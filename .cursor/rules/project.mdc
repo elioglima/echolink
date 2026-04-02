@@ -1,0 +1,24 @@
+---
+description: Padrões EchoLink — arquitetura, estilo e comportamento do agente
+alwaysApply: true
+---
+
+# EchoLink / EchoLink Box
+
+- **Core independente do hardware:** pipeline (STT, tradução, TTS) e domínio não acoplam ALSA, USB Gadget nem drivers. Hardware entra só via **adapters** (local/mock em dev; ALSA/gadget no RPi).
+- **Dev-first:** priorizar o que roda em máquina local sem Raspberry; mocks de USB e áudio onde couber.
+- **Nomes de funções, tipos e módulos em inglês.** Novos arquivos em **camelCase** quando o projeto já usar esse padrão.
+- Alterações **mínimas e focadas** na tarefa; evitar refatorações amplas não pedidas.
+- **Sem comentários no código** salvo pedido explícito do usuário.
+- Não executar **eslint** nem testes unitários por conta própria, salvo pedido do usuário.
+- Não ler nem usar `.env`, `.env.local`, `.env.dev`, `.env.prd`.
+- Respostas ao usuário em **português**, salvo outra instrução.
+
+## Stack
+
+- **Python:** `applications/echoLinkService` — API/pipeline (FastAPI, uvicorn).
+- **Frontend:** `applications/echolinkApp` — Next.js + Electron.
+
+## Commits e branches
+
+- Commits em **português**, **Conventional Commits**, mensagens objetivas. Branch curta alinhada ao escopo quando o usuário pedir fluxo git completo.
