@@ -1,0 +1,102 @@
+@import "tailwindcss";
+
+:root {
+  --background: #ffffff;
+  --foreground: #171717;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #18181b;
+    --foreground: #f4f4f5;
+  }
+}
+
+body {
+  background-color: #18181b;
+  color: var(--foreground);
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+.panel-bezel {
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.05),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.5);
+}
+
+.echo-range {
+  --range-progress: 0%;
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 6px;
+  border-radius: 9999px;
+  background: transparent;
+  outline: none;
+}
+
+.echo-range::-webkit-slider-runnable-track {
+  height: 6px;
+  border-radius: 9999px;
+  background: linear-gradient(
+    to right,
+    #71717a 0%,
+    #71717a var(--range-progress),
+    #27272a var(--range-progress),
+    #27272a 100%
+  );
+}
+
+.echo-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  margin-top: -4px;
+  border-radius: 9999px;
+  background: #a1a1aa;
+  border: none;
+  cursor: pointer;
+}
+
+.echo-range:disabled::-webkit-slider-thumb {
+  cursor: not-allowed;
+  background: #52525b;
+}
+
+.echo-range::-moz-range-track {
+  height: 6px;
+  border-radius: 9999px;
+  background: #27272a;
+}
+
+.echo-range::-moz-range-progress {
+  height: 6px;
+  border-radius: 9999px;
+  background: #71717a;
+}
+
+.echo-range::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border: none;
+  border-radius: 9999px;
+  background: #a1a1aa;
+  cursor: pointer;
+}
+
+.echo-range:disabled::-moz-range-thumb {
+  cursor: not-allowed;
+  background: #52525b;
+}
+
+.echo-range:disabled {
+  opacity: 0.45;
+}
+
