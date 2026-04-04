@@ -75,7 +75,7 @@ pip install -U pip
 pip install -e .
 
 # API em http://127.0.0.1:8765 (WebSocket em /ws/mic)
-python main.py
+uvicorn core.api.server:app --reload --port 8765
 ```
 
 Variável opcional: `ECHO_LINK_RELOAD=0` desativa o reload automático do Uvicorn.

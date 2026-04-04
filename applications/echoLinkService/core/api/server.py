@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from core.api.micRoutes import router as mic_router
+from core.api.sttRoutes import router as stt_router
 
 app = FastAPI(title="EchoLink Service")
 
@@ -17,6 +18,7 @@ app.add_middleware(
 )
 
 app.include_router(mic_router)
+app.include_router(stt_router)
 
 
 @app.get("/health")
@@ -28,5 +30,6 @@ def health() -> dict[str, str]:
 def capture_info() -> dict[str, str]:
     return {
         "websocketPath": "/ws/mic",
-        "hint": "Connect from EchoLink app; browser sends mic chunks as binary.",
+        "sttWebsocketPath": "/ws/stt",
+        "hint": "Mic chunks as binary; STT expects PCM s16le mono 16 kHz on /ws/stt.",
     }
