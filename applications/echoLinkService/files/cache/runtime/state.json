@@ -1,0 +1,16 @@
+{
+  "status": "running",
+  "startedAt": "2026-04-04T23:48:31Z",
+  "stoppedAt": null,
+  "pid": 53490,
+  "host": "127.0.0.1",
+  "port": 8765,
+  "activeWebSockets": {
+    "mic": 0,
+    "stt": 0
+  },
+  "panelCaptureActive": false,
+  "panelCaptureStartedAt": "2026-04-04T23:51:35Z",
+  "panelCaptureStoppedAt": "2026-04-04T23:53:10Z",
+  "updatedAt": "2026-04-04T23:53:10Z"
+}

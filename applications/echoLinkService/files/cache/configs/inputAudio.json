@@ -1,0 +1,8 @@
+{
+  "selectedInputDeviceId": "",
+  "inputDeviceAliases": {},
+  "audioChunkMs": 1190,
+  "transcriptionStartDelayMs": 2100,
+  "phraseSilenceCutMs": 1200,
+  "inputSensitivity": 2959
+}

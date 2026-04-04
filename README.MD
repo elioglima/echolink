@@ -71,14 +71,18 @@ pyenv local 3.12
 python -m venv .venv
 source .venv/bin/activate
 
-pip install -U pip
+pip install -U pip setuptools wheel
 pip install -e .
 
-# API em http://127.0.0.1:8765 (WebSocket em /ws/mic)
-uvicorn core.api.server:app --reload --port 8765
+# API em http://127.0.0.1:8765 (WebSockets: /ws/mic, /ws/stt)
+python main.py
 ```
 
-Variável opcional: `ECHO_LINK_RELOAD=0` desativa o reload automático do Uvicorn.
+Alternativa na pasta do serviço: `./configure.sh` (cria/usa `.venv`, instala dependências, tenta detetar `VOSK_MODEL_PATH` em pastas locais e sobe o Uvicorn com reload).
+
+Variável opcional: `ECHO_LINK_RELOAD=0` desativa o reload automático quando usas `python main.py`.
+
+**Configuração (fonte de verdade no servidor):** `GET http://127.0.0.1:8765/config` devolve o JSON de settings; `PATCH` com o mesmo formato aplica alterações parciais. A UI envia `PATCH` ao mudar opções (o `localStorage` fica como cache quando o serviço está offline).
 
 ### App Next.js (`echolinkApp`)
 
@@ -102,8 +106,17 @@ A UI fica em **http://127.0.0.1:3000** e espera o serviço Python na porta **876
 
 | Terminal | Pasta | Comando |
 |----------|--------|---------|
-| 1 | `applications/echoLinkService` | `source .venv/bin/activate` → `python main.py` |
+| 1 | `applications/echoLinkService` | `source .venv/bin/activate` → `python main.py` (ou `./configure.sh`) |
 | 2 | `applications/echolinkApp` | `nvm use` → `npm run dev` |
+
+### Desenvolvimento no Mac (sem Raspberry Pi)
+
+Quem desenvolve **não precisa de Raspberry Pi** para executar e testar: o Mac usa microfone e saída de áudio normais; o **USB gadget** do produto final só entra no modo **hardware** no Pi (ver `mds/resume.md`).
+
+1. **Serviço Python** — terminal na pasta `applications/echoLinkService` (como acima ou `./configure.sh`).
+2. **UI** — terminal na pasta `applications/echolinkApp`, `npm run dev`, abrir **http://127.0.0.1:3000** e autorizar o microfone no browser.
+3. **STT com Vosk (opcional)** — descarregar um modelo em [alphacephei.com/vosk/models](https://alphacephei.com/vosk/models), descompactar em `applications/echoLinkService/vosk-model` (ou definir `VOSK_MODEL_PATH` para a pasta do modelo). Sem modelo, o resto da interface continua utilizável; o passo fala→texto via Vosk fica indisponível.
+4. **Verificação rápida** — `curl -s http://127.0.0.1:8765/health` e `curl -s http://127.0.0.1:8765/stt/status`.
 
 ## Documentação
 

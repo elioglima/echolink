@@ -1,13 +1,16 @@
 export const STT_WS_URL = "ws://127.0.0.1:8765/ws/stt";
 
 const TARGET_RATE = 16000;
+const STT_LOWPASS_HZ = 7200;
+const STT_INPUT_RMS_FLOOR = 0.01;
+const STT_PEAK_CEILING = 0.88;
 
 export type ServiceSttClientEvent =
   | { kind: "partial"; text: string }
   | { kind: "final"; text: string }
   | { kind: "error"; message: string };
 
-function downsampleFloat(
+function resampleFloatLinear(
   input: Float32Array,
   inputRate: number,
   outputRate: number
@@ -15,19 +18,51 @@ function downsampleFloat(
   if (inputRate === outputRate) {
     return input;
   }
-  const ratio = inputRate / outputRate;
-  const outLen = Math.max(1, Math.floor(input.length / ratio));
+  const outLen = Math.max(
+    1,
+    Math.floor((input.length * outputRate) / inputRate)
+  );
   const out = new Float32Array(outLen);
+  const ratio = inputRate / outputRate;
   for (let i = 0; i < outLen; i++) {
-    const start = Math.floor(i * ratio);
-    const end = Math.min(Math.floor((i + 1) * ratio), input.length);
-    let sum = 0;
-    for (let j = start; j < end; j++) {
-      sum += input[j];
-    }
-    out[i] = sum / (end - start);
+    const pos = i * ratio;
+    const j = Math.floor(pos);
+    const f = pos - j;
+    const j1 = Math.min(j + 1, input.length - 1);
+    const s0 = input[j] ?? 0;
+    const s1 = input[j1] ?? s0;
+    out[i] = s0 + f * (s1 - s0);
   }
   return out;
+}
+
+function normalizePeakForStt(mono: Float32Array, ceiling: number): void {
+  let peak = 0;
+  for (let i = 0; i < mono.length; i++) {
+    const a = Math.abs(mono[i] ?? 0);
+    if (a > peak) {
+      peak = a;
+    }
+  }
+  if (peak <= ceiling || peak <= 0) {
+    return;
+  }
+  const g = ceiling / peak;
+  for (let i = 0; i < mono.length; i++) {
+    mono[i] = (mono[i] ?? 0) * g;
+  }
+}
+
+function rmsOfFloat32(buf: Float32Array): number {
+  if (buf.length === 0) {
+    return 0;
+  }
+  let s = 0;
+  for (let i = 0; i < buf.length; i++) {
+    const x = buf[i] ?? 0;
+    s += x * x;
+  }
+  return Math.sqrt(s / buf.length);
 }
 
 function floatToInt16(f: Float32Array): Int16Array {
@@ -44,7 +79,13 @@ function attachPcmTap(
   source: MediaStreamAudioSourceNode,
   sendPcm: (data: Int16Array) => void
 ): () => void {
-  const proc = audioContext.createScriptProcessor(4096, 2, 2);
+  const lowpass = audioContext.createBiquadFilter();
+  lowpass.type = "lowpass";
+  const nyquistIn = audioContext.sampleRate * 0.5;
+  lowpass.frequency.value = Math.min(STT_LOWPASS_HZ, nyquistIn * 0.92);
+  lowpass.Q.value = 0.707;
+
+  const proc = audioContext.createScriptProcessor(2048, 2, 2);
   const mute = audioContext.createGain();
   mute.gain.value = 0;
   proc.onaudioprocess = (ev) => {
@@ -55,20 +96,30 @@ function attachPcmTap(
     for (let i = 0; i < L.length; i++) {
       mono[i] = (L[i] + R[i]) * 0.5;
     }
-    const down = downsampleFloat(mono, audioContext.sampleRate, TARGET_RATE);
-    const i16 = floatToInt16(down);
+    normalizePeakForStt(mono, STT_PEAK_CEILING);
+    if (rmsOfFloat32(mono) < STT_INPUT_RMS_FLOOR) {
+      mono.fill(0);
+    }
+    const resampled = resampleFloatLinear(
+      mono,
+      audioContext.sampleRate,
+      TARGET_RATE
+    );
+    const i16 = floatToInt16(resampled);
     if (i16.byteLength > 0) {
       sendPcm(i16);
     }
   };
-  source.connect(proc);
+  source.connect(lowpass);
+  lowpass.connect(proc);
   proc.connect(mute);
   mute.connect(audioContext.destination);
   return () => {
     try {
       proc.disconnect();
       mute.disconnect();
-      source.disconnect(proc);
+      lowpass.disconnect(proc);
+      source.disconnect(lowpass);
     } catch {
       /* ignore */
     }
@@ -92,7 +143,7 @@ export async function startServiceSttSession(
 
   await new Promise<void>((resolve, reject) => {
     const timeout = window.setTimeout(() => {
-      reject(new Error("STT: tempo esgotado aguardando modelo Vosk no serviço."));
+      reject(new Error("STT: tempo esgotado aguardando o serviço ficar pronto."));
     }, 120000);
     const onFirst = (ev: MessageEvent) => {
       window.clearTimeout(timeout);

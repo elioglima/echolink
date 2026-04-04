@@ -22,34 +22,65 @@ export type EchoLinkSettings = {
   speechReceiveLanguage: string;
   speechTransformLanguage: string;
   speechLanguagesEnabled: boolean;
+  selectedInputDeviceId: string;
+  selectedOutputDeviceId: string;
+  selectedElevenLabsVoiceId: string;
+  voiceTranslationEnabled: boolean;
+  pipelineMonitorEnabled: boolean;
+  pipelineMonitorGainPercent: number;
 };
 
 export const ECHO_LINK_STORAGE_KEY = "echoLink.settings.v1";
 
-export const ECHO_LINK_SETTINGS_DEFAULTS: EchoLinkSettings = {
-  audioChunkMs: 250,
+const DEVICE_ID_MAX = 512;
+const ELEVEN_LABS_VOICE_ID_MAX = 96;
+
+export const ECHO_LINK_SETTINGS_PLACEHOLDER: EchoLinkSettings = {
+  audioChunkMs: 50,
   transcriptionStartDelayMs: 0,
-  phraseSilenceCutMs: 1200,
-  inputSensitivity: 100,
+  phraseSilenceCutMs: 0,
+  inputSensitivity: 10,
   inputDeviceAliases: {},
   outputDeviceAliases: {},
   speechReceiveLanguage: "pt-BR",
   speechTransformLanguage: "pt-BR",
-  speechLanguagesEnabled: true,
+  speechLanguagesEnabled: false,
+  selectedInputDeviceId: "",
+  selectedOutputDeviceId: "",
+  selectedElevenLabsVoiceId: "",
+  voiceTranslationEnabled: false,
+  pipelineMonitorEnabled: false,
+  pipelineMonitorGainPercent: 1,
 };
 
+function sanitizeDeviceId(raw: unknown): string {
+  if (typeof raw !== "string") {
+    return "";
+  }
+  return raw.length > DEVICE_ID_MAX ? raw.slice(0, DEVICE_ID_MAX) : raw;
+}
+
+function sanitizeElevenLabsVoiceId(raw: unknown): string {
+  if (typeof raw !== "string") {
+    return "";
+  }
+  const t = raw.trim();
+  return t.length > ELEVEN_LABS_VOICE_ID_MAX
+    ? t.slice(0, ELEVEN_LABS_VOICE_ID_MAX)
+    : t;
+}
+
 export const TIMING_DEFAULTS: Record<TimingKey, number> = {
-  audioChunkMs: ECHO_LINK_SETTINGS_DEFAULTS.audioChunkMs,
-  transcriptionStartDelayMs:
-    ECHO_LINK_SETTINGS_DEFAULTS.transcriptionStartDelayMs,
-  phraseSilenceCutMs: ECHO_LINK_SETTINGS_DEFAULTS.phraseSilenceCutMs,
+  audioChunkMs: 50,
+  transcriptionStartDelayMs: 0,
+  phraseSilenceCutMs: 0,
 };
 
 const RANGES: Record<EchoLinkSettingsKey, [number, number]> = {
   audioChunkMs: [50, 4000],
   transcriptionStartDelayMs: [0, 15000],
   phraseSilenceCutMs: [0, 15000],
-  inputSensitivity: [10, 400],
+  inputSensitivity: [10, 5000],
 };
 
 export function clampEchoLinkSetting(
@@ -58,9 +89,7 @@ export function clampEchoLinkSetting(
 ): number {
   const [min, max] = RANGES[key];
   if (Number.isNaN(value)) {
-    return key === "inputSensitivity"
-      ? ECHO_LINK_SETTINGS_DEFAULTS.inputSensitivity
-      : TIMING_DEFAULTS[key as TimingKey];
+    return min;
   }
   return Math.min(max, Math.max(min, Math.round(value)));
 }
@@ -85,9 +114,18 @@ function sanitizeAliasRecord(
   return out;
 }
 
-function mergeWithDefaults(raw: Partial<Record<string, unknown>>): EchoLinkSettings {
-  const out: EchoLinkSettings = { ...ECHO_LINK_SETTINGS_DEFAULTS };
-  (Object.keys(ECHO_LINK_SETTINGS_DEFAULTS) as (keyof EchoLinkSettings)[]).forEach(
+export function parseEchoLinkSettingsFromServer(raw: unknown): EchoLinkSettings {
+  if (raw === null || typeof raw !== "object") {
+    return { ...ECHO_LINK_SETTINGS_PLACEHOLDER };
+  }
+  return mergeEchoLinkSettingsPayload(raw as Record<string, unknown>);
+}
+
+function mergeEchoLinkSettingsPayload(
+  raw: Partial<Record<string, unknown>>
+): EchoLinkSettings {
+  const out: EchoLinkSettings = { ...ECHO_LINK_SETTINGS_PLACEHOLDER };
+  (Object.keys(ECHO_LINK_SETTINGS_PLACEHOLDER) as (keyof EchoLinkSettings)[]).forEach(
     (key) => {
       const v = raw[key as string];
       if (key === "inputDeviceAliases" || key === "outputDeviceAliases") {
@@ -99,7 +137,7 @@ function mergeWithDefaults(raw: Partial<Record<string, unknown>>): EchoLinkSetti
       if (key === "speechReceiveLanguage" || key === "speechTransformLanguage") {
         out[key] = sanitizeSpeechLanguageTag(
           v,
-          ECHO_LINK_SETTINGS_DEFAULTS[key]
+          ECHO_LINK_SETTINGS_PLACEHOLDER[key]
         );
         return;
       }
@@ -107,7 +145,31 @@ function mergeWithDefaults(raw: Partial<Record<string, unknown>>): EchoLinkSetti
         out[key] =
           typeof v === "boolean"
             ? v
-            : ECHO_LINK_SETTINGS_DEFAULTS.speechLanguagesEnabled;
+            : ECHO_LINK_SETTINGS_PLACEHOLDER.speechLanguagesEnabled;
+        return;
+      }
+      if (
+        key === "selectedInputDeviceId" ||
+        key === "selectedOutputDeviceId"
+      ) {
+        out[key] = sanitizeDeviceId(v);
+        return;
+      }
+      if (key === "selectedElevenLabsVoiceId") {
+        out[key] = sanitizeElevenLabsVoiceId(v);
+        return;
+      }
+      if (key === "voiceTranslationEnabled" || key === "pipelineMonitorEnabled") {
+        out[key] =
+          typeof v === "boolean"
+            ? v
+            : ECHO_LINK_SETTINGS_PLACEHOLDER[key];
+        return;
+      }
+      if (key === "pipelineMonitorGainPercent") {
+        if (typeof v === "number" && Number.isFinite(v)) {
+          out[key] = Math.min(100, Math.max(1, Math.round(v)));
+        }
         return;
       }
       if (typeof v === "number" && Number.isFinite(v)) {
@@ -135,22 +197,26 @@ function migrateLegacyLocalStorage(): Partial<EchoLinkSettings> | null {
 
 export function loadEchoLinkSettingsFromLocalStorage(): EchoLinkSettings {
   if (typeof window === "undefined") {
-    return { ...ECHO_LINK_SETTINGS_DEFAULTS };
+    return { ...ECHO_LINK_SETTINGS_PLACEHOLDER };
   }
   const legacy = migrateLegacyLocalStorage();
   const rawJson = window.localStorage.getItem(ECHO_LINK_STORAGE_KEY);
   if (rawJson === null) {
-    return legacy ? mergeWithDefaults(legacy) : { ...ECHO_LINK_SETTINGS_DEFAULTS };
+    return legacy
+      ? mergeEchoLinkSettingsPayload(legacy)
+      : { ...ECHO_LINK_SETTINGS_PLACEHOLDER };
   }
   try {
     const parsed = JSON.parse(rawJson) as unknown;
     if (parsed === null || typeof parsed !== "object") {
-      return mergeWithDefaults(legacy ?? {});
+      return mergeEchoLinkSettingsPayload(legacy ?? {});
     }
-    const base = mergeWithDefaults(parsed as Record<string, unknown>);
-    return legacy ? mergeWithDefaults({ ...base, ...legacy }) : base;
+    const base = mergeEchoLinkSettingsPayload(parsed as Record<string, unknown>);
+    return legacy
+      ? mergeEchoLinkSettingsPayload({ ...base, ...legacy })
+      : base;
   } catch {
-    return mergeWithDefaults(legacy ?? {});
+    return mergeEchoLinkSettingsPayload(legacy ?? {});
   }
 }
 
@@ -209,7 +275,7 @@ export function saveEchoLinkSettingsToStorage(
       if (typeof v === "string") {
         next[key] = sanitizeSpeechLanguageTag(
           v,
-          ECHO_LINK_SETTINGS_DEFAULTS[key]
+          ECHO_LINK_SETTINGS_PLACEHOLDER[key]
         );
       }
       return;
@@ -220,11 +286,45 @@ export function saveEchoLinkSettingsToStorage(
       }
       return;
     }
+    if (key === "selectedInputDeviceId" || key === "selectedOutputDeviceId") {
+      if (typeof v === "string") {
+        next[key] = sanitizeDeviceId(v);
+      }
+      return;
+    }
+    if (key === "selectedElevenLabsVoiceId") {
+      if (typeof v === "string") {
+        next[key] = sanitizeElevenLabsVoiceId(v);
+      }
+      return;
+    }
+    if (key === "voiceTranslationEnabled" || key === "pipelineMonitorEnabled") {
+      if (typeof v === "boolean") {
+        next[key] = v;
+      }
+      return;
+    }
+    if (key === "pipelineMonitorGainPercent") {
+      if (typeof v === "number" && Number.isFinite(v)) {
+        next[key] = Math.min(100, Math.max(1, Math.round(v)));
+      }
+      return;
+    }
     if (typeof v === "number") {
       next[key] = clampEchoLinkSetting(key as EchoLinkSettingsKey, v);
     }
   });
   window.localStorage.setItem(ECHO_LINK_STORAGE_KEY, JSON.stringify(next));
+  const patchKeys = Object.keys(partial) as (keyof EchoLinkSettings)[];
+  if (patchKeys.length > 0) {
+    const body: Partial<EchoLinkSettings> = {};
+    patchKeys.forEach((k) => {
+      Object.assign(body, { [k]: next[k] } as Partial<EchoLinkSettings>);
+    });
+    void import("./echoLinkServerConfig").then((m) =>
+      m.pushEchoLinkServerConfigPatch(body)
+    );
+  }
   if (options?.syncElectron) {
     if (electronWriteTimer !== null) {
       clearTimeout(electronWriteTimer);
@@ -249,11 +349,11 @@ export function saveEchoLinkSpeechSettings(
   const prev = loadEchoLinkSettingsFromLocalStorage();
   const speechReceiveLanguage = sanitizeSpeechLanguageTag(
     patch.speechReceiveLanguage ?? prev.speechReceiveLanguage,
-    ECHO_LINK_SETTINGS_DEFAULTS.speechReceiveLanguage
+    ECHO_LINK_SETTINGS_PLACEHOLDER.speechReceiveLanguage
   );
   const speechTransformLanguage = sanitizeSpeechLanguageTag(
     patch.speechTransformLanguage ?? prev.speechTransformLanguage,
-    ECHO_LINK_SETTINGS_DEFAULTS.speechTransformLanguage
+    ECHO_LINK_SETTINGS_PLACEHOLDER.speechTransformLanguage
   );
   const speechLanguagesEnabled =
     typeof patch.speechLanguagesEnabled === "boolean"
@@ -280,7 +380,7 @@ export async function hydrateEchoLinkSettingsFromElectron(): Promise<EchoLinkSet
   try {
     const raw = await bridge.readSettings();
     if (raw === null || typeof raw !== "object") return null;
-    const merged = mergeWithDefaults(raw as Record<string, unknown>);
+    const merged = mergeEchoLinkSettingsPayload(raw as Record<string, unknown>);
     window.localStorage.setItem(ECHO_LINK_STORAGE_KEY, JSON.stringify(merged));
     return merged;
   } catch {

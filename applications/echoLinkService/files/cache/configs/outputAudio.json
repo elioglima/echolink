@@ -1,0 +1,11 @@
+{
+  "selectedOutputDeviceId": "",
+  "outputDeviceAliases": {},
+  "pipelineMonitorEnabled": false,
+  "pipelineMonitorGainPercent": 12,
+  "speechReceiveLanguage": "pt-BR",
+  "speechTransformLanguage": "en-US",
+  "speechLanguagesEnabled": true,
+  "selectedElevenLabsVoiceId": "bIHbv24MWmeRgasZH58o",
+  "voiceTranslationEnabled": true
+}

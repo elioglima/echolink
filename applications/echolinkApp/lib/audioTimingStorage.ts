@@ -5,7 +5,7 @@ export {
   clampTiming,
   loadEchoLinkSettingsFromLocalStorage as loadTimingFromStorage,
   saveEchoLinkSettingsToStorage as saveTimingToStorage,
-  ECHO_LINK_SETTINGS_DEFAULTS,
+  ECHO_LINK_SETTINGS_PLACEHOLDER,
   type EchoLinkSettings,
   type EchoLinkSettingsKey,
 } from "./echoLinkSettings";
