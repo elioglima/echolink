@@ -1,8 +1,8 @@
 {
-  "status": "running",
+  "status": "stopped",
   "startedAt": "2026-04-04T23:48:31Z",
-  "stoppedAt": null,
-  "pid": 53490,
+  "stoppedAt": "2026-04-04T23:55:26Z",
+  "pid": null,
   "host": "127.0.0.1",
   "port": 8765,
   "activeWebSockets": {
@@ -10,7 +10,7 @@
     "stt": 0
   },
   "panelCaptureActive": false,
-  "panelCaptureStartedAt": "2026-04-04T23:51:35Z",
-  "panelCaptureStoppedAt": "2026-04-04T23:53:10Z",
-  "updatedAt": "2026-04-04T23:53:10Z"
+  "panelCaptureStartedAt": "2026-04-04T23:54:08Z",
+  "panelCaptureStoppedAt": "2026-04-04T23:55:00Z",
+  "updatedAt": "2026-04-04T23:55:26Z"
 }
