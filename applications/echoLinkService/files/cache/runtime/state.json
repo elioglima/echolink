@@ -1,8 +1,8 @@
 {
   "status": "running",
-  "startedAt": "2026-04-05T07:06:31Z",
+  "startedAt": "2026-04-05T07:32:29Z",
   "stoppedAt": null,
-  "pid": 19910,
+  "pid": 29849,
   "host": "127.0.0.1",
   "port": 8765,
   "listenMode": "tcp",
@@ -12,7 +12,7 @@
     "stt": 0
   },
   "panelCaptureActive": false,
-  "panelCaptureStartedAt": null,
-  "panelCaptureStoppedAt": "2026-04-05T07:21:14Z",
-  "updatedAt": "2026-04-05T07:21:14Z"
+  "panelCaptureStartedAt": "2026-04-05T07:51:22Z",
+  "panelCaptureStoppedAt": "2026-04-05T07:51:41Z",
+  "updatedAt": "2026-04-05T07:51:41Z"
 }

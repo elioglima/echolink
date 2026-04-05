@@ -65,6 +65,10 @@ import { formatMediaDeviceOptionLabel } from "../lib/mediaDeviceOptionLabel";
 import { isSubstantivePhraseForJournal } from "../lib/substantivePhraseForJournal";
 import { sttFinalTextPassesQualityGate } from "../lib/sttTranscriptQuality";
 import { timingRangeProgress } from "../lib/timingRangeProgress";
+import {
+  applyMaxChannelWebAudioNodes,
+  withIdealMultiChannelCapture,
+} from "../lib/echoLinkMultiChannelAudio";
 import { safeCloseAudioContext } from "../lib/safeCloseAudioContext";
 import {
   subscribeEchoLinkChatAppend,
@@ -488,17 +492,17 @@ function MixerConsoleInputChannel({
     channelId === 1
       ? "microfone"
       : channelId === 2
-        ? "entrada linha"
+        ? "entrada teams"
         : "entrada mídia";
   const faderDomId = `echo-mixer-fader-ch${channelId}`;
   const faderAria =
     channelId === 1
       ? "Ganho do microfone na mistura"
       : channelId === 2
-        ? "Ganho da entrada linha na mistura"
+        ? "Ganho da entrada Teams na mistura"
         : "Ganho da entrada mídia na mistura";
   const mixerFaderTitle =
-    channelId === 1 ? "Microfone" : channelId === 2 ? "Linha" : "MÍDIA";
+    channelId === 1 ? "Microfone" : channelId === 2 ? "Teams" : "MÍDIA";
   return (
     <div
       className={`relative isolate box-border flex min-h-0 w-[11.5rem] shrink-0 flex-col overflow-hidden border-l-2 border-solid bg-linear-to-b from-zinc-800/30 via-zinc-950 to-[#050506] px-2.5 pb-0 pt-2 sm:w-[13.25rem] sm:px-3 ${mixerChannelStripBorderColorClass("input", activateOn, muted, faderDisabled)} ${draggingMixerStripId === mixerStripId ? "opacity-50" : ""}`}
@@ -926,6 +930,9 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
   const testStreamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const mediaStreamSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const pipelineMonitorSourceRef = useRef<MediaStreamAudioSourceNode | null>(
+    null
+  );
   const pipelineBranchCleanupRef = useRef<(() => void) | null>(null);
   const pipelineGainNodeRef = useRef<GainNode | null>(null);
   const pipelineOutputAnalyserRef = useRef<AnalyserNode | null>(null);
@@ -1841,7 +1848,9 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
   const unlockMediaLabels = async () => {
     setError(null);
     try {
-      const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const s = await navigator.mediaDevices.getUserMedia({
+        audio: withIdealMultiChannelCapture({}),
+      });
       s.getTracks().forEach((t) => t.stop());
       await refreshMediaDevices();
     } catch (e) {
@@ -1871,6 +1880,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
     pipelineBranchCleanupRef.current = null;
     pipelineGainNodeRef.current = null;
     mediaStreamSourceRef.current = null;
+    pipelineMonitorSourceRef.current = null;
     const meterCtx = audioContextRef.current;
     audioContextRef.current = null;
     safeCloseAudioContext(meterCtx);
@@ -1971,7 +1981,11 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
   }, []);
 
   const startMeter = useCallback(
-    async (stream: MediaStream, withRx: boolean) => {
+    async (
+      stream: MediaStream,
+      withRx: boolean,
+      pipelineStream?: MediaStream
+    ) => {
       micVuSmoothRef.current = 0;
       lineVuSmoothRef.current = 0;
       mediaVuSmoothRef.current = 0;
@@ -1980,6 +1994,12 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
       setMeterSampleRate(ctx.sampleRate);
       const source = ctx.createMediaStreamSource(stream);
       mediaStreamSourceRef.current = source;
+      if (pipelineStream && pipelineStream !== stream) {
+        pipelineMonitorSourceRef.current =
+          ctx.createMediaStreamSource(pipelineStream);
+      } else {
+        pipelineMonitorSourceRef.current = source;
+      }
       const mixP = mixPrimaryAnalyserRef.current;
       const mixS = mixSecondaryAnalyserRef.current;
       const mixT = mixTertiaryAnalyserRef.current;
@@ -1996,6 +2016,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
         const analyser = ctx.createAnalyser();
         analyser.fftSize = 512;
         analyser.smoothingTimeConstant = 0.75;
+        applyMaxChannelWebAudioNodes(analyser);
         source.connect(analyser);
         analyserRef.current = analyser;
         timeDomainRef.current = createByteDomainBuffer(analyser.fftSize);
@@ -2108,11 +2129,11 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
     setError(null);
     setMicTesting(true);
     try {
-      const audioConstraints: MediaTrackConstraints = {
+      const audioConstraints = withIdealMultiChannelCapture({
         echoCancellation: false,
         noiseSuppression: true,
         autoGainControl: false,
-      };
+      });
       if (selectedInputId) {
         audioConstraints.deviceId = { exact: selectedInputId };
       }
@@ -2120,7 +2141,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
         audio: audioConstraints,
       });
       testStreamRef.current = stream;
-      await startMeter(stream, false);
+      await startMeter(stream, false, undefined);
       await new Promise((r) => setTimeout(r, MIC_TEST_MS));
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Teste do microfone falhou";
@@ -2167,11 +2188,11 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
     let secondaryForCleanup: MediaStream | null = null;
     let tertiaryForCleanup: MediaStream | null = null;
     try {
-      const baseAudio: MediaTrackConstraints = {
+      const baseAudio = withIdealMultiChannelCapture({
         echoCancellation: false,
         noiseSuppression: true,
         autoGainControl: false,
-      };
+      });
       const primaryConstraints: MediaTrackConstraints = { ...baseAudio };
       if (selectedInputId) {
         primaryConstraints.deviceId = { exact: selectedInputId };
@@ -2203,6 +2224,8 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
         0,
         Math.min(2, settings.tertiaryChannelMixGainPercent / 100)
       );
+      const monitorExcludePrimary = voiceTranslationEnabledRef.current;
+      let pipelineStreamForMeter: MediaStream | undefined;
       captureGainControlsRef.current = null;
       mixPrimaryAnalyserRef.current = null;
       mixSecondaryAnalyserRef.current = null;
@@ -2220,6 +2243,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
         });
         const {
           mixedStream,
+          monitorStream,
           dispose,
           controls,
           primaryAnalyser,
@@ -2233,6 +2257,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
             primaryLinear: pLin,
             secondaryLinear: sLin,
             tertiaryLinear: tLin,
+            monitorExcludePrimary: monitorExcludePrimary,
           }
         );
         mixDisposeRef.current = dispose;
@@ -2249,6 +2274,8 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
         secondaryForCleanup = null;
         tertiaryForCleanup = null;
         captureStream = mixedStream;
+        pipelineStreamForMeter =
+          monitorStream !== mixedStream ? monitorStream : undefined;
       } else if (secondaryId) {
         const secondaryConstraints: MediaTrackConstraints = { ...baseAudio };
         secondaryConstraints.deviceId = { exact: secondaryId };
@@ -2257,6 +2284,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
         });
         const {
           mixedStream,
+          monitorStream,
           dispose,
           controls,
           primaryAnalyser,
@@ -2264,6 +2292,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
         } = await mixCaptureAudioStreams(primaryForCleanup, secondaryForCleanup, {
           primaryLinear: pLin,
           secondaryLinear: sLin,
+          monitorExcludePrimary: monitorExcludePrimary,
         });
         mixDisposeRef.current = dispose;
         mixPrimaryAnalyserRef.current = primaryAnalyser;
@@ -2277,6 +2306,8 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
         primaryForCleanup = null;
         secondaryForCleanup = null;
         captureStream = mixedStream;
+        pipelineStreamForMeter =
+          monitorStream !== mixedStream ? monitorStream : undefined;
       } else if (tertiaryId) {
         const tertiaryConstraints: MediaTrackConstraints = { ...baseAudio };
         tertiaryConstraints.deviceId = { exact: tertiaryId };
@@ -2285,6 +2316,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
         });
         const {
           mixedStream,
+          monitorStream,
           dispose,
           controls,
           primaryAnalyser,
@@ -2292,6 +2324,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
         } = await mixCaptureAudioStreams(primaryForCleanup, tertiaryForCleanup, {
           primaryLinear: pLin,
           secondaryLinear: tLin,
+          monitorExcludePrimary: monitorExcludePrimary,
         });
         mixDisposeRef.current = dispose;
         mixPrimaryAnalyserRef.current = primaryAnalyser;
@@ -2305,8 +2338,12 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
         primaryForCleanup = null;
         tertiaryForCleanup = null;
         captureStream = mixedStream;
+        pipelineStreamForMeter =
+          monitorStream !== mixedStream ? monitorStream : undefined;
       } else {
-        const pt = await passThroughCaptureWithGain(primaryForCleanup, pLin);
+        const pt = await passThroughCaptureWithGain(primaryForCleanup, pLin, {
+          monitorExcludePrimary: monitorExcludePrimary,
+        });
         mixDisposeRef.current = pt.dispose;
         mixPrimaryAnalyserRef.current = pt.primaryAnalyser;
         mixSecondaryAnalyserRef.current = null;
@@ -2317,9 +2354,11 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
         };
         primaryForCleanup = null;
         captureStream = pt.stream;
+        pipelineStreamForMeter =
+          pt.monitorStream !== pt.stream ? pt.monitorStream : undefined;
       }
       streamRef.current = captureStream;
-      await startMeter(captureStream, true);
+      await startMeter(captureStream, true, pipelineStreamForMeter);
 
       const ws = openEchoLinkServiceWebSocket("/ws/mic");
       ws.binaryType = "arraybuffer";
@@ -2441,14 +2480,12 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
         Math.min(2, settings.outputChannelMixGainPercent / 100)
       );
       const m = mixerOutputMute ? 0 : 1;
-      const dryToSpeakers = voiceTranslationEnabled ? 0 : 1;
-      g.gain.value = pipelineMonitorGain * outLin * m * dryToSpeakers;
+      g.gain.value = pipelineMonitorGain * outLin * m;
     }
   }, [
     pipelineMonitorGain,
     settings.outputChannelMixGainPercent,
     mixerOutputMute,
-    voiceTranslationEnabled,
     pipelineBranchLive,
   ]);
 
@@ -2537,7 +2574,14 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
         : 0;
     c.setPrimaryLinear(p);
     if (c.mode === "dual") {
-      c.setSecondaryLinear(s);
+      const secOk =
+        Boolean(selectedSecondaryInputId) &&
+        selectedSecondaryInputId !== selectedInputId;
+      const terOk =
+        Boolean(selectedTertiaryInputId) &&
+        selectedTertiaryInputId !== selectedInputId &&
+        selectedTertiaryInputId !== selectedSecondaryInputId;
+      c.setSecondaryLinear(secOk ? s : terOk ? t : 0);
     }
     if (c.mode === "triple") {
       c.setSecondaryLinear(s);
@@ -2598,7 +2642,8 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
   useEffect(() => {
     if (!running) return;
     const ctx = audioContextRef.current;
-    const source = mediaStreamSourceRef.current;
+    const source =
+      pipelineMonitorSourceRef.current ?? mediaStreamSourceRef.current;
     if (!ctx || !source) return;
     let cancelled = false;
     const run = async () => {
@@ -2616,9 +2661,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
       if (!pipelineMonitorEnabled) return;
       try {
         const branch = await connectMonitorBranch(ctx, source, {
-          monitorGain:
-            pipelineMonitorGainRef.current *
-            (voiceTranslationEnabledRef.current ? 0 : 1),
+          monitorGain: pipelineMonitorGainRef.current,
           outputDeviceId: selectedOutputId || undefined,
           inject: pipelineInjectRef.current,
         });
@@ -2668,6 +2711,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
         selectedInputId,
         selectedSecondaryInputId,
         selectedTertiaryInputId,
+        voiceTranslationEnabled,
       ].join("\0"),
     [
       running,
@@ -2683,6 +2727,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
       selectedInputId,
       selectedSecondaryInputId,
       selectedTertiaryInputId,
+      voiceTranslationEnabled,
     ]
   );
 
@@ -2734,11 +2779,11 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
           return;
         }
         setMeterSampleRate(ctx.sampleRate);
-        const baseAudio: MediaTrackConstraints = {
+        const baseAudio = withIdealMultiChannelCapture({
           echoCancellation: false,
           noiseSuppression: true,
           autoGainControl: false,
-        };
+        });
         const silent = ctx.createGain();
         silent.gain.value = 0;
         silent.connect(ctx.destination);
@@ -2758,6 +2803,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
           an1 = ctx.createAnalyser();
           an1.fftSize = 512;
           an1.smoothingTimeConstant = 0.75;
+          applyMaxChannelWebAudioNodes(an1);
           ms1Node.connect(an1);
           an1.connect(silent);
         }
@@ -2777,6 +2823,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
           an2 = ctx.createAnalyser();
           an2.fftSize = 512;
           an2.smoothingTimeConstant = 0.75;
+          applyMaxChannelWebAudioNodes(an2);
           ms2Node.connect(an2);
           an2.connect(silent);
         }
@@ -2796,6 +2843,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
           an3 = ctx.createAnalyser();
           an3.fftSize = 512;
           an3.smoothingTimeConstant = 0.75;
+          applyMaxChannelWebAudioNodes(an3);
           ms3Node.connect(an3);
           an3.connect(silent);
         }
@@ -2934,7 +2982,9 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
             const gP = ctx.createGain();
             gP.gain.value = IDLE_PREVIEW_MIX_HEADROOM * pLin;
             ms1Node.connect(gP);
-            gP.connect(previewSumGain);
+            if (!voiceTranslationEnabled) {
+              gP.connect(previewSumGain);
+            }
             idlePreviewPrimGainRef.current = gP;
           }
           if (want2 && ms2Node) {
@@ -3052,9 +3102,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
           previewMeterCtx,
           prevSrc,
           {
-            monitorGain:
-              pipelineMonitorGainRef.current *
-              (voiceTranslationEnabledRef.current ? 0 : 1),
+            monitorGain: pipelineMonitorGainRef.current,
             outputDeviceId: selectedOutputId.trim(),
             inject: pipelineInjectRef.current,
           }
@@ -3817,7 +3865,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                                                   )
                                                 : "…";
                                             })()
-                                          : "Linha · off"
+                                          : "Teams · off"
                                       }
                                       vuLevel={lineVu}
                                       faderValue={

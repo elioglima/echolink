@@ -658,18 +658,17 @@ export function AudioInLineInputDetailPanel(props: AudioInLineInputPanelProps) {
               : "text-[9px] font-bold uppercase tracking-[0.18em] text-emerald-300 sm:text-[10px] sm:tracking-[0.2em]"
           }
         >
-          Canal de entrada 2
+          Teams · entrada 2
         </span>
         <span className="text-[9px] text-zinc-400">
-          Áudio (sistema, apps, linha)
+          Microsoft Teams, apps, loopback
         </span>
       </div>
       <p className="mb-2 text-[9px] leading-snug text-zinc-500">
-        Canal opcional. Misturado ao canal 1 na captura (STT e fluxo ao
-        serviço). Para incluir Teams, YouTube ou saída do sistema, escolha um
-        dispositivo virtual de loopback (ex.: EchoLink Virtual Audio ou BlackHole no
-        macOS) ou roteamento
-        equivalente no SO.
+        Canal opcional. Misturado ao microfone na captura (STT e fluxo ao
+        serviço). Use para capturar o Teams (dispositivo de áudio do Teams ou
+        agregado no macOS), outras apps ou loopback virtual quando não couber na
+        entrada Mídia.
       </p>
       <label
         htmlFor="echo-input-device-2"

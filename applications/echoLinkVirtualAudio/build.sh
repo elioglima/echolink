@@ -19,4 +19,4 @@ xcodebuild \
   CONFIGURATION_BUILD_DIR="$root/build" \
   build
 
-echo "Build concluido: $root/build/EchoLinkVirtualAudio.driver"
+echo "Build concluido: $root/build/EchoLinkVirtualAudio8ch.driver"

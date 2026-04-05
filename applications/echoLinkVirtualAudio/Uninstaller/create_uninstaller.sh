@@ -12,7 +12,7 @@ if [ ! -d EchoLinkVirtualAudio.xcodeproj ]; then
     exit 1
 fi
 
-for channels in 2 16 64 128 256; do
+for channels in 2 8 16 64 128 256; do
 
 	# create script
 	echo \

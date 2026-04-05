@@ -1,3 +1,4 @@
+import { applyMaxChannelWebAudioNodes } from "./echoLinkMultiChannelAudio";
 import {
   echoLinkServiceOriginForDisplay,
   openEchoLinkServiceWebSocket,
@@ -90,16 +91,26 @@ function attachPcmTap(
   lowpass.frequency.value = Math.min(STT_LOWPASS_HZ, nyquistIn * 0.92);
   lowpass.Q.value = 0.707;
 
-  const proc = audioContext.createScriptProcessor(2048, 2, 2);
+  const proc = audioContext.createScriptProcessor(2048, 8, 2);
   const mute = audioContext.createGain();
   mute.gain.value = 0;
+  applyMaxChannelWebAudioNodes(lowpass);
   proc.onaudioprocess = (ev) => {
     const n = ev.inputBuffer.numberOfChannels;
-    const L = ev.inputBuffer.getChannelData(0);
-    const R = n > 1 ? ev.inputBuffer.getChannelData(1) : L;
-    const mono = new Float32Array(L.length);
-    for (let i = 0; i < L.length; i++) {
-      mono[i] = (L[i] + R[i]) * 0.5;
+    const len = ev.inputBuffer.length;
+    const mono = new Float32Array(len);
+    if (n <= 0) {
+      return;
+    }
+    for (let ch = 0; ch < n; ch++) {
+      const c = ev.inputBuffer.getChannelData(ch);
+      for (let i = 0; i < len; i++) {
+        mono[i] += c[i] ?? 0;
+      }
+    }
+    const inv = 1 / n;
+    for (let i = 0; i < len; i++) {
+      mono[i] *= inv;
     }
     normalizePeakForStt(mono, STT_PEAK_CEILING);
     if (rmsOfFloat32(mono) < STT_INPUT_RMS_FLOOR) {

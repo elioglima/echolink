@@ -154,7 +154,7 @@ struct ObjectInfo {
 #endif
 
 #ifndef kPlugIn_BundleID
-#define                             kPlugIn_BundleID                    "audio.neocoode.EchoLinkVirtualAudio2ch"
+#define                             kPlugIn_BundleID                    "audio.neocoode.EchoLinkVirtualAudio8ch"
 #endif
 
 #ifndef kPlugIn_Icon
@@ -234,7 +234,7 @@ struct ObjectInfo {
 #define                             kLatency_Frame_Size                 0
 
 #ifndef kNumber_Of_Channels
-#define                             kNumber_Of_Channels                 2
+#define                             kNumber_Of_Channels                 8
 #endif
 
 #ifndef kEnableVolumeControl

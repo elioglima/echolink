@@ -28,7 +28,7 @@ if [ -z "$version" ]; then
     exit 1
 fi
 
-for channels in 2 16 64 128 256; do
+for channels in 2 8 16 64 128 256; do
     # Env
     ch=$channels"ch"
     driverVartiantName=$driverName$ch
@@ -40,18 +40,20 @@ for channels in 2 16 64 128 256; do
       -configuration Release \
       -target EchoLinkVirtualAudio CONFIGURATION_BUILD_DIR=build \
       PRODUCT_BUNDLE_IDENTIFIER=$bundleID \
+      PRODUCT_NAME=$driverVartiantName \
       GCC_PREPROCESSOR_DEFINITIONS='$GCC_PREPROCESSOR_DEFINITIONS 
       kNumber_Of_Channels='$channels' 
       kPlugIn_BundleID=\"'$bundleID'\"'
     
     # Generate a new UUID
     uuid=$(uuidgen)
-    awk '{sub(/e395c745-4eea-4d94-bb92-46224221047c/,"'$uuid'")}1' build/EchoLinkVirtualAudio.driver/Contents/Info.plist > Temp.plist
-    mv Temp.plist build/EchoLinkVirtualAudio.driver/Contents/Info.plist
+    builtDriver="build/$driverVartiantName.driver"
+    awk '{sub(/e395c745-4eea-4d94-bb92-46224221047c/,"'$uuid'")}1' "$builtDriver/Contents/Info.plist" > Temp.plist
+    mv Temp.plist "$builtDriver/Contents/Info.plist"
     
     mkdir Installer/root
     driverBundleName=$driverVartiantName.driver
-    mv build/EchoLinkVirtualAudio.driver Installer/root/$driverBundleName
+    mv "$builtDriver" Installer/root/$driverBundleName
     rm -r build
     
     # Sign

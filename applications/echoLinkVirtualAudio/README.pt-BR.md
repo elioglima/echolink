@@ -8,19 +8,19 @@ Este diretório é um **fork** do projeto [BlackHole](https://github.com/Existen
 
 ## Nome no sistema
 
-Após instalar, o dispositivo principal (build padrão 2 canais) costuma aparecer como **EchoLink Virtual Audio 2ch** (varia conforme a lista do macOS).
+Após instalar, o dispositivo principal (build padrão 8 canais) costuma aparecer como **EchoLink Virtual Audio 8ch** (varia conforme a lista do macOS).
 
 ## Compilar no Xcode
 
 1. Abrir `EchoLinkVirtualAudio.xcodeproj`.
 2. Em **Signing & Capabilities**, escolha o seu **Team** (Apple Developer).
-3. **Product → Build**. O artefato fica em `EchoLinkVirtualAudio.driver`.
+3. **Product → Build**. O artefato fica em `EchoLinkVirtualAudio8ch.driver`.
 
 ## Instalar manualmente (dev)
 
 ```bash
-sudo cp -R caminho/para/EchoLinkVirtualAudio.driver /Library/Audio/Plug-Ins/HAL/
-sudo chown -R root:wheel /Library/Audio/Plug-Ins/HAL/EchoLinkVirtualAudio.driver
+sudo cp -R caminho/para/EchoLinkVirtualAudio8ch.driver /Library/Audio/Plug-Ins/HAL/
+sudo chown -R root:wheel /Library/Audio/Plug-Ins/HAL/EchoLinkVirtualAudio8ch.driver
 ```
 
 Reiniciar o Mac ou terminar sessão pode ser necessário para o Core Audio recarregar.

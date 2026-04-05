@@ -1,7 +1,7 @@
 {
   "selectedInputDeviceId": "313cbbb89e86197265840a351c08a61d5540ae82c71baef17dec2a1c3bf96ddb",
-  "selectedSecondaryInputDeviceId": "",
-  "selectedTertiaryInputDeviceId": "033a6630d2c3c4c9766548736ee6547fe5d41274cdcaf781dea36c71ad0162fa",
+  "selectedSecondaryInputDeviceId": "fd14c23ec1fad069351f59026fa7462847fa5f56eba3184abc2dbe0a9caee48f",
+  "selectedTertiaryInputDeviceId": "658d63ce8863e012089ba30d7c4629f52f786ccbc9d9fb02d7dccae6e36a05e4",
   "inputDeviceAliases": {},
   "audioChunkMs": 1190,
   "transcriptionStartDelayMs": 2100,

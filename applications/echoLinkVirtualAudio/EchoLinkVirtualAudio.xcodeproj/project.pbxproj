@@ -50,7 +50,7 @@
 		3D88D48C285BBA5800629399 /* EchoLinkVirtualAudioTests */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = EchoLinkVirtualAudioTests; sourceTree = BUILT_PRODUCTS_DIR; };
 		3D88D48E285BBA5800629399 /* main.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = main.c; sourceTree = "<group>"; };
 		3D89662F2849BF1A002AB3F0 /* VERSION */ = {isa = PBXFileReference; lastKnownFileType = text; path = VERSION; sourceTree = "<group>"; };
-		3D89664D2849C318002AB3F0 /* EchoLinkVirtualAudio.driver */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = EchoLinkVirtualAudio.driver; sourceTree = BUILT_PRODUCTS_DIR; };
+		3D89664D2849C318002AB3F0 /* EchoLinkVirtualAudio8ch.driver */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = EchoLinkVirtualAudio8ch.driver; sourceTree = BUILT_PRODUCTS_DIR; };
 		3D8966882849D45F002AB3F0 /* postinstall */ = {isa = PBXFileReference; lastKnownFileType = text.script.sh; path = postinstall; sourceTree = "<group>"; };
 		3D8966892849D45F002AB3F0 /* preinstall */ = {isa = PBXFileReference; lastKnownFileType = text.script.sh; path = preinstall; sourceTree = "<group>"; };
 		EBAD0E120C0F120C0F120001 /* deploymentSettings.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = deploymentSettings.xcconfig; sourceTree = "<group>"; };
@@ -106,7 +106,7 @@
 		2D7477AA1578168D00412279 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				3D89664D2849C318002AB3F0 /* EchoLinkVirtualAudio.driver */,
+				3D89664D2849C318002AB3F0 /* EchoLinkVirtualAudio8ch.driver */,
 				3D88D48C285BBA5800629399 /* EchoLinkVirtualAudioTests */,
 			);
 			name = Products;
@@ -187,7 +187,7 @@
 			);
 			name = EchoLinkVirtualAudio;
 			productName = EchoLinkVirtualAudio;
-			productReference = 3D89664D2849C318002AB3F0 /* EchoLinkVirtualAudio.driver */;
+			productReference = 3D89664D2849C318002AB3F0 /* EchoLinkVirtualAudio8ch.driver */;
 			productType = "com.apple.product-type.bundle";
 		};
 /* End PBXNativeTarget section */
@@ -539,13 +539,14 @@
 				GCC_PREPROCESSOR_DEFINITIONS = (
 					"$(inherited)",
 					"DEBUG=0",
+					"kNumber_Of_Channels=8",
 				);
 				INFOPLIST_FILE = EchoLinkDriver/echoLinkVirtualAudio.plist;
 				INSTALL_PATH = "$(LOCAL_LIBRARY_DIR)/Audio/Plug-Ins/HAL";
 				MACOSX_DEPLOYMENT_TARGET = 12.3;
 				MARKETING_VERSION = 0.6.1;
-				PRODUCT_BUNDLE_IDENTIFIER = audio.neocoode.EchoLinkVirtualAudio2ch;
-				PRODUCT_NAME = EchoLinkVirtualAudio;
+				PRODUCT_BUNDLE_IDENTIFIER = audio.neocoode.EchoLinkVirtualAudio8ch;
+				PRODUCT_NAME = EchoLinkVirtualAudio8ch;
 				WRAPPER_EXTENSION = driver;
 			};
 			name = Release;
@@ -561,13 +562,14 @@
 				GCC_PREPROCESSOR_DEFINITIONS = (
 					"$(inherited)",
 					"DEBUG=1",
+					"kNumber_Of_Channels=8",
 				);
 				INFOPLIST_FILE = EchoLinkDriver/echoLinkVirtualAudio.plist;
 				INSTALL_PATH = "$(LOCAL_LIBRARY_DIR)/Audio/Plug-Ins/HAL";
 				MACOSX_DEPLOYMENT_TARGET = 12.3;
 				MARKETING_VERSION = 0.6.1;
-				PRODUCT_BUNDLE_IDENTIFIER = audio.neocoode.EchoLinkVirtualAudio2ch;
-				PRODUCT_NAME = EchoLinkVirtualAudio;
+				PRODUCT_BUNDLE_IDENTIFIER = audio.neocoode.EchoLinkVirtualAudio8ch;
+				PRODUCT_NAME = EchoLinkVirtualAudio8ch;
 				WRAPPER_EXTENSION = driver;
 			};
 			name = Debug;
@@ -583,13 +585,14 @@
 				GCC_PREPROCESSOR_DEFINITIONS = (
 					"$(inherited)",
 					"DEBUG=1",
+					"kNumber_Of_Channels=8",
 				);
 				INFOPLIST_FILE = EchoLinkDriver/echoLinkVirtualAudio.plist;
 				INSTALL_PATH = "$(LOCAL_LIBRARY_DIR)/Audio/Plug-Ins/HAL";
 				MACOSX_DEPLOYMENT_TARGET = 12.3;
 				MARKETING_VERSION = 0.6.1;
-				PRODUCT_BUNDLE_IDENTIFIER = audio.neocoode.EchoLinkVirtualAudio2ch;
-				PRODUCT_NAME = EchoLinkVirtualAudio;
+				PRODUCT_BUNDLE_IDENTIFIER = audio.neocoode.EchoLinkVirtualAudio8ch;
+				PRODUCT_NAME = EchoLinkVirtualAudio8ch;
 				WRAPPER_EXTENSION = driver;
 			};
 			name = "Debug-Opt";
