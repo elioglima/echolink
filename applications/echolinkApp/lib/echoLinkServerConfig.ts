@@ -1,20 +1,44 @@
+import { fetchEchoLinkService } from "./echoLinkLocalTransport";
 import {
   parseEchoLinkSettingsFromServer,
   type EchoLinkSettings,
 } from "./echoLinkSettings";
 
-const originFromEnv =
-  typeof process !== "undefined" &&
-  typeof process.env.NEXT_PUBLIC_ECHO_LINK_SERVICE_ORIGIN === "string" &&
-  process.env.NEXT_PUBLIC_ECHO_LINK_SERVICE_ORIGIN.length > 0
-    ? process.env.NEXT_PUBLIC_ECHO_LINK_SERVICE_ORIGIN
-    : null;
+const SERVER_CONFIG_PATCH_DEBOUNCE_MS = 220;
+let serverConfigPatchPending: Partial<EchoLinkSettings> | null = null;
+let serverConfigPatchTimer: ReturnType<typeof setTimeout> | null = null;
 
-const ECHO_LINK_SERVICE_ORIGIN = originFromEnv ?? "http://127.0.0.1:8765";
+function scheduleServerConfigPatchFlush() {
+  if (serverConfigPatchTimer !== null) {
+    clearTimeout(serverConfigPatchTimer);
+  }
+  serverConfigPatchTimer = setTimeout(() => {
+    serverConfigPatchTimer = null;
+    void flushEchoLinkServerConfigPatch();
+  }, SERVER_CONFIG_PATCH_DEBOUNCE_MS);
+}
+
+async function flushEchoLinkServerConfigPatch(): Promise<void> {
+  const body = serverConfigPatchPending;
+  serverConfigPatchPending = null;
+  if (!body || Object.keys(body).length === 0) {
+    return;
+  }
+  try {
+    const res = await fetchEchoLinkService("/config", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) return;
+  } catch {
+    return;
+  }
+}
 
 export async function hydrateEchoLinkSettingsFromServer(): Promise<EchoLinkSettings | null> {
   try {
-    const res = await fetch(`${ECHO_LINK_SERVICE_ORIGIN}/config`, {
+    const res = await fetchEchoLinkService("/config", {
       method: "GET",
       cache: "no-store",
     });
@@ -29,14 +53,12 @@ export async function hydrateEchoLinkSettingsFromServer(): Promise<EchoLinkSetti
 export async function pushEchoLinkServerConfigPatch(
   partial: Partial<EchoLinkSettings>
 ): Promise<void> {
-  try {
-    const res = await fetch(`${ECHO_LINK_SERVICE_ORIGIN}/config`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(partial),
-    });
-    if (!res.ok) return;
-  } catch {
+  if (Object.keys(partial).length === 0) {
     return;
   }
+  serverConfigPatchPending = {
+    ...serverConfigPatchPending,
+    ...partial,
+  };
+  scheduleServerConfigPatchFlush();
 }

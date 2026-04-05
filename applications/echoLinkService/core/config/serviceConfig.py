@@ -14,6 +14,30 @@ from core.files.localFileCache import (
 
 _log = logging.getLogger(__name__)
 
+_MIXER_STRIP_ORDER_DEFAULT = ["ch1", "ch2", "ch3", "output"]
+_MIXER_STRIP_IDS = frozenset({"ch1", "ch2", "ch3", "output"})
+
+
+def _mixer_strip_order(v: Any) -> list[str]:
+    if not isinstance(v, list):
+        return list(_MIXER_STRIP_ORDER_DEFAULT)
+    seen: set[str] = set()
+    out: list[str] = []
+    for x in v:
+        if not isinstance(x, str) or x not in _MIXER_STRIP_IDS:
+            return list(_MIXER_STRIP_ORDER_DEFAULT)
+        if x in seen:
+            continue
+        seen.add(x)
+        out.append(x)
+    if len(out) == 4 and len(seen) == 4:
+        return out
+    if len(out) == 3 and seen == {"ch1", "ch2", "output"}:
+        i = out.index("output")
+        return [*out[:i], "ch3", *out[i:]]
+    return list(_MIXER_STRIP_ORDER_DEFAULT)
+
+
 ALLOWED_SPEECH_LANG = frozenset({"pt-BR", "en-US"})
 ALIAS_KEY_MAX = 512
 ALIAS_VALUE_MAX = 96
@@ -51,6 +75,8 @@ class EchoLinkConfigModel(BaseModel):
     inputSensitivity: int = Field(default=2959, ge=10, le=5000)
     primaryChannelMixGainPercent: int = Field(default=100, ge=0, le=150)
     secondaryChannelMixGainPercent: int = Field(default=100, ge=0, le=150)
+    tertiaryChannelMixGainPercent: int = Field(default=100, ge=0, le=150)
+    outputChannelMixGainPercent: int = Field(default=100, ge=0, le=150)
     inputDeviceAliases: dict[str, str] = Field(default_factory=dict)
     outputDeviceAliases: dict[str, str] = Field(default_factory=dict)
     speechReceiveLanguage: str = "pt-BR"
@@ -58,6 +84,7 @@ class EchoLinkConfigModel(BaseModel):
     speechLanguagesEnabled: bool = True
     selectedInputDeviceId: str = Field(default="", max_length=512)
     selectedSecondaryInputDeviceId: str = Field(default="", max_length=512)
+    selectedTertiaryInputDeviceId: str = Field(default="", max_length=512)
     selectedOutputDeviceId: str = Field(default="", max_length=512)
     selectedElevenLabsVoiceId: str = Field(
         default="bIHbv24MWmeRgasZH58o", max_length=96
@@ -65,6 +92,25 @@ class EchoLinkConfigModel(BaseModel):
     voiceTranslationEnabled: bool = True
     pipelineMonitorEnabled: bool = False
     pipelineMonitorGainPercent: int = Field(default=12, ge=1, le=100)
+    sidebarSection: str = "audioIn"
+    audioInLayoutMode: str = "mixer"
+    audioInDetailScope: str = "both"
+    audioInChannelTab: str = "microphone"
+    mixerChannel1Active: bool = True
+    mixerChannel2Active: bool = False
+    mixerChannel3Active: bool = False
+    mixerChannel1Muted: bool = False
+    mixerChannel2Muted: bool = False
+    mixerChannel3Muted: bool = False
+    mixerOutputMuted: bool = False
+    mixerStripOrder: list[str] = Field(
+        default_factory=lambda: list(_MIXER_STRIP_ORDER_DEFAULT)
+    )
+
+    @field_validator("mixerStripOrder", mode="before")
+    @classmethod
+    def mixer_strip_order(cls, v: Any) -> list[str]:
+        return _mixer_strip_order(v)
 
     @field_validator("inputDeviceAliases", "outputDeviceAliases", mode="before")
     @classmethod
@@ -81,6 +127,45 @@ class EchoLinkConfigModel(BaseModel):
     def transform_lang(cls, v: Any) -> str:
         return _speech_lang(v, "en-US")
 
+    @field_validator("sidebarSection", mode="before")
+    @classmethod
+    def sidebar_section(cls, v: Any) -> str:
+        if isinstance(v, str) and v in (
+            "audioIn",
+            "monitor",
+            "vocabulary",
+            "chats",
+            "info",
+        ):
+            return v
+        return "audioIn"
+
+    @field_validator("audioInLayoutMode", mode="before")
+    @classmethod
+    def audio_in_layout(cls, v: Any) -> str:
+        if isinstance(v, str) and v in ("mixer", "detail"):
+            return v
+        return "mixer"
+
+    @field_validator("audioInDetailScope", mode="before")
+    @classmethod
+    def audio_in_detail_scope(cls, v: Any) -> str:
+        if isinstance(v, str) and v in (
+            "both",
+            "microphone",
+            "systemAudio",
+            "media",
+        ):
+            return v
+        return "both"
+
+    @field_validator("audioInChannelTab", mode="before")
+    @classmethod
+    def audio_in_channel_tab(cls, v: Any) -> str:
+        if isinstance(v, str) and v in ("microphone", "systemAudio", "media"):
+            return v
+        return "microphone"
+
 
 class EchoLinkConfigPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -95,6 +180,12 @@ class EchoLinkConfigPatch(BaseModel):
     secondaryChannelMixGainPercent: int | None = Field(
         default=None, ge=0, le=150
     )
+    tertiaryChannelMixGainPercent: int | None = Field(
+        default=None, ge=0, le=150
+    )
+    outputChannelMixGainPercent: int | None = Field(
+        default=None, ge=0, le=150
+    )
     inputDeviceAliases: dict[str, str] | None = None
     outputDeviceAliases: dict[str, str] | None = None
     speechReceiveLanguage: str | None = None
@@ -104,11 +195,33 @@ class EchoLinkConfigPatch(BaseModel):
     selectedSecondaryInputDeviceId: str | None = Field(
         default=None, max_length=512
     )
+    selectedTertiaryInputDeviceId: str | None = Field(
+        default=None, max_length=512
+    )
     selectedOutputDeviceId: str | None = Field(default=None, max_length=512)
     selectedElevenLabsVoiceId: str | None = Field(default=None, max_length=96)
     voiceTranslationEnabled: bool | None = None
     pipelineMonitorEnabled: bool | None = None
     pipelineMonitorGainPercent: int | None = Field(default=None, ge=1, le=100)
+    sidebarSection: str | None = None
+    audioInLayoutMode: str | None = None
+    audioInDetailScope: str | None = None
+    audioInChannelTab: str | None = None
+    mixerChannel1Active: bool | None = None
+    mixerChannel2Active: bool | None = None
+    mixerChannel3Active: bool | None = None
+    mixerChannel1Muted: bool | None = None
+    mixerChannel2Muted: bool | None = None
+    mixerChannel3Muted: bool | None = None
+    mixerOutputMuted: bool | None = None
+    mixerStripOrder: list[str] | None = None
+
+    @field_validator("mixerStripOrder", mode="before")
+    @classmethod
+    def mixer_strip_order_patch(cls, v: Any) -> list[str] | None:
+        if v is None:
+            return None
+        return _mixer_strip_order(v)
 
     @field_validator("inputDeviceAliases", "outputDeviceAliases", mode="before")
     @classmethod

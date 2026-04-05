@@ -1,11 +1,4 @@
-const originFromEnv =
-  typeof process !== "undefined" &&
-  typeof process.env.NEXT_PUBLIC_ECHO_LINK_SERVICE_ORIGIN === "string" &&
-  process.env.NEXT_PUBLIC_ECHO_LINK_SERVICE_ORIGIN.length > 0
-    ? process.env.NEXT_PUBLIC_ECHO_LINK_SERVICE_ORIGIN
-    : null;
-
-const ECHO_LINK_SERVICE_ORIGIN = originFromEnv ?? "http://127.0.0.1:8765";
+import { fetchEchoLinkService } from "./echoLinkLocalTransport";
 
 export type EchoLinkChatSessionStart = {
   sessionId: string;
@@ -14,7 +7,7 @@ export type EchoLinkChatSessionStart = {
 
 export async function postEchoLinkChatSession(): Promise<EchoLinkChatSessionStart | null> {
   try {
-    const res = await fetch(`${ECHO_LINK_SERVICE_ORIGIN}/chats/sessions`, {
+    const res = await fetchEchoLinkService("/chats/sessions", {
       method: "POST",
       cache: "no-store",
     });
@@ -48,8 +41,8 @@ export async function putEchoLinkChatSessionSnapshot(
   }
 ): Promise<void> {
   try {
-    await fetch(
-      `${ECHO_LINK_SERVICE_ORIGIN}/chats/sessions/${encodeURIComponent(sessionId)}`,
+    await fetchEchoLinkService(
+      `/chats/sessions/${encodeURIComponent(sessionId)}`,
       {
         method: "PUT",
         headers: { "Content-Type": "application/json" },

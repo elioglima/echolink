@@ -14,7 +14,8 @@ from core.api.vocabularyCacheRoutes import router as vocabulary_cache_router
 from core.api.voiceTranslationRoutes import router as voice_translation_router
 from core.api.chatRoutes import router as chat_router
 from core.files.localFileCache import ensure_cache_dirs
-from core.files.runtimeState import mark_server_started, mark_server_stopped, service_bind_from_env
+from core.config.localIpcBinding import resolve_listen_config
+from core.files.runtimeState import mark_server_started, mark_server_stopped
 
 
 def apply_echo_link_aws_profile_env() -> None:
@@ -29,8 +30,8 @@ def apply_echo_link_aws_profile_env() -> None:
 async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     apply_echo_link_aws_profile_env()
     ensure_cache_dirs()
-    bind_host, bind_port = service_bind_from_env()
-    mark_server_started(bind_host, bind_port)
+    lc = resolve_listen_config()
+    mark_server_started(lc.host, lc.port, uds_path=lc.uds_path, listen_mode=lc.mode)
     try:
         yield
     finally:

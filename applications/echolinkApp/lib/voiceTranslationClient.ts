@@ -3,17 +3,11 @@ import {
   type ElevenLabsVoiceDisplayBundle,
 } from "./elevenLabsVoiceDisplay";
 import { isSubstantivePhraseForJournal } from "./substantivePhraseForJournal";
+import { fetchEchoLinkService } from "./echoLinkLocalTransport";
 import {
   lookupVoiceTranslationCache,
   storeVoiceTranslationCache,
 } from "./voiceTranslationCache";
-
-const serviceOrigin =
-  typeof process !== "undefined" &&
-  typeof process.env.NEXT_PUBLIC_ECHO_LINK_SERVICE_ORIGIN === "string" &&
-  process.env.NEXT_PUBLIC_ECHO_LINK_SERVICE_ORIGIN.length > 0
-    ? process.env.NEXT_PUBLIC_ECHO_LINK_SERVICE_ORIGIN
-    : "http://127.0.0.1:8765";
 
 export type VoiceTranslationStatus = {
   translateReady: boolean;
@@ -32,7 +26,7 @@ export type VoiceTranslationStatus = {
 };
 
 export async function fetchVoiceTranslationStatus(): Promise<VoiceTranslationStatus> {
-  const res = await fetch(`${serviceOrigin}/voiceTranslation/status`, {
+  const res = await fetchEchoLinkService("/voiceTranslation/status", {
     cache: "no-store",
   });
   if (!res.ok) {
@@ -49,7 +43,7 @@ export type ElevenLabsVoiceOption = {
 
 export async function fetchElevenLabsVoiceDisplay(): Promise<ElevenLabsVoiceDisplayBundle> {
   try {
-    const res = await fetch(`${serviceOrigin}/voiceTranslation/voiceDisplay`, {
+    const res = await fetchEchoLinkService("/voiceTranslation/voiceDisplay", {
       cache: "no-store",
     });
     if (!res.ok) {
@@ -116,7 +110,7 @@ export async function fetchElevenLabsVoiceDisplay(): Promise<ElevenLabsVoiceDisp
 }
 
 export async function fetchElevenLabsVoices(): Promise<ElevenLabsVoiceOption[]> {
-  const res = await fetch(`${serviceOrigin}/voiceTranslation/voices`, {
+  const res = await fetchEchoLinkService("/voiceTranslation/voices", {
     cache: "no-store",
   });
   if (!res.ok) {
@@ -156,7 +150,7 @@ export async function fetchTranslatedVoiceAudio(
   opts?: { elevenLabsVoiceId?: string }
 ): Promise<ArrayBuffer> {
   const id = opts?.elevenLabsVoiceId?.trim();
-  const res = await fetch(`${serviceOrigin}/voiceTranslation/synthesize`, {
+  const res = await fetchEchoLinkService("/voiceTranslation/synthesize", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -214,7 +208,7 @@ export async function fetchTranslatedVoiceAudioWithText(
     }
   }
   const id = opts.elevenLabsVoiceId?.trim();
-  const res = await fetch(`${serviceOrigin}/voiceTranslation/synthesize`, {
+  const res = await fetchEchoLinkService("/voiceTranslation/synthesize", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({

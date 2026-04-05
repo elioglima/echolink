@@ -1,16 +1,18 @@
 {
   "status": "running",
-  "startedAt": "2026-04-05T05:04:45Z",
+  "startedAt": "2026-04-05T07:06:31Z",
   "stoppedAt": null,
-  "pid": 47322,
+  "pid": 19910,
   "host": "127.0.0.1",
   "port": 8765,
+  "listenMode": "tcp",
+  "udsPath": null,
   "activeWebSockets": {
     "mic": 0,
     "stt": 0
   },
   "panelCaptureActive": false,
   "panelCaptureStartedAt": null,
-  "panelCaptureStoppedAt": "2026-04-05T05:06:40Z",
-  "updatedAt": "2026-04-05T05:06:40Z"
+  "panelCaptureStoppedAt": "2026-04-05T07:21:14Z",
+  "updatedAt": "2026-04-05T07:21:14Z"
 }

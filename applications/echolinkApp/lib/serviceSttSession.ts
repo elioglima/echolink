@@ -1,4 +1,9 @@
-export const STT_WS_URL = "ws://127.0.0.1:8765/ws/stt";
+import {
+  echoLinkServiceOriginForDisplay,
+  openEchoLinkServiceWebSocket,
+} from "./echoLinkLocalTransport";
+
+export { getEchoLinkSttWebSocketUrl } from "./echoLinkLocalTransport";
 
 const TARGET_RATE = 16000;
 const STT_LOWPASS_HZ = 7200;
@@ -131,12 +136,16 @@ export async function startServiceSttSession(
   source: MediaStreamAudioSourceNode,
   onClientEvent: (ev: ServiceSttClientEvent) => void
 ): Promise<() => void> {
-  const ws = new WebSocket(STT_WS_URL);
+  const ws = openEchoLinkServiceWebSocket("/ws/stt");
   ws.binaryType = "arraybuffer";
 
   await new Promise<void>((resolve, reject) => {
     ws.onerror = () => {
-      reject(new Error("Falha na conexão WebSocket STT (serviço em 127.0.0.1:8765?)."));
+      reject(
+        new Error(
+          `Falha na conexão WebSocket STT (serviço em ${echoLinkServiceOriginForDisplay()}?).`
+        )
+      );
     };
     ws.onopen = () => resolve();
   });

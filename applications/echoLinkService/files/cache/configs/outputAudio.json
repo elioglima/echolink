@@ -1,11 +1,11 @@
 {
-  "selectedOutputDeviceId": "8b96b18d3acf8435c24673cecf663e49f0c7f003a5512730885a5feec7f545fa",
+  "selectedOutputDeviceId": "8d09e551a266492b65e70da8f61d54e45c5751786bad9348fbf1f1fdedad0371",
   "outputDeviceAliases": {},
-  "pipelineMonitorEnabled": false,
-  "pipelineMonitorGainPercent": 12,
+  "pipelineMonitorEnabled": true,
+  "pipelineMonitorGainPercent": 100,
   "speechReceiveLanguage": "pt-BR",
   "speechTransformLanguage": "en-US",
-  "speechLanguagesEnabled": false,
+  "speechLanguagesEnabled": true,
   "selectedElevenLabsVoiceId": "pqHfZKP75CvOlQylNhV4",
-  "voiceTranslationEnabled": false
+  "voiceTranslationEnabled": true
 }

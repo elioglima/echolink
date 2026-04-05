@@ -12,7 +12,70 @@ export type EchoLinkSettingsKey =
   | TimingKey
   | "inputSensitivity"
   | "primaryChannelMixGainPercent"
-  | "secondaryChannelMixGainPercent";
+  | "secondaryChannelMixGainPercent"
+  | "tertiaryChannelMixGainPercent"
+  | "outputChannelMixGainPercent";
+
+export type EchoLinkSidebarSection =
+  | "audioIn"
+  | "monitor"
+  | "vocabulary"
+  | "chats"
+  | "info";
+
+export type EchoLinkAudioInLayoutMode = "mixer" | "detail";
+
+export type EchoLinkAudioInDetailScope =
+  | "both"
+  | "microphone"
+  | "systemAudio"
+  | "media";
+
+export type EchoLinkAudioInChannelTab = "microphone" | "systemAudio" | "media";
+
+export type EchoLinkMixerStripId = "ch1" | "ch2" | "ch3" | "output";
+
+export const ECHO_LINK_MIXER_STRIP_ORDER_DEFAULT: EchoLinkMixerStripId[] = [
+  "ch1",
+  "ch2",
+  "ch3",
+  "output",
+];
+
+export function sanitizeMixerStripOrder(
+  raw: unknown
+): EchoLinkMixerStripId[] {
+  const fallback = [...ECHO_LINK_MIXER_STRIP_ORDER_DEFAULT];
+  if (!Array.isArray(raw)) {
+    return fallback;
+  }
+  const seen = new Set<EchoLinkMixerStripId>();
+  const out: EchoLinkMixerStripId[] = [];
+  for (const x of raw) {
+    if (x !== "ch1" && x !== "ch2" && x !== "ch3" && x !== "output") {
+      return fallback;
+    }
+    if (seen.has(x)) {
+      continue;
+    }
+    seen.add(x);
+    out.push(x);
+  }
+  if (out.length === 4 && seen.size === 4) {
+    return out;
+  }
+  if (
+    out.length === 3 &&
+    seen.has("ch1") &&
+    seen.has("ch2") &&
+    seen.has("output") &&
+    !seen.has("ch3")
+  ) {
+    const idxOut = out.indexOf("output");
+    return [...out.slice(0, idxOut), "ch3", ...out.slice(idxOut)];
+  }
+  return fallback;
+}
 
 export type EchoLinkSettings = {
   audioChunkMs: number;
@@ -26,6 +89,7 @@ export type EchoLinkSettings = {
   speechLanguagesEnabled: boolean;
   selectedInputDeviceId: string;
   selectedSecondaryInputDeviceId: string;
+  selectedTertiaryInputDeviceId: string;
   selectedOutputDeviceId: string;
   selectedElevenLabsVoiceId: string;
   voiceTranslationEnabled: boolean;
@@ -33,6 +97,20 @@ export type EchoLinkSettings = {
   pipelineMonitorGainPercent: number;
   primaryChannelMixGainPercent: number;
   secondaryChannelMixGainPercent: number;
+  tertiaryChannelMixGainPercent: number;
+  outputChannelMixGainPercent: number;
+  sidebarSection: EchoLinkSidebarSection;
+  audioInLayoutMode: EchoLinkAudioInLayoutMode;
+  audioInDetailScope: EchoLinkAudioInDetailScope;
+  audioInChannelTab: EchoLinkAudioInChannelTab;
+  mixerChannel1Active: boolean;
+  mixerChannel2Active: boolean;
+  mixerChannel3Active: boolean;
+  mixerChannel1Muted: boolean;
+  mixerChannel2Muted: boolean;
+  mixerChannel3Muted: boolean;
+  mixerOutputMuted: boolean;
+  mixerStripOrder: EchoLinkMixerStripId[];
 };
 
 export const ECHO_LINK_STORAGE_KEY = "echoLink.settings.v1";
@@ -52,6 +130,7 @@ export const ECHO_LINK_SETTINGS_PLACEHOLDER: EchoLinkSettings = {
   speechLanguagesEnabled: false,
   selectedInputDeviceId: "",
   selectedSecondaryInputDeviceId: "",
+  selectedTertiaryInputDeviceId: "",
   selectedOutputDeviceId: "",
   selectedElevenLabsVoiceId: "",
   voiceTranslationEnabled: false,
@@ -59,6 +138,20 @@ export const ECHO_LINK_SETTINGS_PLACEHOLDER: EchoLinkSettings = {
   pipelineMonitorGainPercent: 25,
   primaryChannelMixGainPercent: 100,
   secondaryChannelMixGainPercent: 100,
+  tertiaryChannelMixGainPercent: 100,
+  outputChannelMixGainPercent: 100,
+  sidebarSection: "audioIn",
+  audioInLayoutMode: "mixer",
+  audioInDetailScope: "both",
+  audioInChannelTab: "microphone",
+  mixerChannel1Active: true,
+  mixerChannel2Active: false,
+  mixerChannel3Active: false,
+  mixerChannel1Muted: false,
+  mixerChannel2Muted: false,
+  mixerChannel3Muted: false,
+  mixerOutputMuted: false,
+  mixerStripOrder: [...ECHO_LINK_MIXER_STRIP_ORDER_DEFAULT],
 };
 
 function sanitizeDeviceId(raw: unknown): string {
@@ -91,6 +184,8 @@ const RANGES: Record<EchoLinkSettingsKey, [number, number]> = {
   inputSensitivity: [10, 5000],
   primaryChannelMixGainPercent: [0, 150],
   secondaryChannelMixGainPercent: [0, 150],
+  tertiaryChannelMixGainPercent: [0, 150],
+  outputChannelMixGainPercent: [0, 150],
 };
 
 export function clampEchoLinkSetting(
@@ -158,9 +253,67 @@ function mergeEchoLinkSettingsPayload(
             : ECHO_LINK_SETTINGS_PLACEHOLDER.speechLanguagesEnabled;
         return;
       }
+      if (key === "sidebarSection") {
+        if (
+          v === "audioIn" ||
+          v === "monitor" ||
+          v === "vocabulary" ||
+          v === "chats" ||
+          v === "info"
+        ) {
+          out[key] = v;
+        }
+        return;
+      }
+      if (key === "audioInLayoutMode") {
+        if (v === "mixer" || v === "detail") {
+          out[key] = v;
+        }
+        return;
+      }
+      if (key === "audioInDetailScope") {
+        if (
+          v === "both" ||
+          v === "microphone" ||
+          v === "systemAudio" ||
+          v === "media"
+        ) {
+          out[key] = v;
+        }
+        return;
+      }
+      if (key === "audioInChannelTab") {
+        if (
+          v === "microphone" ||
+          v === "systemAudio" ||
+          v === "media"
+        ) {
+          out[key] = v;
+        }
+        return;
+      }
+      if (
+        key === "mixerChannel1Active" ||
+        key === "mixerChannel2Active" ||
+        key === "mixerChannel3Active" ||
+        key === "mixerChannel1Muted" ||
+        key === "mixerChannel2Muted" ||
+        key === "mixerChannel3Muted" ||
+        key === "mixerOutputMuted"
+      ) {
+        if (typeof v === "boolean") {
+          out[key] = v;
+        }
+        return;
+      }
+      if (key === "mixerStripOrder") {
+        out[key] = sanitizeMixerStripOrder(v);
+        return;
+      }
       if (
         key === "selectedInputDeviceId" ||
         key === "selectedSecondaryInputDeviceId" ||
+        key === "selectedTertiaryInputDeviceId" ||
         key === "selectedOutputDeviceId"
       ) {
         out[key] = sanitizeDeviceId(v);
@@ -185,7 +338,9 @@ function mergeEchoLinkSettingsPayload(
       }
       if (
         key === "primaryChannelMixGainPercent" ||
-        key === "secondaryChannelMixGainPercent"
+        key === "secondaryChannelMixGainPercent" ||
+        key === "tertiaryChannelMixGainPercent" ||
+        key === "outputChannelMixGainPercent"
       ) {
         if (typeof v === "number" && Number.isFinite(v)) {
           out[key] = clampEchoLinkSetting(key, Math.round(v));
@@ -306,9 +461,63 @@ export function saveEchoLinkSettingsToStorage(
       }
       return;
     }
+    if (key === "sidebarSection") {
+      if (
+        v === "audioIn" ||
+        v === "monitor" ||
+        v === "vocabulary" ||
+        v === "chats" ||
+        v === "info"
+      ) {
+        next[key] = v;
+      }
+      return;
+    }
+    if (key === "audioInLayoutMode") {
+      if (v === "mixer" || v === "detail") {
+        next[key] = v;
+      }
+      return;
+    }
+    if (key === "audioInDetailScope") {
+      if (
+        v === "both" ||
+        v === "microphone" ||
+        v === "systemAudio" ||
+        v === "media"
+      ) {
+        next[key] = v;
+      }
+      return;
+    }
+    if (key === "audioInChannelTab") {
+      if (v === "microphone" || v === "systemAudio" || v === "media") {
+        next[key] = v;
+      }
+      return;
+    }
+    if (
+      key === "mixerChannel1Active" ||
+      key === "mixerChannel2Active" ||
+      key === "mixerChannel3Active" ||
+      key === "mixerChannel1Muted" ||
+      key === "mixerChannel2Muted" ||
+      key === "mixerChannel3Muted" ||
+      key === "mixerOutputMuted"
+    ) {
+      if (typeof v === "boolean") {
+        next[key] = v;
+      }
+      return;
+    }
+    if (key === "mixerStripOrder") {
+      next[key] = sanitizeMixerStripOrder(v);
+      return;
+    }
     if (
       key === "selectedInputDeviceId" ||
       key === "selectedSecondaryInputDeviceId" ||
+      key === "selectedTertiaryInputDeviceId" ||
       key === "selectedOutputDeviceId"
     ) {
       if (typeof v === "string") {
@@ -336,7 +545,9 @@ export function saveEchoLinkSettingsToStorage(
     }
     if (
       key === "primaryChannelMixGainPercent" ||
-      key === "secondaryChannelMixGainPercent"
+      key === "secondaryChannelMixGainPercent" ||
+      key === "tertiaryChannelMixGainPercent" ||
+      key === "outputChannelMixGainPercent"
     ) {
       if (typeof v === "number" && Number.isFinite(v)) {
         next[key] = clampEchoLinkSetting(key, Math.round(v));

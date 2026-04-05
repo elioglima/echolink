@@ -18,6 +18,16 @@ CONFIG_INPUT_AUDIO_PATH = CONFIGS_CACHE / "inputAudio.json"
 CONFIG_OUTPUT_AUDIO_PATH = CONFIGS_CACHE / "outputAudio.json"
 CONFIG_PARAMETERS_PATH = CONFIGS_CACHE / "parameters.json"
 CONFIG_SETTINGS_PATH = CONFIGS_CACHE / "settings.json"
+CONFIG_FADER1_PATH = CONFIGS_CACHE / "fader1.json"
+CONFIG_FADER2_PATH = CONFIGS_CACHE / "fader2.json"
+CONFIG_FADER3_PATH = CONFIGS_CACHE / "fader3.json"
+CONFIG_FADER4_PATH = CONFIGS_CACHE / "fader4.json"
+_FADER_SLICES: tuple[tuple[Path, str], ...] = (
+    (CONFIG_FADER1_PATH, "primaryChannelMixGainPercent"),
+    (CONFIG_FADER2_PATH, "secondaryChannelMixGainPercent"),
+    (CONFIG_FADER3_PATH, "tertiaryChannelMixGainPercent"),
+    (CONFIG_FADER4_PATH, "outputChannelMixGainPercent"),
+)
 CHATS_CACHE = CACHE_ROOT / "chats"
 
 
@@ -191,6 +201,19 @@ def read_selected_eleven_labs_voice_id_from_output_audio() -> str:
     return raw.strip()[:96]
 
 
+def _read_fader_slices_into(merged: dict[str, Any]) -> None:
+    for path, state_key in _FADER_SLICES:
+        data = _read_json_file(path)
+        if not data:
+            continue
+        if state_key in data and isinstance(data[state_key], (int, float)):
+            merged[state_key] = int(round(float(data[state_key])))
+            continue
+        raw = data.get("mixGainPercent")
+        if isinstance(raw, (int, float)):
+            merged[state_key] = int(round(float(raw)))
+
+
 def read_echo_link_config_slices() -> dict[str, Any]:
     ensure_cache_dirs()
     merged: dict[str, Any] = {}
@@ -203,7 +226,21 @@ def read_echo_link_config_slices() -> dict[str, Any]:
         part = _read_json_file(path)
         if part:
             merged.update(part)
+    _read_fader_slices_into(merged)
     return merged
+
+
+def _write_fader_slices(state: dict[str, Any]) -> None:
+    for path, state_key in _FADER_SLICES:
+        if state_key not in state:
+            continue
+        v = state[state_key]
+        if not isinstance(v, (int, float)):
+            continue
+        _write_json_file(
+            path,
+            {"mixGainPercent": int(round(float(v)))},
+        )
 
 
 def write_echo_link_config_slices(state: dict[str, Any]) -> None:
@@ -212,13 +249,13 @@ def write_echo_link_config_slices(state: dict[str, Any]) -> None:
         for k in (
             "selectedInputDeviceId",
             "selectedSecondaryInputDeviceId",
+            "selectedTertiaryInputDeviceId",
             "inputDeviceAliases",
             "audioChunkMs",
             "transcriptionStartDelayMs",
             "phraseSilenceCutMs",
             "inputSensitivity",
-            "primaryChannelMixGainPercent",
-            "secondaryChannelMixGainPercent",
+            "mixerStripOrder",
         )
         if k in state
     }
@@ -241,5 +278,6 @@ def write_echo_link_config_slices(state: dict[str, Any]) -> None:
     settings: dict[str, Any] = {}
     _write_json_file(CONFIG_INPUT_AUDIO_PATH, input_audio)
     _write_json_file(CONFIG_OUTPUT_AUDIO_PATH, output_audio)
+    _write_fader_slices(state)
     _write_json_file(CONFIG_PARAMETERS_PATH, parameters)
     _write_json_file(CONFIG_SETTINGS_PATH, settings)

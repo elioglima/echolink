@@ -20,6 +20,8 @@ _ws_stt = 0
 _started_at: str | None = None
 _bind_host: str | None = None
 _bind_port: int | None = None
+_uds_path: str | None = None
+_listen_mode: str = "tcp"
 _panel_capture_active = False
 _panel_capture_started_at: str | None = None
 _panel_capture_stopped_at: str | None = None
@@ -59,6 +61,8 @@ def _snapshot_unlocked() -> dict[str, Any]:
         "pid": os.getpid(),
         "host": _bind_host,
         "port": _bind_port,
+        "listenMode": _listen_mode,
+        "udsPath": _uds_path,
         "activeWebSockets": {"mic": _ws_mic, "stt": _ws_stt},
         "panelCaptureActive": _panel_capture_active,
         "panelCaptureStartedAt": _panel_capture_started_at,
@@ -68,7 +72,7 @@ def _snapshot_unlocked() -> dict[str, Any]:
 
 
 def _flush_unlocked() -> None:
-    if _bind_host is None:
+    if _bind_host is None and _uds_path is None:
         return
     _write_json(RUNTIME_STATE_PATH, _snapshot_unlocked())
 
@@ -83,13 +87,22 @@ def service_bind_from_env() -> tuple[str, int]:
     return h, p
 
 
-def mark_server_started(host: str, port: int) -> None:
+def mark_server_started(
+    host: str,
+    port: int,
+    *,
+    uds_path: str | None = None,
+    listen_mode: str = "tcp",
+) -> None:
     global _started_at, _bind_host, _bind_port
+    global _uds_path, _listen_mode
     global _ws_mic, _ws_stt
     global _panel_capture_active, _panel_capture_started_at, _panel_capture_stopped_at
     with _lock:
         _bind_host = host
         _bind_port = port
+        _uds_path = uds_path
+        _listen_mode = listen_mode if listen_mode in ("tcp", "unix") else "tcp"
         _started_at = _iso_now()
         _ws_mic = 0
         _ws_stt = 0
@@ -101,14 +114,19 @@ def mark_server_started(host: str, port: int) -> None:
 
 def mark_server_stopped() -> None:
     global _bind_host, _bind_port, _panel_capture_active
+    global _uds_path, _listen_mode
     global _ws_mic, _ws_stt
     with _lock:
         stopped_at = _iso_now()
         last_started = _started_at
         host = _bind_host
         port = _bind_port
+        uds_snapshot = _uds_path
+        mode_snapshot = _listen_mode
         _bind_host = None
         _bind_port = None
+        _uds_path = None
+        _listen_mode = "tcp"
         _ws_mic = 0
         _ws_stt = 0
         _panel_capture_active = False
@@ -119,6 +137,8 @@ def mark_server_stopped() -> None:
             "pid": None,
             "host": host,
             "port": port,
+            "listenMode": mode_snapshot,
+            "udsPath": uds_snapshot,
             "activeWebSockets": {"mic": 0, "stt": 0},
             "panelCaptureActive": False,
             "panelCaptureStartedAt": _panel_capture_started_at,
@@ -181,6 +201,8 @@ def get_runtime_snapshot() -> dict[str, Any]:
                 "pid": None,
                 "host": None,
                 "port": None,
+                "listenMode": None,
+                "udsPath": None,
                 "activeWebSockets": {"mic": 0, "stt": 0},
                 "panelCaptureActive": False,
                 "panelCaptureStartedAt": None,

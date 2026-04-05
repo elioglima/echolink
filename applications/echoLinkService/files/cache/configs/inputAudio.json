@@ -1,11 +1,16 @@
 {
-  "selectedInputDeviceId": "ba7b47da3bd7375ee43525369e7ae693e6f16e39f8f4d67fc9bce7da9303110d",
-  "selectedSecondaryInputDeviceId": "default",
+  "selectedInputDeviceId": "313cbbb89e86197265840a351c08a61d5540ae82c71baef17dec2a1c3bf96ddb",
+  "selectedSecondaryInputDeviceId": "",
+  "selectedTertiaryInputDeviceId": "033a6630d2c3c4c9766548736ee6547fe5d41274cdcaf781dea36c71ad0162fa",
   "inputDeviceAliases": {},
   "audioChunkMs": 1190,
   "transcriptionStartDelayMs": 2100,
   "phraseSilenceCutMs": 1200,
-  "inputSensitivity": 2959,
-  "primaryChannelMixGainPercent": 87,
-  "secondaryChannelMixGainPercent": 113
+  "inputSensitivity": 2520,
+  "mixerStripOrder": [
+    "ch1",
+    "ch2",
+    "ch3",
+    "output"
+  ]
 }

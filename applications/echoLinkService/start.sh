@@ -6,6 +6,8 @@ cd "$SCRIPT_DIR"
 
 export ECHO_LINK_AWS_PROFILE="${ECHO_LINK_AWS_PROFILE:-dev-neocoode}"
 export AWS_PROFILE="${AWS_PROFILE:-$ECHO_LINK_AWS_PROFILE}"
+export ECHO_LINK_BIND_HOST="${ECHO_LINK_BIND_HOST:-127.0.0.1}"
+export ECHO_LINK_BIND_PORT="${ECHO_LINK_BIND_PORT:-8765}"
 # export ELEVENLABS_VOICE_ID="${ECHO_LINK_ELEVENLABS_VOICE_ID:-hpp4J3VqNfWAUOO0d1Us}"
 
 STT_ENGINE="${ECHO_LINK_STT_ENGINE:-aws}"
@@ -92,9 +94,6 @@ else
   export VOSK_MODEL_PATH=""
 fi
 
-reload_args=(--reload)
-if [[ "${ECHO_LINK_RELOAD:-1}" == "0" ]]; then
-  reload_args=()
-fi
+export ECHO_LINK_RELOAD="${ECHO_LINK_RELOAD:-1}"
 
-exec uvicorn core.api.server:app "${reload_args[@]}" --host 127.0.0.1 --port 8765
+exec python main.py

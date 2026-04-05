@@ -7,6 +7,7 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type DragEvent,
 } from "react";
 
 import {
@@ -15,14 +16,17 @@ import {
   ECHO_LINK_STORAGE_KEY,
   hydrateEchoLinkSettingsFromElectron,
   loadEchoLinkSettingsFromLocalStorage,
+  sanitizeMixerStripOrder,
   saveEchoLinkSettingsToStorage,
-  saveEchoLinkSpeechSettings,
+  type EchoLinkMixerStripId,
   type EchoLinkSettings,
   type EchoLinkSettingsKey,
+  type EchoLinkSidebarSection,
 } from "../lib/echoLinkSettings";
 import { hydrateEchoLinkSettingsFromServer } from "../lib/echoLinkServerConfig";
 import {
   mixCaptureAudioStreams,
+  mixCaptureAudioStreamsTriple,
   passThroughCaptureWithGain,
 } from "../lib/mixCaptureAudioStreams";
 import { postEchoLinkRuntimeCapture } from "../lib/echoLinkRuntimeClient";
@@ -40,11 +44,8 @@ import {
   connectMonitorBranch,
   type AudioPipelineInject,
 } from "../lib/audioPipeline";
-import {
-  getSpeechLanguageLabel,
-  SPEECH_LANGUAGE_OPTIONS,
-} from "../lib/speechLanguages";
-import { STT_WS_URL, startServiceSttSession } from "../lib/serviceSttSession";
+import { getSpeechLanguageLabel } from "../lib/speechLanguages";
+import { startServiceSttSession } from "../lib/serviceSttSession";
 import {
   fetchElevenLabsVoiceDisplay,
   fetchElevenLabsVoices,
@@ -83,11 +84,17 @@ import {
   upsertTranscriptJournalRow,
 } from "../lib/transcriptJournalDb";
 import {
+  echoLinkServiceOriginForDisplay,
+  getEchoLinkMicWebSocketUrl,
+  getEchoLinkSttWebSocketUrl,
+  openEchoLinkServiceWebSocket,
+} from "../lib/echoLinkLocalTransport";
+import {
   AudioInLineInputDetailPanel,
+  AudioInMediaInputDetailPanel,
   AudioInMicInputDetailPanel,
 } from "./audioInChannelInputPanels";
 
-const WS_URL = "ws://127.0.0.1:8765/ws/mic";
 const RX_DECAY = 0.91;
 const RX_SPIKE = 0.42;
 const MIC_TEST_MS = 4000;
@@ -109,13 +116,34 @@ function createByteDomainBuffer(size: number): AnalyserByteDomainBuffer {
   return new Uint8Array(new ArrayBuffer(size)) as AnalyserByteDomainBuffer;
 }
 
+const RMS_METER_NOISE_FLOOR = 0.018;
+
 function mapRmsToMeterLevel(
   rms: number,
   inputSensitivityPercent: number
 ): number {
-  const gain = 3.6 * (inputSensitivityPercent / 100);
-  const x = Math.min(1, rms * gain);
+  const sensRatio = Math.max(0, inputSensitivityPercent / 100);
+  const adaptiveFloor =
+    RMS_METER_NOISE_FLOOR +
+    Math.min(0.058, Math.max(0, sensRatio - 1) * 0.0026);
+  const gated = Math.max(0, rms - adaptiveFloor);
+  if (gated <= 0) {
+    return 0;
+  }
+  const linearGain = 3.6 * Math.max(sensRatio, 0.01);
+  const gain = Math.min(linearGain, 26);
+  const x = Math.min(1, gated * gain);
   return 1 - Math.exp(-2.85 * x);
+}
+
+function smoothVuLevel(prev: number, instant: number): number {
+  if (instant <= 0) {
+    const d = prev * 0.72;
+    return d < 0.0025 ? 0 : d;
+  }
+  return instant > prev
+    ? prev * 0.78 + instant * 0.22
+    : prev * 0.91 + instant * 0.09;
 }
 
 function pickMimeType(): string {
@@ -144,19 +172,15 @@ function hintForServiceSttFailure(serverMessage: string): string {
   return "Por padrão o serviço usa Amazon Transcribe em streaming na AWS. Alternativa local: ECHO_LINK_STT_ENGINE=vosk e VOSK_MODEL_PATH no arranque do serviço.";
 }
 
-type SidebarSection =
-  | "audioIn"
-  | "audioOut"
-  | "monitor"
-  | "vocabulary"
-  | "chats"
-  | "info";
+type SidebarSection = EchoLinkSidebarSection;
 
-type AudioInChannelTab = "microphone" | "systemAudio";
+type AudioInChannelTab = "microphone" | "systemAudio" | "media";
+
+type MixerSideEditorTab = AudioInChannelTab | "output";
 
 type AudioInLayoutMode = "mixer" | "detail";
 
-type AudioInDetailScope = "both" | "microphone" | "systemAudio";
+type AudioInDetailScope = "both" | "microphone" | "systemAudio" | "media";
 
 type CaptureGainControlsRef =
   | {
@@ -167,6 +191,12 @@ type CaptureGainControlsRef =
       mode: "dual";
       setPrimaryLinear: (n: number) => void;
       setSecondaryLinear: (n: number) => void;
+    }
+  | {
+      mode: "triple";
+      setPrimaryLinear: (n: number) => void;
+      setSecondaryLinear: (n: number) => void;
+      setTertiaryLinear: (n: number) => void;
     };
 
 const MIX_FADER_MAX = 150;
@@ -180,31 +210,80 @@ function formatMixFaderDbLabel(percent: number): string {
   return rounded >= 0 ? `+${rounded}` : `${rounded}`;
 }
 
-function MixerVuStrip({
-  level,
-  className = "h-36 w-5",
-}: {
-  level: number;
-  className?: string;
-}) {
-  const h = Math.min(100, Math.max(0, level * 100));
+const MIXER_TOOLBAR_ICON_CLASS =
+  "pointer-events-none mx-auto block h-8 w-8 shrink-0 sm:h-10 sm:w-10";
+
+function IconMixerPower({ className }: { className?: string }) {
   return (
-    <div
-      className={`relative shrink-0 overflow-hidden rounded-sm bg-zinc-950 shadow-[inset_0_0_12px_rgba(0,0,0,0.92)] ring-1 ring-zinc-700/70 ${className}`}
+    <svg
+      className={className}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
       aria-hidden
     >
-      <div
-        className="absolute bottom-0 left-0 right-0 bg-linear-to-t from-emerald-600 via-amber-400 to-red-500 opacity-[0.88] transition-[height] duration-75 ease-out"
-        style={{ height: `${h}%` }}
-      />
-      <div
-        className="pointer-events-none absolute inset-0 opacity-40"
-        style={{
-          backgroundImage:
-            "repeating-linear-gradient(to top, transparent 0px, transparent 5px, rgba(0,0,0,0.55) 5px, rgba(0,0,0,0.55) 6px)",
-        }}
-      />
-    </div>
+      <path d="M12 2v10" />
+      <path d="M18.36 6.64a9 9 0 1 1-12.73 0" />
+    </svg>
+  );
+}
+
+function IconMixerSettings({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" />
+      <circle cx="12" cy="12" r="3" />
+    </svg>
+  );
+}
+
+function IconMixerVolumeOn({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <path d="M11 5L6 9H2v6h4l5 4V5z" />
+      <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+      <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
+    </svg>
+  );
+}
+
+function IconMixerVolumeMuted({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <path d="M11 5L6 9H2v6h4l5 4V5z" />
+      <line x1="22" x2="16" y1="9" y2="15" />
+      <line x1="16" x2="22" y1="9" y2="15" />
+    </svg>
   );
 }
 
@@ -220,7 +299,7 @@ function MixerFaderDbScale({
     "relative z-10 text-right font-mono text-[10px] font-medium leading-none text-zinc-200 drop-shadow-[0_1px_2px_rgba(0,0,0,1)] sm:text-[11px]";
   return (
     <div
-      className={`relative h-full shrink-0 overflow-hidden bg-black ${className}`}
+      className={`relative h-full min-h-0 overflow-hidden bg-black ${className}`}
       role="meter"
       aria-valuenow={Math.round(pct)}
       aria-valuemin={0}
@@ -258,8 +337,111 @@ function MixerFaderDbScale({
   );
 }
 
+function mixerChannelStripBorderColorClass(
+  role: "input" | "output",
+  activateOn: boolean,
+  muted: boolean,
+  faderDisabled?: boolean
+): string {
+  const pathOff = !activateOn || Boolean(faderDisabled);
+  if (pathOff) {
+    return "border-amber-400";
+  }
+  if (muted) {
+    return "border-red-500";
+  }
+  if (role === "output") {
+    return "border-blue-500";
+  }
+  return "border-emerald-500";
+}
+
+function mixerChannelStripBadgeToneClassName(
+  role: "input" | "output",
+  activateOn: boolean,
+  muted: boolean,
+  faderDisabled?: boolean
+): string {
+  const pathOff = !activateOn || Boolean(faderDisabled);
+  if (pathOff) {
+    return "bg-amber-400 text-black";
+  }
+  if (muted) {
+    return "bg-red-600 text-white";
+  }
+  if (role === "output") {
+    return "bg-sky-500 text-black";
+  }
+  return "bg-emerald-500 text-black";
+}
+
+const MIXER_STRIP_DND_TYPE = "application/x-echolink-mixer-strip";
+
+function moveMixerStripInOrder(
+  order: EchoLinkMixerStripId[],
+  fromId: EchoLinkMixerStripId,
+  toId: EchoLinkMixerStripId
+): EchoLinkMixerStripId[] {
+  if (fromId === toId) {
+    return order;
+  }
+  const next = order.filter((x) => x !== fromId);
+  const i = next.indexOf(toId);
+  if (i < 0) {
+    return order;
+  }
+  next.splice(i, 0, fromId);
+  return next;
+}
+
+function MixerStripTopDragHandle({
+  stripId,
+  draggingStripId,
+  onDragStart,
+  onDragEnd,
+}: {
+  stripId: EchoLinkMixerStripId;
+  draggingStripId: EchoLinkMixerStripId | null;
+  onDragStart: (id: EchoLinkMixerStripId) => void;
+  onDragEnd: () => void;
+}) {
+  return (
+    <div
+      className="mb-1.5 flex shrink-0 cursor-grab justify-center px-1 pt-0.5 active:cursor-grabbing"
+      draggable
+      onDragStart={(e) => {
+        e.dataTransfer.setData(MIXER_STRIP_DND_TYPE, stripId);
+        e.dataTransfer.effectAllowed = "move";
+        onDragStart(stripId);
+      }}
+      onDragEnd={onDragEnd}
+      title="Arrastar para reordenar as faixas"
+      aria-label="Arrastar para reordenar as faixas do mixer"
+    >
+      <div
+        className={`h-0.5 w-10 shrink-0 rounded-full sm:w-12 ${
+          draggingStripId === stripId ? "bg-zinc-400" : "bg-zinc-500/75"
+        }`}
+      />
+    </div>
+  );
+}
+
+type MixerStripDnDProps = {
+  mixerStripId: EchoLinkMixerStripId;
+  stripStackIndex: number;
+  draggingMixerStripId: EchoLinkMixerStripId | null;
+  onMixerStripDragStart: (id: EchoLinkMixerStripId) => void;
+  onMixerStripDragEnd: () => void;
+  onMixerStripDragOver: (e: DragEvent<HTMLDivElement>) => void;
+  onMixerStripDrop: (
+    e: DragEvent<HTMLDivElement>,
+    targetId: EchoLinkMixerStripId
+  ) => void;
+};
+
 type MixerConsoleInputChannelProps = {
-  channelId: 1 | 2;
+  channelId: 1 | 2 | 3;
   activateOn: boolean;
   onActivateToggle: () => void;
   onEdit: () => void;
@@ -271,7 +453,7 @@ type MixerConsoleInputChannelProps = {
   onFaderChange: (v: number) => void;
   faderDisabled: boolean;
   busy: boolean;
-};
+} & MixerStripDnDProps;
 
 function MixerConsoleInputChannel({
   channelId,
@@ -286,66 +468,107 @@ function MixerConsoleInputChannel({
   onFaderChange,
   faderDisabled,
   busy,
+  mixerStripId,
+  stripStackIndex,
+  draggingMixerStripId,
+  onMixerStripDragStart,
+  onMixerStripDragEnd,
+  onMixerStripDragOver,
+  onMixerStripDrop,
 }: MixerConsoleInputChannelProps) {
-  const btnBase =
-    "panel-bezel w-full rounded-md py-2 text-[10px] font-bold uppercase tracking-wide transition disabled:opacity-40 sm:text-[11px]";
+  const mixerIconHit =
+    "inline-flex w-full min-h-11 items-center justify-center rounded-md border-0 bg-transparent py-1.5 outline-none focus-visible:outline-none focus-visible:ring-0 disabled:cursor-not-allowed disabled:opacity-35 sm:min-h-12 sm:py-2";
   const vuLevelShown =
     activateOn && !muted && !faderDisabled ? vuLevel : 0;
   const stripDim =
     !activateOn ? "opacity-40" : muted ? "opacity-55" : "";
   const faderZoneMutedVisual =
     faderDisabled && activateOn ? "opacity-[0.55]" : "";
-  const muteEngaged = !activateOn || muted;
+  const chRole =
+    channelId === 1
+      ? "microfone"
+      : channelId === 2
+        ? "entrada linha"
+        : "entrada mídia";
   const faderDomId = `echo-mixer-fader-ch${channelId}`;
   const faderAria =
     channelId === 1
       ? "Ganho do microfone na mistura"
-      : "Ganho da entrada adicional na mistura";
-  const mixerFaderTitle = channelId === 1 ? "MIC" : "Linha";
+      : channelId === 2
+        ? "Ganho da entrada linha na mistura"
+        : "Ganho da entrada mídia na mistura";
+  const mixerFaderTitle =
+    channelId === 1 ? "Microfone" : channelId === 2 ? "Linha" : "MÍDIA";
   return (
     <div
-      className="relative isolate flex min-h-0 w-[11.5rem] shrink-0 flex-col overflow-hidden border-l border-white/10 bg-linear-to-b from-zinc-800/30 via-zinc-950 to-[#050506] px-2.5 pb-0 pt-2 first:border-l-0 first:pl-0 sm:w-[13.25rem] sm:px-3"
-      style={{ zIndex: channelId }}
+      className={`relative isolate box-border flex min-h-0 w-[11.5rem] shrink-0 flex-col overflow-hidden border-l-2 border-solid bg-linear-to-b from-zinc-800/30 via-zinc-950 to-[#050506] px-2.5 pb-0 pt-2 sm:w-[13.25rem] sm:px-3 ${mixerChannelStripBorderColorClass("input", activateOn, muted, faderDisabled)} ${draggingMixerStripId === mixerStripId ? "opacity-50" : ""}`}
+      style={{ zIndex: stripStackIndex + 1 }}
+      onDragOver={onMixerStripDragOver}
+      onDrop={(e) => onMixerStripDrop(e, mixerStripId)}
     >
-      <p className="mb-[8px] shrink-0 text-center font-mono text-[12px] font-bold uppercase tracking-[0.2em] text-zinc-100 sm:text-[13px] sm:tracking-[0.22em]">
-        {mixerFaderTitle}
+      <MixerStripTopDragHandle
+        stripId={mixerStripId}
+        draggingStripId={draggingMixerStripId}
+        onDragStart={onMixerStripDragStart}
+        onDragEnd={onMixerStripDragEnd}
+      />
+      <p className="mb-1.5 shrink-0 border-0 bg-transparent px-2 text-center font-mono text-[10px] font-bold uppercase tracking-[0.2em] text-zinc-500 shadow-none ring-0 outline-none sm:text-[11px] sm:tracking-[0.22em]">
+        ENTRADA
       </p>
-      <div className="mb-1.5 flex min-w-0 shrink-0 flex-col gap-1">
+      <div className="mb-1.5 flex min-w-0 shrink-0 flex-col gap-2">
         <button
           type="button"
           disabled={busy}
           onClick={onActivateToggle}
-          className={`${btnBase} ${
+          title={activateOn ? "Desativar canal" : "Ativar canal"}
+          aria-label={
             activateOn
-              ? "bg-amber-600 text-zinc-950 shadow-[0_0_12px_rgba(245,158,11,0.4)] ring-1 ring-amber-300/50"
-              : "bg-zinc-700/95 text-zinc-500 ring-1 ring-zinc-600/60 hover:bg-zinc-600"
+              ? `Desativar canal de ${chRole}`
+              : `Ativar canal de ${chRole}`
+          }
+          className={`${mixerIconHit} ${
+            activateOn
+              ? "text-emerald-400 drop-shadow-[0_0_14px_rgba(52,211,153,0.45)]"
+              : "text-zinc-100"
           }`}
         >
-          Ativar
+          <IconMixerPower className={MIXER_TOOLBAR_ICON_CLASS} />
         </button>
         <button
           type="button"
           disabled={busy || !activateOn}
           onClick={onEdit}
-          className={`${btnBase} ${
-            activateOn
-              ? "bg-sky-950/90 text-sky-200 ring-1 ring-sky-800/50 hover:bg-sky-900/80"
-              : "bg-zinc-800/80 text-zinc-600 ring-1 ring-zinc-700/50"
+          title="Editar dispositivo e tempos"
+          aria-label={`Editar definições do canal de ${chRole}`}
+          className={`${mixerIconHit} ${
+            activateOn ? "text-sky-400" : "text-zinc-600"
           }`}
         >
-          Editar
+          <IconMixerSettings className={MIXER_TOOLBAR_ICON_CLASS} />
         </button>
         <button
           type="button"
           disabled={busy || !activateOn}
           onClick={onMuteToggle}
-          className={`${btnBase} ${
+          title={
+            muted && activateOn ? "Restaurar som do canal" : "Silenciar canal"
+          }
+          aria-label={
             muted && activateOn
-              ? "bg-red-900/95 text-red-100 shadow-[0_0_10px_rgba(239,68,68,0.35)] ring-1 ring-red-600/50"
-              : "bg-zinc-700/95 text-zinc-400 ring-1 ring-zinc-600/60 hover:bg-zinc-600"
+              ? `Restaurar som do canal de ${chRole}`
+              : `Silenciar canal de ${chRole}`
+          }
+          className={`${mixerIconHit} ${
+            muted && activateOn
+              ? "text-red-500 drop-shadow-[0_0_12px_rgba(239,68,68,0.55)]"
+              : "text-zinc-500"
           }`}
         >
-          Mudo
+          {muted && activateOn ? (
+            <IconMixerVolumeMuted className={MIXER_TOOLBAR_ICON_CLASS} />
+          ) : (
+            <IconMixerVolumeOn className={MIXER_TOOLBAR_ICON_CLASS} />
+          )}
         </button>
       </div>
       <p className="mb-1 line-clamp-2 min-h-8 shrink-0 text-center text-[8px] leading-snug text-zinc-400 sm:text-[9px]">
@@ -357,12 +580,8 @@ function MixerConsoleInputChannel({
         <div
           className={`flex min-h-[11rem] min-w-0 flex-1 items-stretch gap-1.5 sm:min-h-[12rem] ${faderZoneMutedVisual}`}
         >
-          <div className="flex h-full min-h-0 min-w-0 flex-1 overflow-hidden bg-black">
-            <MixerVuStrip
-              level={vuLevelShown}
-              className="h-full! w-5 shrink-0 rounded-none! ring-0! sm:w-5"
-            />
-            <div className="echo-mixer-fader-slot relative isolate h-full min-h-0 min-w-[5.25rem] flex-1 overflow-hidden bg-black sm:min-w-[6rem]">
+          <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-black">
+            <div className="echo-mixer-fader-slot relative isolate min-h-0 min-w-[5.25rem] flex-1 overflow-hidden bg-black sm:min-w-[6rem]">
               <div
                 className="pointer-events-none absolute inset-0 z-0 shadow-[inset_0_0_20px_rgba(0,0,0,1)]"
                 aria-hidden
@@ -384,10 +603,12 @@ function MixerConsoleInputChannel({
               />
             </div>
           </div>
-          <MixerFaderDbScale
-            level={vuLevelShown}
-            className="w-9 shrink-0 sm:w-10"
-          />
+          <div className="echo-mixer-fader-meter-column flex h-full min-h-0 shrink-0 flex-col">
+            <MixerFaderDbScale
+              level={vuLevelShown}
+              className="min-h-0 w-9 flex-1 sm:w-10"
+            />
+          </div>
         </div>
         <div className="pt-1 text-center font-mono text-[8px] tabular-nums text-zinc-500 sm:text-[9px]">
           {formatMixFaderDbLabel(faderValue)} · {faderValue}%
@@ -395,6 +616,193 @@ function MixerConsoleInputChannel({
         <div className="border-t border-zinc-800/50 pt-1.5 text-center font-mono text-xs font-semibold tabular-nums text-zinc-100">
           {channelId}
         </div>
+      </div>
+      <div className="shrink-0 border-t border-white/10 pb-2 pt-2">
+        <p
+          className={`shrink-0 rounded-md px-2 py-1 text-center font-mono text-[12px] font-bold uppercase tracking-[0.2em] sm:text-[13px] sm:tracking-[0.22em] ${mixerChannelStripBadgeToneClassName("input", activateOn, muted, faderDisabled)}`}
+        >
+          {mixerFaderTitle}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+type MixerConsoleOutputChannelProps = {
+  activateOn: boolean;
+  onActivateToggle: () => void;
+  onEdit: () => void;
+  muted: boolean;
+  onMuteToggle: () => void;
+  deviceLabel: string;
+  vuLevel: number;
+  faderValue: number;
+  onFaderChange: (v: number) => void;
+  faderDisabled: boolean;
+  busy: boolean;
+  activateDisabled: boolean;
+} & MixerStripDnDProps;
+
+function MixerConsoleOutputChannel({
+  activateOn,
+  onActivateToggle,
+  onEdit,
+  muted,
+  onMuteToggle,
+  deviceLabel,
+  vuLevel,
+  faderValue,
+  onFaderChange,
+  faderDisabled,
+  busy,
+  activateDisabled,
+  mixerStripId,
+  stripStackIndex,
+  draggingMixerStripId,
+  onMixerStripDragStart,
+  onMixerStripDragEnd,
+  onMixerStripDragOver,
+  onMixerStripDrop,
+}: MixerConsoleOutputChannelProps) {
+  const mixerIconHit =
+    "inline-flex w-full min-h-11 items-center justify-center rounded-md border-0 bg-transparent py-1.5 outline-none focus-visible:outline-none focus-visible:ring-0 disabled:cursor-not-allowed disabled:opacity-35 sm:min-h-12 sm:py-2";
+  const vuLevelShown =
+    activateOn && !muted && !faderDisabled ? vuLevel : 0;
+  const stripDim =
+    !activateOn ? "opacity-40" : muted ? "opacity-55" : "";
+  const faderZoneMutedVisual =
+    faderDisabled && activateOn ? "opacity-[0.55]" : "";
+  const faderDomId = "echo-mixer-fader-output";
+  return (
+    <div
+      className={`relative isolate box-border flex min-h-0 w-[11.5rem] shrink-0 flex-col overflow-hidden border-l-2 border-solid bg-linear-to-b from-zinc-800/30 via-zinc-950 to-[#050506] px-2.5 pb-0 pt-2 sm:w-[13.25rem] sm:px-3 ${mixerChannelStripBorderColorClass("output", activateOn, muted, faderDisabled)} ${draggingMixerStripId === mixerStripId ? "opacity-50" : ""}`}
+      style={{ zIndex: stripStackIndex + 1 }}
+      onDragOver={onMixerStripDragOver}
+      onDrop={(e) => onMixerStripDrop(e, mixerStripId)}
+    >
+      <MixerStripTopDragHandle
+        stripId={mixerStripId}
+        draggingStripId={draggingMixerStripId}
+        onDragStart={onMixerStripDragStart}
+        onDragEnd={onMixerStripDragEnd}
+      />
+      <p className="mb-1.5 shrink-0 border-0 bg-transparent px-2 text-center font-mono text-[10px] font-bold uppercase tracking-[0.2em] text-zinc-500 shadow-none ring-0 outline-none sm:text-[11px] sm:tracking-[0.22em]">
+        SAÍDA
+      </p>
+      <div className="mb-1.5 flex min-w-0 shrink-0 flex-col gap-2">
+        <button
+          type="button"
+          disabled={busy || activateDisabled}
+          onClick={onActivateToggle}
+          title={
+            activateOn
+              ? "Desativar monitor entrada → saída"
+              : "Ativar monitor entrada → saída"
+          }
+          aria-label={
+            activateOn
+              ? "Desativar monitor de saída (entrada para o dispositivo de áudio)"
+              : "Ativar monitor de saída (entrada para o dispositivo de áudio)"
+          }
+          className={`${mixerIconHit} ${
+            activateOn
+              ? "text-sky-400 drop-shadow-[0_0_14px_rgba(56,189,248,0.45)]"
+              : "text-zinc-100"
+          }`}
+        >
+          <IconMixerPower className={MIXER_TOOLBAR_ICON_CLASS} />
+        </button>
+        <button
+          type="button"
+          disabled={busy || !activateOn}
+          onClick={onEdit}
+          title="Editar saída de áudio"
+          aria-label="Editar definições de saída de áudio (dispositivo, monitor e tradução)"
+          className={`${mixerIconHit} ${
+            activateOn ? "text-sky-400" : "text-zinc-600"
+          }`}
+        >
+          <IconMixerSettings className={MIXER_TOOLBAR_ICON_CLASS} />
+        </button>
+        <button
+          type="button"
+          disabled={busy || !activateOn}
+          onClick={onMuteToggle}
+          title={
+            muted && activateOn
+              ? "Restaurar som na saída"
+              : "Silenciar saída do monitor"
+          }
+          aria-label={
+            muted && activateOn
+              ? "Restaurar som do monitor de saída"
+              : "Silenciar monitor de saída"
+          }
+          className={`${mixerIconHit} ${
+            muted && activateOn
+              ? "text-red-500 drop-shadow-[0_0_12px_rgba(239,68,68,0.55)]"
+              : "text-zinc-500"
+          }`}
+        >
+          {muted && activateOn ? (
+            <IconMixerVolumeMuted className={MIXER_TOOLBAR_ICON_CLASS} />
+          ) : (
+            <IconMixerVolumeOn className={MIXER_TOOLBAR_ICON_CLASS} />
+          )}
+        </button>
+      </div>
+      <p className="mb-1 line-clamp-2 min-h-8 shrink-0 text-center text-[8px] leading-snug text-zinc-400 sm:text-[9px]">
+        {deviceLabel}
+      </p>
+      <div
+        className={`flex min-h-0 flex-1 flex-col bg-black pb-2 ${stripDim}`}
+      >
+        <div
+          className={`flex min-h-[11rem] min-w-0 flex-1 items-stretch gap-1.5 sm:min-h-[12rem] ${faderZoneMutedVisual}`}
+        >
+          <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-black">
+            <div className="echo-mixer-fader-slot relative isolate min-h-0 min-w-[5.25rem] flex-1 overflow-hidden bg-black sm:min-w-[6rem]">
+              <div
+                className="pointer-events-none absolute inset-0 z-0 shadow-[inset_0_0_20px_rgba(0,0,0,1)]"
+                aria-hidden
+              />
+              <input
+                id={faderDomId}
+                name="echoMixerFaderOutput"
+                type="range"
+                min={0}
+                max={MIX_FADER_MAX}
+                step={1}
+                disabled={busy}
+                value={faderValue}
+                onChange={(e) =>
+                  onFaderChange(Number.parseInt(e.target.value, 10))
+                }
+                className="echo-mixer-fader-input echo-console-fader"
+                aria-label="Ganho da saída (monitor)"
+              />
+            </div>
+          </div>
+          <div className="echo-mixer-fader-meter-column flex h-full min-h-0 shrink-0 flex-col">
+            <MixerFaderDbScale
+              level={vuLevelShown}
+              className="min-h-0 w-9 flex-1 sm:w-10"
+            />
+          </div>
+        </div>
+        <div className="pt-1 text-center font-mono text-[8px] tabular-nums text-zinc-500 sm:text-[9px]">
+          {formatMixFaderDbLabel(faderValue)} · {faderValue}%
+        </div>
+        <div className="border-t border-zinc-800/50 pt-1.5 text-center font-mono text-xs font-semibold tabular-nums text-zinc-100">
+          4
+        </div>
+      </div>
+      <div className="shrink-0 border-t border-white/10 pb-2 pt-2">
+        <p
+          className={`shrink-0 rounded-md px-2 py-1 text-center font-mono text-[12px] font-bold uppercase tracking-[0.2em] sm:text-[13px] sm:tracking-[0.22em] ${mixerChannelStripBadgeToneClassName("output", activateOn, muted, faderDisabled)}`}
+        >
+          Master
+        </p>
       </div>
     </div>
   );
@@ -528,15 +936,20 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
   const idlePreviewMonitorGainRef = useRef<GainNode | null>(null);
   const idlePreviewPrimGainRef = useRef<GainNode | null>(null);
   const idlePreviewSecGainRef = useRef<GainNode | null>(null);
+  const idlePreviewTertGainRef = useRef<GainNode | null>(null);
+  const idlePreviewMixStreamRef = useRef<MediaStream | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const mixPrimaryAnalyserRef = useRef<AnalyserNode | null>(null);
   const mixSecondaryAnalyserRef = useRef<AnalyserNode | null>(null);
+  const mixTertiaryAnalyserRef = useRef<AnalyserNode | null>(null);
   const rafRef = useRef<number>(0);
   const timeDomainRef = useRef<AnalyserByteDomainBuffer | null>(null);
   const timeDomainSecondaryRef = useRef<AnalyserByteDomainBuffer | null>(null);
+  const timeDomainTertiaryRef = useRef<AnalyserByteDomainBuffer | null>(null);
   const rxPulseRef = useRef(0);
   const micVuSmoothRef = useRef(0);
   const lineVuSmoothRef = useRef(0);
+  const mediaVuSmoothRef = useRef(0);
   const serviceSttCleanupRef = useRef<(() => void) | null>(null);
   const phraseSilenceCutMsRef = useRef(
     ECHO_LINK_SETTINGS_PLACEHOLDER.phraseSilenceCutMs
@@ -559,6 +972,8 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
   const [connected, setConnected] = useState(false);
   const [micVu, setMicVu] = useState(0);
   const [lineVu, setLineVu] = useState(0);
+  const [mediaVu, setMediaVu] = useState(0);
+  const [idleInputGraphSeq, setIdleInputGraphSeq] = useState(0);
   const [captureStarting, setCaptureStarting] = useState(false);
   const [rxLevel, setRxLevel] = useState(0);
   const [audioInputs, setAudioInputs] = useState<MediaDeviceInfo[]>([]);
@@ -569,6 +984,10 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
   const [selectedSecondaryInputId, setSelectedSecondaryInputId] =
     useState<string>(
       () => ECHO_LINK_SETTINGS_PLACEHOLDER.selectedSecondaryInputDeviceId
+    );
+  const [selectedTertiaryInputId, setSelectedTertiaryInputId] =
+    useState<string>(
+      () => ECHO_LINK_SETTINGS_PLACEHOLDER.selectedTertiaryInputDeviceId
     );
   const [selectedOutputId, setSelectedOutputId] = useState<string>(
     () => ECHO_LINK_SETTINGS_PLACEHOLDER.selectedOutputDeviceId
@@ -594,25 +1013,70 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
   const [settings, setSettings] = useState<EchoLinkSettings>(() => ({
     ...ECHO_LINK_SETTINGS_PLACEHOLDER,
   }));
-  const [sidebarSection, setSidebarSection] =
-    useState<SidebarSection>("info");
+  const [sidebarSection, setSidebarSection] = useState<SidebarSection>(
+    "audioIn"
+  );
   const [audioInChannelTab, setAudioInChannelTab] =
-    useState<AudioInChannelTab>("microphone");
+    useState<AudioInChannelTab>(() =>
+      typeof window === "undefined"
+        ? ECHO_LINK_SETTINGS_PLACEHOLDER.audioInChannelTab
+        : loadEchoLinkSettingsFromLocalStorage().audioInChannelTab
+    );
   const [audioInDetailScope, setAudioInDetailScope] =
-    useState<AudioInDetailScope>("both");
+    useState<AudioInDetailScope>(() =>
+      typeof window === "undefined"
+        ? ECHO_LINK_SETTINGS_PLACEHOLDER.audioInDetailScope
+        : loadEchoLinkSettingsFromLocalStorage().audioInDetailScope
+    );
   const [audioInLayoutMode, setAudioInLayoutMode] =
-    useState<AudioInLayoutMode>("mixer");
+    useState<AudioInLayoutMode>(() =>
+      typeof window === "undefined"
+        ? ECHO_LINK_SETTINGS_PLACEHOLDER.audioInLayoutMode
+        : loadEchoLinkSettingsFromLocalStorage().audioInLayoutMode
+    );
   const audioInActivePanel: AudioInChannelTab =
     audioInDetailScope === "both"
       ? audioInChannelTab
       : audioInDetailScope;
-  const [mixerActivate1, setMixerActivate1] = useState(true);
-  const [mixerActivate2, setMixerActivate2] = useState(false);
-  const [mixerMute1, setMixerMute1] = useState(false);
-  const [mixerMute2, setMixerMute2] = useState(false);
-  const [mixerSideEditor, setMixerSideEditor] = useState<
-    AudioInChannelTab | null
-  >(null);
+  const [mixerActivate1, setMixerActivate1] = useState(() =>
+    typeof window === "undefined"
+      ? ECHO_LINK_SETTINGS_PLACEHOLDER.mixerChannel1Active
+      : loadEchoLinkSettingsFromLocalStorage().mixerChannel1Active
+  );
+  const [mixerActivate2, setMixerActivate2] = useState(() =>
+    typeof window === "undefined"
+      ? ECHO_LINK_SETTINGS_PLACEHOLDER.mixerChannel2Active
+      : loadEchoLinkSettingsFromLocalStorage().mixerChannel2Active
+  );
+  const [mixerActivate3, setMixerActivate3] = useState(() =>
+    typeof window === "undefined"
+      ? ECHO_LINK_SETTINGS_PLACEHOLDER.mixerChannel3Active
+      : loadEchoLinkSettingsFromLocalStorage().mixerChannel3Active
+  );
+  const [mixerMute1, setMixerMute1] = useState(() =>
+    typeof window === "undefined"
+      ? ECHO_LINK_SETTINGS_PLACEHOLDER.mixerChannel1Muted
+      : loadEchoLinkSettingsFromLocalStorage().mixerChannel1Muted
+  );
+  const [mixerMute2, setMixerMute2] = useState(() =>
+    typeof window === "undefined"
+      ? ECHO_LINK_SETTINGS_PLACEHOLDER.mixerChannel2Muted
+      : loadEchoLinkSettingsFromLocalStorage().mixerChannel2Muted
+  );
+  const [mixerMute3, setMixerMute3] = useState(() =>
+    typeof window === "undefined"
+      ? ECHO_LINK_SETTINGS_PLACEHOLDER.mixerChannel3Muted
+      : loadEchoLinkSettingsFromLocalStorage().mixerChannel3Muted
+  );
+  const [mixerOutputMute, setMixerOutputMute] = useState(() =>
+    typeof window === "undefined"
+      ? ECHO_LINK_SETTINGS_PLACEHOLDER.mixerOutputMuted
+      : loadEchoLinkSettingsFromLocalStorage().mixerOutputMuted
+  );
+  const [draggingMixerStripId, setDraggingMixerStripId] =
+    useState<EchoLinkMixerStripId | null>(null);
+  const [mixerSideEditor, setMixerSideEditor] =
+    useState<MixerSideEditorTab | null>(null);
   const [vocabularyRows, setVocabularyRows] = useState<TranscriptJournalRow[]>(
     []
   );
@@ -655,6 +1119,8 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
   const [voiceTranslationEnabled, setVoiceTranslationEnabled] = useState(
     () => ECHO_LINK_SETTINGS_PLACEHOLDER.voiceTranslationEnabled
   );
+  const voiceTranslationEnabledRef = useRef(voiceTranslationEnabled);
+  voiceTranslationEnabledRef.current = voiceTranslationEnabled;
   const [voiceTranslationBackendStatus, setVoiceTranslationBackendStatus] =
     useState<VoiceTranslationStatus | null>(null);
   const [elevenLabsVoicesFromApi, setElevenLabsVoicesFromApi] = useState<
@@ -745,6 +1211,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
   const applyUiFromEchoLinkSettings = useCallback((s: EchoLinkSettings) => {
     setSelectedInputId(s.selectedInputDeviceId);
     setSelectedSecondaryInputId(s.selectedSecondaryInputDeviceId);
+    setSelectedTertiaryInputId(s.selectedTertiaryInputDeviceId);
     setSelectedOutputId(s.selectedOutputDeviceId);
     setVoiceTranslationEnabled(s.voiceTranslationEnabled);
     setPipelineMonitorEnabled(s.pipelineMonitorEnabled);
@@ -754,6 +1221,16 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
     );
     setPipelineMonitorGain(g);
     pipelineMonitorGainRef.current = g;
+    setAudioInLayoutMode(s.audioInLayoutMode);
+    setAudioInDetailScope(s.audioInDetailScope);
+    setAudioInChannelTab(s.audioInChannelTab);
+    setMixerActivate1(s.mixerChannel1Active);
+    setMixerActivate2(s.mixerChannel2Active);
+    setMixerActivate3(s.mixerChannel3Active);
+    setMixerMute1(s.mixerChannel1Muted);
+    setMixerMute2(s.mixerChannel2Muted);
+    setMixerMute3(s.mixerChannel3Muted);
+    setMixerOutputMute(s.mixerOutputMuted);
   }, []);
 
   useEffect(() => {
@@ -806,17 +1283,80 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
   );
 
   const setMixerChannelMixGainPercent = useCallback(
-    (ch: 1 | 2, v: number) => {
+    (ch: 1 | 2 | 3 | 4, v: number) => {
       if (ch === 1) {
         setSettings((prev) => ({ ...prev, primaryChannelMixGainPercent: v }));
         saveEchoLinkSettingsToStorage({ primaryChannelMixGainPercent: v });
         return;
       }
+      if (ch === 2) {
+        setSettings((prev) => ({
+          ...prev,
+          secondaryChannelMixGainPercent: v,
+        }));
+        saveEchoLinkSettingsToStorage({ secondaryChannelMixGainPercent: v });
+        return;
+      }
+      if (ch === 3) {
+        setSettings((prev) => ({
+          ...prev,
+          tertiaryChannelMixGainPercent: v,
+        }));
+        saveEchoLinkSettingsToStorage({ tertiaryChannelMixGainPercent: v });
+        return;
+      }
       setSettings((prev) => ({
         ...prev,
-        secondaryChannelMixGainPercent: v,
+        outputChannelMixGainPercent: v,
       }));
-      saveEchoLinkSettingsToStorage({ secondaryChannelMixGainPercent: v });
+      saveEchoLinkSettingsToStorage({ outputChannelMixGainPercent: v });
+    },
+    []
+  );
+
+  const handleMixerStripDragOver = useCallback(
+    (e: DragEvent<HTMLDivElement>) => {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "move";
+    },
+    []
+  );
+
+  const handleMixerStripDragStart = useCallback((id: EchoLinkMixerStripId) => {
+    setDraggingMixerStripId(id);
+  }, []);
+
+  const handleMixerStripDragEnd = useCallback(() => {
+    setDraggingMixerStripId(null);
+  }, []);
+
+  const handleMixerStripDrop = useCallback(
+    (e: DragEvent<HTMLDivElement>, targetId: EchoLinkMixerStripId) => {
+      e.preventDefault();
+      const raw = e.dataTransfer.getData(MIXER_STRIP_DND_TYPE);
+      if (
+        raw !== "ch1" &&
+        raw !== "ch2" &&
+        raw !== "ch3" &&
+        raw !== "output"
+      ) {
+        setDraggingMixerStripId(null);
+        return;
+      }
+      const fromId = raw as EchoLinkMixerStripId;
+      setDraggingMixerStripId(null);
+      setSettings((prev) => {
+        const base = sanitizeMixerStripOrder(prev.mixerStripOrder);
+        const nextOrder = moveMixerStripInOrder(base, fromId, targetId);
+        const unchanged =
+          nextOrder.length === base.length &&
+          nextOrder.every((x, i) => x === base[i]);
+        if (unchanged) {
+          return prev;
+        }
+        saveEchoLinkSettingsToStorage({ mixerStripOrder: nextOrder });
+        return { ...prev, mixerStripOrder: nextOrder };
+      });
     },
     []
   );
@@ -1238,6 +1778,13 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
   }, [refreshMediaDevices]);
 
   useEffect(() => {
+    if (sidebarSection !== "info") {
+      return;
+    }
+    void refreshMediaDevices();
+  }, [sidebarSection, refreshMediaDevices]);
+
+  useEffect(() => {
     if (
       selectedInputId &&
       !audioInputs.some((d) => d.deviceId === selectedInputId)
@@ -1260,6 +1807,27 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
       saveEchoLinkSettingsToStorage({ selectedSecondaryInputDeviceId: "" });
     }
   }, [audioInputs, selectedSecondaryInputId, selectedInputId]);
+
+  useEffect(() => {
+    if (!selectedTertiaryInputId) return;
+    if (
+      !audioInputs.some((d) => d.deviceId === selectedTertiaryInputId) ||
+      selectedTertiaryInputId === selectedInputId ||
+      selectedTertiaryInputId === selectedSecondaryInputId
+    ) {
+      setSelectedTertiaryInputId("");
+      setSettings((prev) => ({
+        ...prev,
+        selectedTertiaryInputDeviceId: "",
+      }));
+      saveEchoLinkSettingsToStorage({ selectedTertiaryInputDeviceId: "" });
+    }
+  }, [
+    audioInputs,
+    selectedTertiaryInputId,
+    selectedInputId,
+    selectedSecondaryInputId,
+  ]);
 
   useEffect(() => {
     if (
@@ -1309,13 +1877,17 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
     analyserRef.current = null;
     mixPrimaryAnalyserRef.current = null;
     mixSecondaryAnalyserRef.current = null;
+    mixTertiaryAnalyserRef.current = null;
     timeDomainRef.current = null;
     timeDomainSecondaryRef.current = null;
+    timeDomainTertiaryRef.current = null;
     rxPulseRef.current = 0;
     micVuSmoothRef.current = 0;
     lineVuSmoothRef.current = 0;
+    mediaVuSmoothRef.current = 0;
     setMicVu(0);
     setLineVu(0);
+    setMediaVu(0);
     setRxLevel(0);
     setMeterSampleRate(0);
     setPipelineBranchLive(false);
@@ -1362,28 +1934,37 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
       pipelineOutRafRef.current = 0;
     }
     const tick = () => {
-      const a = pipelineOutputAnalyserRef.current;
-      let buf = pipelineOutBufRef.current;
-      if (a) {
-        if (!buf || buf.length !== a.fftSize) {
-          buf = createByteDomainBuffer(a.fftSize);
-          pipelineOutBufRef.current = buf;
+      try {
+        const a = pipelineOutputAnalyserRef.current;
+        let buf = pipelineOutBufRef.current;
+        if (a) {
+          if (!buf || buf.length !== a.fftSize) {
+            buf = createByteDomainBuffer(a.fftSize);
+            pipelineOutBufRef.current = buf;
+          }
+          a.getByteTimeDomainData(buf);
+          let sum = 0;
+          for (let i = 0; i < buf.length; i++) {
+            const v = (buf[i] - 128) / 128;
+            sum += v * v;
+          }
+          const rms = Math.sqrt(sum / buf.length);
+          const instant = mapRmsToMeterLevel(rms, 100);
+          pipelineOutSmoothRef.current = smoothVuLevel(
+            pipelineOutSmoothRef.current,
+            instant
+          );
+          setPipelineOutVu(pipelineOutSmoothRef.current);
+        } else {
+          const d = smoothVuLevel(pipelineOutSmoothRef.current, 0);
+          pipelineOutSmoothRef.current = d;
+          setPipelineOutVu(d);
+          if (d <= 0) {
+            pipelineOutRafRef.current = 0;
+            return;
+          }
         }
-        a.getByteTimeDomainData(buf);
-        let sum = 0;
-        for (let i = 0; i < buf.length; i++) {
-          const v = (buf[i] - 128) / 128;
-          sum += v * v;
-        }
-        const rms = Math.sqrt(sum / buf.length);
-        const instant = mapRmsToMeterLevel(rms, 100);
-        const prev = pipelineOutSmoothRef.current;
-        pipelineOutSmoothRef.current =
-          instant > prev
-            ? prev * 0.78 + instant * 0.22
-            : prev * 0.91 + instant * 0.09;
-        setPipelineOutVu(pipelineOutSmoothRef.current);
-      }
+      } catch {}
       pipelineOutRafRef.current = requestAnimationFrame(tick);
     };
     pipelineOutRafRef.current = requestAnimationFrame(tick);
@@ -1393,6 +1974,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
     async (stream: MediaStream, withRx: boolean) => {
       micVuSmoothRef.current = 0;
       lineVuSmoothRef.current = 0;
+      mediaVuSmoothRef.current = 0;
       const ctx = new AudioContext();
       await ctx.resume().catch(() => undefined);
       setMeterSampleRate(ctx.sampleRate);
@@ -1400,11 +1982,15 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
       mediaStreamSourceRef.current = source;
       const mixP = mixPrimaryAnalyserRef.current;
       const mixS = mixSecondaryAnalyserRef.current;
+      const mixT = mixTertiaryAnalyserRef.current;
       if (mixP) {
         analyserRef.current = null;
         timeDomainRef.current = createByteDomainBuffer(mixP.fftSize);
         timeDomainSecondaryRef.current = mixS
           ? createByteDomainBuffer(mixS.fftSize)
+          : null;
+        timeDomainTertiaryRef.current = mixT
+          ? createByteDomainBuffer(mixT.fftSize)
           : null;
       } else {
         const analyser = ctx.createAnalyser();
@@ -1414,16 +2000,20 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
         analyserRef.current = analyser;
         timeDomainRef.current = createByteDomainBuffer(analyser.fftSize);
         timeDomainSecondaryRef.current = null;
+        timeDomainTertiaryRef.current = null;
       }
       audioContextRef.current = ctx;
 
       const tick = () => {
+        try {
         const sens = inputSensitivityRef.current;
         const mp = mixPrimaryAnalyserRef.current;
         const ms = mixSecondaryAnalyserRef.current;
+        const mt = mixTertiaryAnalyserRef.current;
         const fallbackA = analyserRef.current;
         const buf1 = timeDomainRef.current;
         const buf2 = timeDomainSecondaryRef.current;
+        const buf3 = timeDomainTertiaryRef.current;
         if (mp && buf1) {
           mp.getByteTimeDomainData(buf1);
           let sum = 0;
@@ -1433,11 +2023,10 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
           }
           const rms = Math.sqrt(sum / buf1.length);
           const instant = mapRmsToMeterLevel(rms, sens);
-          const prev = micVuSmoothRef.current;
-          micVuSmoothRef.current =
-            instant > prev
-              ? prev * 0.78 + instant * 0.22
-              : prev * 0.91 + instant * 0.09;
+          micVuSmoothRef.current = smoothVuLevel(
+            micVuSmoothRef.current,
+            instant
+          );
           setMicVu(micVuSmoothRef.current);
         } else if (fallbackA && buf1) {
           fallbackA.getByteTimeDomainData(buf1);
@@ -1448,11 +2037,13 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
           }
           const rms = Math.sqrt(sum / buf1.length);
           const instant = mapRmsToMeterLevel(rms, sens);
-          const prev = micVuSmoothRef.current;
-          micVuSmoothRef.current =
-            instant > prev
-              ? prev * 0.78 + instant * 0.22
-              : prev * 0.91 + instant * 0.09;
+          micVuSmoothRef.current = smoothVuLevel(
+            micVuSmoothRef.current,
+            instant
+          );
+          setMicVu(micVuSmoothRef.current);
+        } else {
+          micVuSmoothRef.current = smoothVuLevel(micVuSmoothRef.current, 0);
           setMicVu(micVuSmoothRef.current);
         }
         if (ms && buf2) {
@@ -1467,20 +2058,44 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
             rms2,
             LINE_CHANNEL_VU_SENSITIVITY_PERCENT
           );
-          const prev2 = lineVuSmoothRef.current;
-          lineVuSmoothRef.current =
-            instant2 > prev2
-              ? prev2 * 0.78 + instant2 * 0.22
-              : prev2 * 0.91 + instant2 * 0.09;
+          lineVuSmoothRef.current = smoothVuLevel(
+            lineVuSmoothRef.current,
+            instant2
+          );
           setLineVu(lineVuSmoothRef.current);
-        } else if (mp) {
-          lineVuSmoothRef.current = 0;
-          setLineVu(0);
+        } else {
+          lineVuSmoothRef.current = smoothVuLevel(lineVuSmoothRef.current, 0);
+          setLineVu(lineVuSmoothRef.current);
+        }
+        if (mt && buf3) {
+          mt.getByteTimeDomainData(buf3);
+          let sum3 = 0;
+          for (let i = 0; i < buf3.length; i++) {
+            const v = (buf3[i] - 128) / 128;
+            sum3 += v * v;
+          }
+          const rms3 = Math.sqrt(sum3 / buf3.length);
+          const instant3 = mapRmsToMeterLevel(
+            rms3,
+            LINE_CHANNEL_VU_SENSITIVITY_PERCENT
+          );
+          mediaVuSmoothRef.current = smoothVuLevel(
+            mediaVuSmoothRef.current,
+            instant3
+          );
+          setMediaVu(mediaVuSmoothRef.current);
+        } else {
+          mediaVuSmoothRef.current = smoothVuLevel(
+            mediaVuSmoothRef.current,
+            0
+          );
+          setMediaVu(mediaVuSmoothRef.current);
         }
         if (withRx) {
           rxPulseRef.current *= RX_DECAY;
           setRxLevel(rxPulseRef.current);
         }
+        } catch {}
         rafRef.current = requestAnimationFrame(tick);
       };
       rafRef.current = requestAnimationFrame(tick);
@@ -1550,6 +2165,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
     rxPulseRef.current = 0;
     let primaryForCleanup: MediaStream | null = null;
     let secondaryForCleanup: MediaStream | null = null;
+    let tertiaryForCleanup: MediaStream | null = null;
     try {
       const baseAudio: MediaTrackConstraints = {
         echoCancellation: false,
@@ -1569,6 +2185,12 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
         selectedSecondaryInputId !== selectedInputId
           ? selectedSecondaryInputId
           : "";
+      const tertiaryId =
+        selectedTertiaryInputId &&
+        selectedTertiaryInputId !== selectedInputId &&
+        selectedTertiaryInputId !== secondaryId
+          ? selectedTertiaryInputId
+          : "";
       const pLin = Math.max(
         0,
         Math.min(2, settings.primaryChannelMixGainPercent / 100)
@@ -1577,10 +2199,57 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
         0,
         Math.min(2, settings.secondaryChannelMixGainPercent / 100)
       );
+      const tLin = Math.max(
+        0,
+        Math.min(2, settings.tertiaryChannelMixGainPercent / 100)
+      );
       captureGainControlsRef.current = null;
       mixPrimaryAnalyserRef.current = null;
       mixSecondaryAnalyserRef.current = null;
-      if (secondaryId) {
+      mixTertiaryAnalyserRef.current = null;
+      if (secondaryId && tertiaryId) {
+        const secondaryConstraints: MediaTrackConstraints = { ...baseAudio };
+        secondaryConstraints.deviceId = { exact: secondaryId };
+        secondaryForCleanup = await navigator.mediaDevices.getUserMedia({
+          audio: secondaryConstraints,
+        });
+        const tertiaryConstraints: MediaTrackConstraints = { ...baseAudio };
+        tertiaryConstraints.deviceId = { exact: tertiaryId };
+        tertiaryForCleanup = await navigator.mediaDevices.getUserMedia({
+          audio: tertiaryConstraints,
+        });
+        const {
+          mixedStream,
+          dispose,
+          controls,
+          primaryAnalyser,
+          secondaryAnalyser,
+          tertiaryAnalyser,
+        } = await mixCaptureAudioStreamsTriple(
+          primaryForCleanup,
+          secondaryForCleanup,
+          tertiaryForCleanup,
+          {
+            primaryLinear: pLin,
+            secondaryLinear: sLin,
+            tertiaryLinear: tLin,
+          }
+        );
+        mixDisposeRef.current = dispose;
+        mixPrimaryAnalyserRef.current = primaryAnalyser;
+        mixSecondaryAnalyserRef.current = secondaryAnalyser;
+        mixTertiaryAnalyserRef.current = tertiaryAnalyser;
+        captureGainControlsRef.current = {
+          mode: "triple",
+          setPrimaryLinear: controls.setPrimaryLinear,
+          setSecondaryLinear: controls.setSecondaryLinear,
+          setTertiaryLinear: controls.setTertiaryLinear,
+        };
+        primaryForCleanup = null;
+        secondaryForCleanup = null;
+        tertiaryForCleanup = null;
+        captureStream = mixedStream;
+      } else if (secondaryId) {
         const secondaryConstraints: MediaTrackConstraints = { ...baseAudio };
         secondaryConstraints.deviceId = { exact: secondaryId };
         secondaryForCleanup = await navigator.mediaDevices.getUserMedia({
@@ -1599,6 +2268,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
         mixDisposeRef.current = dispose;
         mixPrimaryAnalyserRef.current = primaryAnalyser;
         mixSecondaryAnalyserRef.current = secondaryAnalyser;
+        mixTertiaryAnalyserRef.current = null;
         captureGainControlsRef.current = {
           mode: "dual",
           setPrimaryLinear: controls.setPrimaryLinear,
@@ -1607,11 +2277,40 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
         primaryForCleanup = null;
         secondaryForCleanup = null;
         captureStream = mixedStream;
+      } else if (tertiaryId) {
+        const tertiaryConstraints: MediaTrackConstraints = { ...baseAudio };
+        tertiaryConstraints.deviceId = { exact: tertiaryId };
+        tertiaryForCleanup = await navigator.mediaDevices.getUserMedia({
+          audio: tertiaryConstraints,
+        });
+        const {
+          mixedStream,
+          dispose,
+          controls,
+          primaryAnalyser,
+          secondaryAnalyser,
+        } = await mixCaptureAudioStreams(primaryForCleanup, tertiaryForCleanup, {
+          primaryLinear: pLin,
+          secondaryLinear: tLin,
+        });
+        mixDisposeRef.current = dispose;
+        mixPrimaryAnalyserRef.current = primaryAnalyser;
+        mixSecondaryAnalyserRef.current = null;
+        mixTertiaryAnalyserRef.current = secondaryAnalyser;
+        captureGainControlsRef.current = {
+          mode: "dual",
+          setPrimaryLinear: controls.setPrimaryLinear,
+          setSecondaryLinear: controls.setSecondaryLinear,
+        };
+        primaryForCleanup = null;
+        tertiaryForCleanup = null;
+        captureStream = mixedStream;
       } else {
         const pt = await passThroughCaptureWithGain(primaryForCleanup, pLin);
         mixDisposeRef.current = pt.dispose;
         mixPrimaryAnalyserRef.current = pt.primaryAnalyser;
         mixSecondaryAnalyserRef.current = null;
+        mixTertiaryAnalyserRef.current = null;
         captureGainControlsRef.current = {
           mode: "single",
           setPrimaryLinear: pt.setGainLinear,
@@ -1622,7 +2321,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
       streamRef.current = captureStream;
       await startMeter(captureStream, true);
 
-      const ws = new WebSocket(WS_URL);
+      const ws = openEchoLinkServiceWebSocket("/ws/mic");
       ws.binaryType = "arraybuffer";
       wsRef.current = ws;
 
@@ -1720,8 +2419,10 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
       mixDisposeRef.current = null;
       mixPrimaryAnalyserRef.current = null;
       mixSecondaryAnalyserRef.current = null;
+      mixTertiaryAnalyserRef.current = null;
       primaryForCleanup?.getTracks().forEach((t) => t.stop());
       secondaryForCleanup?.getTracks().forEach((t) => t.stop());
+      tertiaryForCleanup?.getTracks().forEach((t) => t.stop());
       const msg =
         e instanceof Error ? e.message : "Não foi possível iniciar a captura.";
       setError(msg);
@@ -1735,9 +2436,21 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
     const g =
       pipelineGainNodeRef.current ?? idlePreviewMonitorGainRef.current;
     if (g) {
-      g.gain.value = pipelineMonitorGain;
+      const outLin = Math.max(
+        0,
+        Math.min(2, settings.outputChannelMixGainPercent / 100)
+      );
+      const m = mixerOutputMute ? 0 : 1;
+      const dryToSpeakers = voiceTranslationEnabled ? 0 : 1;
+      g.gain.value = pipelineMonitorGain * outLin * m * dryToSpeakers;
     }
-  }, [pipelineMonitorGain]);
+  }, [
+    pipelineMonitorGain,
+    settings.outputChannelMixGainPercent,
+    mixerOutputMute,
+    voiceTranslationEnabled,
+    pipelineBranchLive,
+  ]);
 
   useEffect(() => {
     if (running) {
@@ -1745,14 +2458,20 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
     }
     const gp = idlePreviewPrimGainRef.current;
     const gs = idlePreviewSecGainRef.current;
-    if (!gp && !gs) {
+    const gt = idlePreviewTertGainRef.current;
+    if (!gp && !gs && !gt) {
       return;
     }
     const ch2Ok =
       Boolean(selectedSecondaryInputId) &&
       selectedSecondaryInputId !== selectedInputId;
+    const ch3Ok =
+      Boolean(selectedTertiaryInputId) &&
+      selectedTertiaryInputId !== selectedInputId &&
+      selectedTertiaryInputId !== selectedSecondaryInputId;
     const pRaw = settings.primaryChannelMixGainPercent / 100;
     const sRaw = settings.secondaryChannelMixGainPercent / 100;
+    const tRaw = settings.tertiaryChannelMixGainPercent / 100;
     const p =
       mixerActivate1 && !mixerMute1
         ? Math.max(0, Math.min(2, pRaw))
@@ -1761,11 +2480,18 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
       mixerActivate2 && !mixerMute2 && ch2Ok
         ? Math.max(0, Math.min(2, sRaw))
         : 0;
+    const t =
+      mixerActivate3 && !mixerMute3 && ch3Ok
+        ? Math.max(0, Math.min(2, tRaw))
+        : 0;
     if (gp) {
       gp.gain.value = IDLE_PREVIEW_MIX_HEADROOM * p;
     }
     if (gs) {
       gs.gain.value = IDLE_PREVIEW_MIX_HEADROOM * s;
+    }
+    if (gt) {
+      gt.gain.value = IDLE_PREVIEW_MIX_HEADROOM * t;
     }
   }, [
     running,
@@ -1773,9 +2499,13 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
     mixerMute1,
     mixerActivate2,
     mixerMute2,
+    mixerActivate3,
+    mixerMute3,
     settings.primaryChannelMixGainPercent,
     settings.secondaryChannelMixGainPercent,
+    settings.tertiaryChannelMixGainPercent,
     selectedSecondaryInputId,
+    selectedTertiaryInputId,
     selectedInputId,
   ]);
 
@@ -1786,8 +2516,13 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
     const ch2Ok =
       Boolean(selectedSecondaryInputId) &&
       selectedSecondaryInputId !== selectedInputId;
+    const ch3Ok =
+      Boolean(selectedTertiaryInputId) &&
+      selectedTertiaryInputId !== selectedInputId &&
+      selectedTertiaryInputId !== selectedSecondaryInputId;
     const pRaw = settings.primaryChannelMixGainPercent / 100;
     const sRaw = settings.secondaryChannelMixGainPercent / 100;
+    const tRaw = settings.tertiaryChannelMixGainPercent / 100;
     const p =
       mixerActivate1 && !mixerMute1
         ? Math.max(0, Math.min(2, pRaw))
@@ -1796,33 +2531,69 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
       mixerActivate2 && !mixerMute2 && ch2Ok
         ? Math.max(0, Math.min(2, sRaw))
         : 0;
+    const t =
+      mixerActivate3 && !mixerMute3 && ch3Ok
+        ? Math.max(0, Math.min(2, tRaw))
+        : 0;
     c.setPrimaryLinear(p);
     if (c.mode === "dual") {
       c.setSecondaryLinear(s);
+    }
+    if (c.mode === "triple") {
+      c.setSecondaryLinear(s);
+      c.setTertiaryLinear(t);
     }
   }, [
     running,
     mixerActivate1,
     mixerActivate2,
+    mixerActivate3,
     mixerMute1,
     mixerMute2,
+    mixerMute3,
     settings.primaryChannelMixGainPercent,
     settings.secondaryChannelMixGainPercent,
+    settings.tertiaryChannelMixGainPercent,
     selectedSecondaryInputId,
+    selectedTertiaryInputId,
     selectedInputId,
   ]);
 
   useEffect(() => {
     if (!mixerActivate1) {
-      setMixerMute1(true);
+      setMixerMute1((prev) => {
+        if (prev) {
+          return prev;
+        }
+        saveEchoLinkSettingsToStorage({ mixerChannel1Muted: true });
+        return true;
+      });
     }
   }, [mixerActivate1]);
 
   useEffect(() => {
     if (!mixerActivate2) {
-      setMixerMute2(true);
+      setMixerMute2((prev) => {
+        if (prev) {
+          return prev;
+        }
+        saveEchoLinkSettingsToStorage({ mixerChannel2Muted: true });
+        return true;
+      });
     }
   }, [mixerActivate2]);
+
+  useEffect(() => {
+    if (!mixerActivate3) {
+      setMixerMute3((prev) => {
+        if (prev) {
+          return prev;
+        }
+        saveEchoLinkSettingsToStorage({ mixerChannel3Muted: true });
+        return true;
+      });
+    }
+  }, [mixerActivate3]);
 
   useEffect(() => {
     if (!running) return;
@@ -1845,7 +2616,9 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
       if (!pipelineMonitorEnabled) return;
       try {
         const branch = await connectMonitorBranch(ctx, source, {
-          monitorGain: pipelineMonitorGainRef.current,
+          monitorGain:
+            pipelineMonitorGainRef.current *
+            (voiceTranslationEnabledRef.current ? 0 : 1),
           outputDeviceId: selectedOutputId || undefined,
           inject: pipelineInjectRef.current,
         });
@@ -1879,7 +2652,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
   const busy =
     running || micTesting || outputTesting || captureStarting;
 
-  const idleInputMeterDepKey = useMemo(
+  const idleInputGraphDepKey = useMemo(
     () =>
       [
         running,
@@ -1890,12 +2663,11 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
         mixerMute1,
         mixerActivate2,
         mixerMute2,
+        mixerActivate3,
+        mixerMute3,
         selectedInputId,
         selectedSecondaryInputId,
-        pipelineMonitorEnabled,
-        selectedOutputId,
-        settings.primaryChannelMixGainPercent,
-        settings.secondaryChannelMixGainPercent,
+        selectedTertiaryInputId,
       ].join("\0"),
     [
       running,
@@ -1906,12 +2678,11 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
       mixerMute1,
       mixerActivate2,
       mixerMute2,
+      mixerActivate3,
+      mixerMute3,
       selectedInputId,
       selectedSecondaryInputId,
-      pipelineMonitorEnabled,
-      selectedOutputId,
-      settings.primaryChannelMixGainPercent,
-      settings.secondaryChannelMixGainPercent,
+      selectedTertiaryInputId,
     ]
   );
 
@@ -1925,10 +2696,10 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
     let ctx: AudioContext | null = null;
     let an1: AnalyserNode | null = null;
     let an2: AnalyserNode | null = null;
+    let an3: AnalyserNode | null = null;
     let ms1Node: MediaStreamAudioSourceNode | null = null;
     let ms2Node: MediaStreamAudioSourceNode | null = null;
-    let previewMeterCtx: AudioContext | null = null;
-    let previewBranchDisconnect: (() => void) | null = null;
+    let ms3Node: MediaStreamAudioSourceNode | null = null;
     let previewMixDest: MediaStreamAudioDestinationNode | null = null;
     let previewSumGain: GainNode | null = null;
 
@@ -1936,14 +2707,23 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
       const ch2Ok =
         Boolean(selectedSecondaryInputId) &&
         selectedSecondaryInputId !== selectedInputId;
+      const ch3Ok =
+        Boolean(selectedTertiaryInputId) &&
+        selectedTertiaryInputId !== selectedInputId &&
+        selectedTertiaryInputId !== selectedSecondaryInputId;
       const want1 = mixerActivate1 && !mixerMute1;
       const want2 = mixerActivate2 && !mixerMute2 && ch2Ok;
-      if (!want1 && !want2) {
+      const want3 = mixerActivate3 && !mixerMute3 && ch3Ok;
+      idlePreviewMixStreamRef.current = null;
+      if (!want1 && !want2 && !want3) {
         setMicVu(0);
         setLineVu(0);
+        setMediaVu(0);
         setMeterSampleRate(0);
         micVuSmoothRef.current = 0;
         lineVuSmoothRef.current = 0;
+        mediaVuSmoothRef.current = 0;
+        setIdleInputGraphSeq((n) => n + 1);
         return;
       }
       try {
@@ -2000,56 +2780,107 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
           ms2Node.connect(an2);
           an2.connect(silent);
         }
+        if (want3) {
+          const c: MediaTrackConstraints = {
+            ...baseAudio,
+            deviceId: { exact: selectedTertiaryInputId },
+          };
+          const s = await navigator.mediaDevices.getUserMedia({ audio: c });
+          if (cancelled) {
+            s.getTracks().forEach((t) => t.stop());
+            safeCloseAudioContext(ctx);
+            return;
+          }
+          streams.push(s);
+          ms3Node = ctx.createMediaStreamSource(s);
+          an3 = ctx.createAnalyser();
+          an3.fftSize = 512;
+          an3.smoothingTimeConstant = 0.75;
+          ms3Node.connect(an3);
+          an3.connect(silent);
+        }
         const buf1 = an1 ? createByteDomainBuffer(an1.fftSize) : null;
         const buf2 = an2 ? createByteDomainBuffer(an2.fftSize) : null;
+        const buf3 = an3 ? createByteDomainBuffer(an3.fftSize) : null;
         micVuSmoothRef.current = 0;
         lineVuSmoothRef.current = 0;
+        mediaVuSmoothRef.current = 0;
         const tick = () => {
           if (cancelled) {
             return;
           }
-          const sens = inputSensitivityRef.current;
-          if (an1 && buf1) {
-            an1.getByteTimeDomainData(buf1);
-            let sum = 0;
-            for (let i = 0; i < buf1.length; i++) {
-              const v = (buf1[i] - 128) / 128;
-              sum += v * v;
+          try {
+            const sens = inputSensitivityRef.current;
+            if (an1 && buf1) {
+              an1.getByteTimeDomainData(buf1);
+              let sum = 0;
+              for (let i = 0; i < buf1.length; i++) {
+                const v = (buf1[i] - 128) / 128;
+                sum += v * v;
+              }
+              const rms = Math.sqrt(sum / buf1.length);
+              const instant = mapRmsToMeterLevel(rms, sens);
+              micVuSmoothRef.current = smoothVuLevel(
+                micVuSmoothRef.current,
+                instant
+              );
+              setMicVu(micVuSmoothRef.current);
+            } else {
+              micVuSmoothRef.current = smoothVuLevel(
+                micVuSmoothRef.current,
+                0
+              );
+              setMicVu(micVuSmoothRef.current);
             }
-            const rms = Math.sqrt(sum / buf1.length);
-            const instant = mapRmsToMeterLevel(rms, sens);
-            const prev = micVuSmoothRef.current;
-            micVuSmoothRef.current =
-              instant > prev
-                ? prev * 0.78 + instant * 0.22
-                : prev * 0.91 + instant * 0.09;
-            setMicVu(micVuSmoothRef.current);
-          } else {
-            micVuSmoothRef.current = 0;
-            setMicVu(0);
-          }
-          if (an2 && buf2) {
-            an2.getByteTimeDomainData(buf2);
-            let sum2 = 0;
-            for (let i = 0; i < buf2.length; i++) {
-              const v = (buf2[i] - 128) / 128;
-              sum2 += v * v;
+            if (an2 && buf2) {
+              an2.getByteTimeDomainData(buf2);
+              let sum2 = 0;
+              for (let i = 0; i < buf2.length; i++) {
+                const v = (buf2[i] - 128) / 128;
+                sum2 += v * v;
+              }
+              const rms2 = Math.sqrt(sum2 / buf2.length);
+              const instant2 = mapRmsToMeterLevel(
+                rms2,
+                LINE_CHANNEL_VU_SENSITIVITY_PERCENT
+              );
+              lineVuSmoothRef.current = smoothVuLevel(
+                lineVuSmoothRef.current,
+                instant2
+              );
+              setLineVu(lineVuSmoothRef.current);
+            } else {
+              lineVuSmoothRef.current = smoothVuLevel(
+                lineVuSmoothRef.current,
+                0
+              );
+              setLineVu(lineVuSmoothRef.current);
             }
-            const rms2 = Math.sqrt(sum2 / buf2.length);
-            const instant2 = mapRmsToMeterLevel(
-              rms2,
-              LINE_CHANNEL_VU_SENSITIVITY_PERCENT
-            );
-            const prev2 = lineVuSmoothRef.current;
-            lineVuSmoothRef.current =
-              instant2 > prev2
-                ? prev2 * 0.78 + instant2 * 0.22
-                : prev2 * 0.91 + instant2 * 0.09;
-            setLineVu(lineVuSmoothRef.current);
-          } else {
-            lineVuSmoothRef.current = 0;
-            setLineVu(0);
-          }
+            if (an3 && buf3) {
+              an3.getByteTimeDomainData(buf3);
+              let sum3 = 0;
+              for (let i = 0; i < buf3.length; i++) {
+                const v = (buf3[i] - 128) / 128;
+                sum3 += v * v;
+              }
+              const rms3 = Math.sqrt(sum3 / buf3.length);
+              const instant3 = mapRmsToMeterLevel(
+                rms3,
+                LINE_CHANNEL_VU_SENSITIVITY_PERCENT
+              );
+              mediaVuSmoothRef.current = smoothVuLevel(
+                mediaVuSmoothRef.current,
+                instant3
+              );
+              setMediaVu(mediaVuSmoothRef.current);
+            } else {
+              mediaVuSmoothRef.current = smoothVuLevel(
+                mediaVuSmoothRef.current,
+                0
+              );
+              setMediaVu(mediaVuSmoothRef.current);
+            }
+          } catch {}
           rafId = requestAnimationFrame(tick);
         };
         rafId = requestAnimationFrame(tick);
@@ -2057,6 +2888,10 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
         const ch2OkMix =
           Boolean(selectedSecondaryInputId) &&
           selectedSecondaryInputId !== selectedInputId;
+        const ch3OkMix =
+          Boolean(selectedTertiaryInputId) &&
+          selectedTertiaryInputId !== selectedInputId &&
+          selectedTertiaryInputId !== selectedSecondaryInputId;
         const pLin =
           mixerActivate1 && !mixerMute1
             ? Math.max(
@@ -2077,92 +2912,54 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                 )
               )
             : 0;
-        if (
-          pipelineMonitorEnabled &&
-          selectedOutputId.trim() &&
-          (want1 || want2) &&
-          !cancelled
-        ) {
-          try {
-            previewSumGain = ctx.createGain();
-            previewSumGain.gain.value = 1;
-            previewMixDest = ctx.createMediaStreamDestination();
-            previewSumGain.connect(previewMixDest);
-            idlePreviewPrimGainRef.current = null;
-            idlePreviewSecGainRef.current = null;
-            if (want1 && ms1Node) {
-              const gP = ctx.createGain();
-              gP.gain.value = IDLE_PREVIEW_MIX_HEADROOM * pLin;
-              ms1Node.connect(gP);
-              gP.connect(previewSumGain);
-              idlePreviewPrimGainRef.current = gP;
-            }
-            if (want2 && ms2Node) {
-              const gS = ctx.createGain();
-              gS.gain.value = IDLE_PREVIEW_MIX_HEADROOM * sLin;
-              ms2Node.connect(gS);
-              gS.connect(previewSumGain);
-              idlePreviewSecGainRef.current = gS;
-            }
-            previewMeterCtx = new AudioContext();
-            await previewMeterCtx.resume();
-            if (cancelled) {
-              previewBranchDisconnect?.();
-              previewBranchDisconnect = null;
-              safeCloseAudioContext(previewMeterCtx);
-              previewMeterCtx = null;
-              idlePreviewMonitorGainRef.current = null;
-              idlePreviewPrimGainRef.current = null;
-              idlePreviewSecGainRef.current = null;
-              setPipelineBranchLive(false);
-              return;
-            }
-            const prevSrc = previewMeterCtx.createMediaStreamSource(
-              previewMixDest.stream
-            );
-            const branch = await connectMonitorBranch(
-              previewMeterCtx,
-              prevSrc,
-              {
-                monitorGain: pipelineMonitorGainRef.current,
-                outputDeviceId: selectedOutputId.trim(),
-                inject: pipelineInjectRef.current,
-              }
-            );
-            if (cancelled) {
-              branch.disconnect();
-              safeCloseAudioContext(previewMeterCtx);
-              previewMeterCtx = null;
-              idlePreviewMonitorGainRef.current = null;
-              idlePreviewPrimGainRef.current = null;
-              idlePreviewSecGainRef.current = null;
-              setPipelineBranchLive(false);
-              return;
-            }
-            previewBranchDisconnect = branch.disconnect;
-            idlePreviewMonitorGainRef.current = branch.gainNode;
-            setPipelineBranchLive(true);
-          } catch (e) {
-            previewBranchDisconnect?.();
-            previewBranchDisconnect = null;
-            safeCloseAudioContext(previewMeterCtx);
-            previewMeterCtx = null;
-            idlePreviewMonitorGainRef.current = null;
-            idlePreviewPrimGainRef.current = null;
-            idlePreviewSecGainRef.current = null;
-            setPipelineBranchLive(false);
-            const msg =
-              e instanceof Error
-                ? e.message
-                : "Pré-visualização do monitor falhou";
-            setError(msg);
+        const tLin =
+          mixerActivate3 && !mixerMute3 && ch3OkMix
+            ? Math.max(
+                0,
+                Math.min(
+                  2,
+                  settings.tertiaryChannelMixGainPercent / 100
+                )
+              )
+            : 0;
+        if ((want1 || want2 || want3) && !cancelled) {
+          previewSumGain = ctx.createGain();
+          previewSumGain.gain.value = 1;
+          previewMixDest = ctx.createMediaStreamDestination();
+          previewSumGain.connect(previewMixDest);
+          idlePreviewPrimGainRef.current = null;
+          idlePreviewSecGainRef.current = null;
+          idlePreviewTertGainRef.current = null;
+          if (want1 && ms1Node) {
+            const gP = ctx.createGain();
+            gP.gain.value = IDLE_PREVIEW_MIX_HEADROOM * pLin;
+            ms1Node.connect(gP);
+            gP.connect(previewSumGain);
+            idlePreviewPrimGainRef.current = gP;
           }
+          if (want2 && ms2Node) {
+            const gS = ctx.createGain();
+            gS.gain.value = IDLE_PREVIEW_MIX_HEADROOM * sLin;
+            ms2Node.connect(gS);
+            gS.connect(previewSumGain);
+            idlePreviewSecGainRef.current = gS;
+          }
+          if (want3 && ms3Node) {
+            const gT = ctx.createGain();
+            gT.gain.value = IDLE_PREVIEW_MIX_HEADROOM * tLin;
+            ms3Node.connect(gT);
+            gT.connect(previewSumGain);
+            idlePreviewTertGainRef.current = gT;
+          }
+          idlePreviewMixStreamRef.current = previewMixDest.stream;
+          setIdleInputGraphSeq((n) => n + 1);
         }
       } catch {
         safeCloseAudioContext(ctx);
         if (!cancelled) {
           setMicVu(0);
           setLineVu(0);
+          setMediaVu(0);
           setMeterSampleRate(0);
         }
       }
@@ -2172,14 +2969,11 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
 
     return () => {
       cancelled = true;
-      previewBranchDisconnect?.();
-      previewBranchDisconnect = null;
-      safeCloseAudioContext(previewMeterCtx);
-      previewMeterCtx = null;
-      idlePreviewMonitorGainRef.current = null;
+      idlePreviewMixStreamRef.current = null;
       idlePreviewPrimGainRef.current = null;
       idlePreviewSecGainRef.current = null;
-      setPipelineBranchLive(false);
+      idlePreviewTertGainRef.current = null;
+      setIdleInputGraphSeq((n) => n + 1);
       if (rafId) {
         cancelAnimationFrame(rafId);
       }
@@ -2187,11 +2981,127 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
       safeCloseAudioContext(ctx);
       setMicVu(0);
       setLineVu(0);
+      setMediaVu(0);
       micVuSmoothRef.current = 0;
       lineVuSmoothRef.current = 0;
+      mediaVuSmoothRef.current = 0;
       setMeterSampleRate(0);
     };
-  }, [idleInputMeterDepKey]);
+  }, [idleInputGraphDepKey]);
+
+  const idleMonitorEffectKey = useMemo(
+    () =>
+      [
+        idleInputGraphSeq,
+        pipelineMonitorEnabled,
+        selectedOutputId,
+        running,
+        micTesting,
+        outputTesting,
+        captureStarting,
+      ].join("\0"),
+    [
+      idleInputGraphSeq,
+      pipelineMonitorEnabled,
+      selectedOutputId,
+      running,
+      micTesting,
+      outputTesting,
+      captureStarting,
+    ]
+  );
+
+  useEffect(() => {
+    if (running || micTesting || outputTesting || captureStarting) {
+      return;
+    }
+    let cancelled = false;
+    let previewMeterCtx: AudioContext | null = null;
+    let previewBranchDisconnect: (() => void) | null = null;
+
+    const run = async () => {
+      stopPipelineOutLevelLoop();
+      previewBranchDisconnect?.();
+      previewBranchDisconnect = null;
+      safeCloseAudioContext(previewMeterCtx);
+      previewMeterCtx = null;
+      idlePreviewMonitorGainRef.current = null;
+      pipelineOutputAnalyserRef.current = null;
+      setPipelineBranchLive(false);
+
+      const mixStream = idlePreviewMixStreamRef.current;
+      if (
+        !pipelineMonitorEnabled ||
+        !selectedOutputId.trim() ||
+        !mixStream
+      ) {
+        return;
+      }
+
+      try {
+        previewMeterCtx = new AudioContext();
+        await previewMeterCtx.resume();
+        if (cancelled) {
+          safeCloseAudioContext(previewMeterCtx);
+          previewMeterCtx = null;
+          return;
+        }
+        const prevSrc =
+          previewMeterCtx.createMediaStreamSource(mixStream);
+        const branch = await connectMonitorBranch(
+          previewMeterCtx,
+          prevSrc,
+          {
+            monitorGain:
+              pipelineMonitorGainRef.current *
+              (voiceTranslationEnabledRef.current ? 0 : 1),
+            outputDeviceId: selectedOutputId.trim(),
+            inject: pipelineInjectRef.current,
+          }
+        );
+        if (cancelled) {
+          branch.disconnect();
+          safeCloseAudioContext(previewMeterCtx);
+          previewMeterCtx = null;
+          return;
+        }
+        previewBranchDisconnect = branch.disconnect;
+        idlePreviewMonitorGainRef.current = branch.gainNode;
+        pipelineOutputAnalyserRef.current = branch.outputAnalyser;
+        startPipelineOutLevelLoop();
+        setPipelineBranchLive(true);
+      } catch (e) {
+        previewBranchDisconnect?.();
+        previewBranchDisconnect = null;
+        safeCloseAudioContext(previewMeterCtx);
+        previewMeterCtx = null;
+        idlePreviewMonitorGainRef.current = null;
+        setPipelineBranchLive(false);
+        const msg =
+          e instanceof Error
+            ? e.message
+            : "Pré-visualização do monitor falhou";
+        setError(msg);
+      }
+    };
+
+    void run();
+
+    return () => {
+      cancelled = true;
+      stopPipelineOutLevelLoop();
+      previewBranchDisconnect?.();
+      previewBranchDisconnect = null;
+      safeCloseAudioContext(previewMeterCtx);
+      previewMeterCtx = null;
+      idlePreviewMonitorGainRef.current = null;
+      setPipelineBranchLive(false);
+    };
+  }, [
+    idleMonitorEffectKey,
+    startPipelineOutLevelLoop,
+    stopPipelineOutLevelLoop,
+  ]);
 
   const selectClass =
     "panel-bezel h-10 w-full rounded-md bg-zinc-800 px-3 font-mono text-[12px] text-zinc-100 shadow-[inset_0_2px_8px_rgba(0,0,0,0.35)] outline-none ring-1 ring-zinc-600/50 transition focus:ring-2 focus:ring-amber-500/40 disabled:cursor-not-allowed disabled:opacity-45 sm:text-[13px]";
@@ -2327,12 +3237,11 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
   }, [elevenLabsVoiceSelectOptions, settings.selectedElevenLabsVoiceId]);
 
   const navEntries: { id: SidebarSection; label: string }[] = [
-    { id: "info", label: "Informações" },
-    { id: "audioIn", label: "Canais de entrada" },
-    { id: "audioOut", label: "Saída de áudio" },
+    { id: "audioIn", label: "Controles" },
     { id: "monitor", label: "Monitoramento" },
     { id: "vocabulary", label: "Vocabulário" },
     { id: "chats", label: "Históricos" },
+    { id: "info", label: "Informações" },
   ];
 
   const selectedOutputLabel =
@@ -2408,8 +3317,28 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
     pipelineUtteranceVersion,
   ]);
 
+  const mixerStripOrderKey = settings.mixerStripOrder.join(",");
+  const mixerStripOrderForUi = useMemo(
+    () => sanitizeMixerStripOrder(settings.mixerStripOrder),
+    [mixerStripOrderKey, settings.mixerStripOrder]
+  );
+
+  useEffect(() => {
+    const normKey = mixerStripOrderForUi.join(",");
+    if (mixerStripOrderKey === normKey) {
+      return;
+    }
+    setSettings((prev) => ({
+      ...prev,
+      mixerStripOrder: mixerStripOrderForUi,
+    }));
+    saveEchoLinkSettingsToStorage({
+      mixerStripOrder: mixerStripOrderForUi,
+    });
+  }, [mixerStripOrderKey, mixerStripOrderForUi]);
+
   const meterForLogDisplay = useMemo(() => {
-    const combined = Math.max(micVu, lineVu);
+    const combined = Math.max(micVu, lineVu, mediaVu);
     const sttMeter =
       settings.speechLanguagesEnabled &&
       serviceSttReady &&
@@ -2429,447 +3358,12 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
     serviceSttFailed,
     micVu,
     lineVu,
+    mediaVu,
     interimTranscript,
     transcriptLines,
   ]);
 
-  return (
-    <div className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-zinc-900 font-mono">
-        <header className="shrink-0 border-b border-zinc-800 bg-zinc-900">
-          <div className="flex flex-col gap-3 px-3 py-3 sm:px-4 lg:flex-row lg:items-center lg:justify-between lg:gap-4">
-            <div className="flex min-w-0 items-center gap-2 sm:gap-3">
-              <div
-                className="flex h-8 w-8 shrink-0 items-center justify-center rounded border border-amber-500/45 bg-zinc-800 text-[9px] font-bold text-amber-300 shadow-inner sm:h-9 sm:w-9 sm:text-[10px]"
-                aria-hidden
-              >
-                EL
-              </div>
-              <div className="min-w-0">
-                <p className="truncate font-mono text-[10px] font-semibold uppercase tracking-[0.18em] text-amber-400 sm:text-[11px] sm:tracking-[0.2em]">
-                  EchoLink
-                </p>
-                <p className="truncate font-mono text-[9px] text-zinc-500 sm:text-[10px]">
-                  Painel · E/S local · WebSocket
-                </p>
-              </div>
-            </div>
-            <div className="flex flex-wrap items-center justify-end gap-2 sm:gap-3 lg:ml-auto">
-              <code className="max-w-[min(100%,14rem)] truncate rounded-md bg-zinc-800 px-2 py-1 text-[9px] text-emerald-300 shadow-inner ring-1 ring-zinc-600/40 sm:text-[10px]">
-                127.0.0.1:8765
-              </code>
-              {!running ? (
-                <button
-                  type="button"
-                  disabled={busy}
-                  onClick={() => {
-                    setSidebarSection("monitor");
-                    void start();
-                  }}
-                  className="panel-bezel inline-flex h-10 min-w-32 shrink-0 items-center justify-center rounded-full bg-linear-to-b from-emerald-600 to-emerald-800 px-5 text-[11px] font-bold uppercase tracking-[0.18em] text-white shadow-[0_3px_0_rgba(6,78,59,0.85)] ring-1 ring-emerald-500/35 transition hover:brightness-110 active:translate-y-px active:shadow-none disabled:opacity-45 sm:h-11 sm:min-w-36 sm:px-6 sm:text-xs"
-                >
-                  Iniciar
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  onClick={stopAll}
-                  className="panel-bezel inline-flex h-10 min-w-32 shrink-0 items-center justify-center rounded-full bg-linear-to-b from-zinc-700 to-zinc-800 px-5 text-[11px] font-bold uppercase tracking-[0.18em] text-red-200 shadow-[0_3px_0_rgba(0,0,0,0.45)] ring-1 ring-red-900/45 transition hover:brightness-110 active:translate-y-px sm:h-11 sm:min-w-36 sm:px-6 sm:text-xs"
-                >
-                  Parar
-                </button>
-              )}
-            </div>
-          </div>
-        </header>
-
-        <div className="relative isolate flex min-h-0 flex-1 flex-col bg-zinc-900 lg:flex-row lg:items-stretch">
-            <nav
-              className="app-region-no-drag pointer-events-auto relative z-50 flex shrink-0 flex-row gap-1 overflow-x-auto border-b border-zinc-800 bg-zinc-900 p-2 lg:h-full lg:min-h-0 lg:w-52 lg:max-w-52 lg:flex-col lg:justify-start lg:gap-0 lg:overflow-x-hidden lg:overflow-y-auto lg:self-stretch lg:border-b-0 lg:border-r lg:bg-zinc-950/40 lg:p-0 lg:py-2"
-              aria-label="Navegação do painel"
-            >
-              {navEntries.map((item) => (
-                <button
-                  key={item.id}
-                  type="button"
-                  onClick={() => setSidebarSection(item.id)}
-                  className={`app-region-no-drag ${navItemBase} min-w-30 touch-manipulation lg:min-w-0 lg:w-full ${sidebarSection === item.id ? navItemActive : navItemIdle}`}
-                >
-                  {item.label}
-                </button>
-              ))}
-            </nav>
-
-            <div className="relative z-0 flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto bg-zinc-900">
-              {sidebarSection === "audioIn" ? (
-                audioInLayoutMode === "mixer" ? (
-                  <div className="flex min-h-0 min-w-0 flex-1 flex-col divide-y divide-zinc-600/35">
-                    <div className="shrink-0 border-b border-zinc-600/35 bg-zinc-900/60 px-3 py-2 sm:px-4">
-                      <p className="text-[10px] font-bold uppercase tracking-[0.22em] text-zinc-200">
-                        Canais de entrada
-                      </p>
-                      <p className="mt-0.5 text-[10px] text-zinc-400">
-                        Mesa de som · faders e VU. Em cada canal, Editar abre
-                        dispositivos, tempos de captura e teste do microfone.
-                      </p>
-                    </div>
-                    <div className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-linear-to-b from-[#0c0c0e] via-[#080809] to-black">
-                      <div
-                        className={`flex min-h-0 min-w-0 flex-1 flex-row ${mixerSideEditor ? "pointer-events-none invisible" : ""}`}
-                        aria-hidden={mixerSideEditor ? true : undefined}
-                      >
-                        <div className="flex min-h-0 shrink-0 flex-col px-3 py-3 sm:px-4 sm:py-4">
-                          <div className="flex min-h-0 min-w-0 flex-1 items-stretch justify-start gap-3 overflow-x-auto pb-1 sm:gap-5">
-                            <MixerConsoleInputChannel
-                              key="echo-mixer-strip-ch1"
-                              channelId={1}
-                              activateOn={mixerActivate1}
-                              onActivateToggle={() => {
-                                setMixerActivate1((v) => {
-                                  const next = !v;
-                                  if (!next) {
-                                    setMixerMute1(true);
-                                  }
-                                  return next;
-                                });
-                              }}
-                              onEdit={() => {
-                                setMixerSideEditor("microphone");
-                                setAudioInDetailScope("microphone");
-                                setAudioInChannelTab("microphone");
-                              }}
-                              muted={mixerMute1}
-                              onMuteToggle={() => setMixerMute1((v) => !v)}
-                              deviceLabel={
-                                selectedInputId
-                                  ? (() => {
-                                      const d = audioInputs.find(
-                                        (x) => x.deviceId === selectedInputId
-                                      );
-                                      return d
-                                        ? formatMediaDeviceOptionLabel(
-                                            d,
-                                            "input",
-                                            settings.inputDeviceAliases[
-                                              d.deviceId
-                                            ]
-                                          )
-                                        : "…";
-                                    })()
-                                  : "Mic · padrão"
-                              }
-                              vuLevel={micVu}
-                              faderValue={
-                                settings.primaryChannelMixGainPercent
-                              }
-                              onFaderChange={(v) =>
-                                setMixerChannelMixGainPercent(1, v)
-                              }
-                              faderDisabled={false}
-                              busy={busy}
-                            />
-                            <MixerConsoleInputChannel
-                              key="echo-mixer-strip-ch2"
-                              channelId={2}
-                              activateOn={mixerActivate2}
-                              onActivateToggle={() => {
-                                setMixerActivate2((v) => {
-                                  const next = !v;
-                                  if (!next) {
-                                    setMixerMute2(true);
-                                  }
-                                  return next;
-                                });
-                              }}
-                              onEdit={() => {
-                                setMixerSideEditor("systemAudio");
-                                setAudioInDetailScope("systemAudio");
-                                setAudioInChannelTab("systemAudio");
-                              }}
-                              muted={mixerMute2}
-                              onMuteToggle={() => setMixerMute2((v) => !v)}
-                              deviceLabel={
-                                selectedSecondaryInputId &&
-                                selectedSecondaryInputId !== selectedInputId
-                                  ? (() => {
-                                      const d = audioInputs.find(
-                                        (x) =>
-                                          x.deviceId ===
-                                          selectedSecondaryInputId
-                                      );
-                                      return d
-                                        ? formatMediaDeviceOptionLabel(
-                                            d,
-                                            "input",
-                                            settings.inputDeviceAliases[
-                                              d.deviceId
-                                            ]
-                                          )
-                                        : "…";
-                                    })()
-                                  : "Linha · off"
-                              }
-                              vuLevel={lineVu}
-                              faderValue={
-                                settings.secondaryChannelMixGainPercent
-                              }
-                              onFaderChange={(v) =>
-                                setMixerChannelMixGainPercent(2, v)
-                              }
-                              faderDisabled={
-                                !selectedSecondaryInputId ||
-                                selectedSecondaryInputId === selectedInputId
-                              }
-                              busy={busy}
-                            />
-                          </div>
-                          {meterSampleRate > 0 && (
-                            <p className="mt-3 shrink-0 font-mono text-[10px] text-zinc-600 sm:text-[11px]">
-                              Taxa de amostragem · {meterSampleRate} Hz
-                            </p>
-                          )}
-                        </div>
-                        <div
-                          className="min-h-0 min-w-0 flex-1 bg-black"
-                          aria-hidden
-                        />
-                      </div>
-                      {mixerSideEditor ? (
-                        <div className="absolute inset-0 z-10 flex min-h-0 min-w-0 flex-col bg-zinc-950/98 ring-1 ring-zinc-700/60">
-                          <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-zinc-700/50 bg-zinc-950/90 px-3 py-2 sm:px-4">
-                            <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-zinc-300 sm:text-[11px]">
-                              {mixerSideEditor === "microphone"
-                                ? "Canal 1 · microfone"
-                                : "Canal 2 · linha"}
-                            </p>
-                            <div className="flex flex-wrap items-center justify-end gap-2">
-                              <button
-                                type="button"
-                                disabled={busy}
-                                onClick={() => void refreshMediaDevices()}
-                                className={btnSecondary}
-                              >
-                                Atualizar
-                              </button>
-                              <button
-                                type="button"
-                                disabled={busy}
-                                onClick={() => void unlockMediaLabels()}
-                                className={btnSecondary}
-                              >
-                                Nomes
-                              </button>
-                              <button
-                                type="button"
-                                disabled={busy}
-                                onClick={() => setMixerSideEditor(null)}
-                                className="panel-bezel inline-flex min-h-9 items-center justify-center rounded-md bg-zinc-800 px-3 font-mono text-[10px] font-bold uppercase tracking-wide text-zinc-200 ring-1 ring-zinc-600/50 transition hover:bg-zinc-700 sm:min-h-8 sm:text-[11px]"
-                              >
-                                Fechar
-                              </button>
-                            </div>
-                          </div>
-                          <div className="min-h-0 flex-1 overflow-y-auto">
-                            {mixerSideEditor === "microphone" ? (
-                              <AudioInMicInputDetailPanel
-                                embedded
-                                audioInDetailScope="microphone"
-                                settings={settings}
-                                setSettings={setSettings}
-                                selectedInputId={selectedInputId}
-                                setSelectedInputId={setSelectedInputId}
-                                selectedSecondaryInputId={
-                                  selectedSecondaryInputId
-                                }
-                                setSelectedSecondaryInputId={
-                                  setSelectedSecondaryInputId
-                                }
-                                audioInputs={audioInputs}
-                                busy={busy}
-                                micTesting={micTesting}
-                                outputTesting={outputTesting}
-                                meterSampleRate={meterSampleRate}
-                                selectClass={selectClass}
-                                btnSky={btnSky}
-                                setSettingsField={setSettingsField}
-                                testMicrophone={testMicrophone}
-                              />
-                            ) : (
-                              <AudioInLineInputDetailPanel
-                                embedded
-                                audioInDetailScope="systemAudio"
-                                settings={settings}
-                                setSettings={setSettings}
-                                selectedInputId={selectedInputId}
-                                selectedSecondaryInputId={
-                                  selectedSecondaryInputId
-                                }
-                                setSelectedSecondaryInputId={
-                                  setSelectedSecondaryInputId
-                                }
-                                audioInputs={audioInputs}
-                                busy={busy}
-                                selectClass={selectClass}
-                                previewVuLevel={lineVu}
-                              />
-                            )}
-                          </div>
-                        </div>
-                      ) : null}
-                    </div>
-                  </div>
-                ) : (
-                  <div className="divide-y divide-zinc-600/35">
-                    <div className="flex flex-wrap items-center gap-2 border-b border-zinc-600/35 bg-zinc-950/60 px-3 py-2 sm:px-4">
-                      <button
-                        type="button"
-                        disabled={busy}
-                        onClick={() => {
-                          setAudioInLayoutMode("mixer");
-                          setAudioInDetailScope("both");
-                          setMixerSideEditor(null);
-                        }}
-                        className="panel-bezel inline-flex min-h-9 items-center justify-center rounded-md bg-zinc-800 px-3 font-mono text-[10px] font-bold uppercase tracking-wide text-zinc-200 ring-1 ring-zinc-600/50 transition hover:bg-zinc-700 sm:min-h-8 sm:text-[11px]"
-                      >
-                        Voltar à mesa
-                      </button>
-                    </div>
-                    <div className="border-b border-zinc-600/35 bg-zinc-900/60 px-3 py-2 sm:px-4">
-                      <p className="text-[10px] font-bold uppercase tracking-[0.22em] text-zinc-200">
-                        Canais de entrada
-                      </p>
-                      {audioInDetailScope === "both" ? (
-                        <p className="mt-0.5 text-[10px] text-zinc-400">
-                          Cada separador é um canal de entrada. Os tempos e o
-                          medidor do VU estão no canal 1 (microfone). Os canais
-                          ativos são misturados antes do STT e do envio ao
-                          serviço.
-                        </p>
-                      ) : audioInDetailScope === "microphone" ? (
-                        <p className="mt-0.5 text-[10px] text-zinc-400">
-                          Definições só do microfone (canal 1): dispositivo, nível
-                          na mesa, VU, tempos de captura e teste do mic.
-                        </p>
-                      ) : (
-                        <p className="mt-0.5 text-[10px] text-zinc-400">
-                          Definições da entrada adicional (canal 2): dispositivo,
-                          medidor em tempo real e nível na mesa. Tempos de bloco
-                          seguem o canal 1.
-                        </p>
-                      )}
-                      <p className="mt-2 text-[9px] leading-snug text-zinc-500">
-                        Os nomes vêm do navegador e podem diferir do sistema. O
-                        sufixo após “·” identifica o dispositivo na Web.
-                      </p>
-                    </div>
-                    <div className="flex flex-wrap gap-2 border-b border-zinc-600/35 bg-zinc-900/40 px-3 py-2 sm:px-4">
-                      <button
-                        type="button"
-                        disabled={busy}
-                        onClick={() => void refreshMediaDevices()}
-                        className={btnSecondary}
-                      >
-                        Atualizar
-                      </button>
-                      <button
-                        type="button"
-                        disabled={busy}
-                        onClick={() => void unlockMediaLabels()}
-                        className={btnSecondary}
-                      >
-                        Nomes
-                      </button>
-                    </div>
-                  {audioInDetailScope === "both" ? (
-                    <div
-                      className="border-b border-zinc-600/35 bg-zinc-950/30 px-3 py-2 sm:px-4"
-                      role="tablist"
-                      aria-label="Canais de entrada"
-                    >
-                      <div className="flex flex-wrap gap-1">
-                        <button
-                          type="button"
-                          role="tab"
-                          aria-selected={audioInChannelTab === "microphone"}
-                          id="audio-in-tab-mic"
-                          className={`panel-bezel rounded-md px-3 py-2 text-left text-[10px] font-bold uppercase tracking-[0.12em] transition sm:text-[11px] ${
-                            audioInChannelTab === "microphone"
-                              ? "bg-zinc-800 text-amber-400 ring-1 ring-amber-600/35"
-                              : "text-zinc-500 ring-1 ring-transparent hover:bg-zinc-800/50 hover:text-zinc-300"
-                          }`}
-                          onClick={() => setAudioInChannelTab("microphone")}
-                        >
-                          Canal 1 · microfone
-                        </button>
-                        <button
-                          type="button"
-                          role="tab"
-                          aria-selected={audioInChannelTab === "systemAudio"}
-                          id="audio-in-tab-audio"
-                          className={`panel-bezel rounded-md px-3 py-2 text-left text-[10px] font-bold uppercase tracking-[0.12em] transition sm:text-[11px] ${
-                            audioInChannelTab === "systemAudio"
-                              ? "bg-zinc-800 text-amber-400 ring-1 ring-amber-600/35"
-                              : "text-zinc-500 ring-1 ring-transparent hover:bg-zinc-800/50 hover:text-zinc-300"
-                          }`}
-                          onClick={() => setAudioInChannelTab("systemAudio")}
-                        >
-                          Canal 2 · áudio
-                        </button>
-                      </div>
-                    </div>
-                  ) : null}
-                  <div className="grid grid-cols-1 gap-0 divide-y divide-zinc-600/35">
-                    {audioInActivePanel === "microphone" ? (
-                      <AudioInMicInputDetailPanel
-                        embedded={false}
-                        audioInDetailScope={audioInDetailScope}
-                        settings={settings}
-                        setSettings={setSettings}
-                        selectedInputId={selectedInputId}
-                        setSelectedInputId={setSelectedInputId}
-                        selectedSecondaryInputId={selectedSecondaryInputId}
-                        setSelectedSecondaryInputId={setSelectedSecondaryInputId}
-                        audioInputs={audioInputs}
-                        busy={busy}
-                        micTesting={micTesting}
-                        outputTesting={outputTesting}
-                        meterSampleRate={meterSampleRate}
-                        selectClass={selectClass}
-                        btnSky={btnSky}
-                        setSettingsField={setSettingsField}
-                        testMicrophone={testMicrophone}
-                      />
-                    ) : (
-                      <AudioInLineInputDetailPanel
-                        embedded={false}
-                        audioInDetailScope={audioInDetailScope}
-                        settings={settings}
-                        setSettings={setSettings}
-                        selectedInputId={selectedInputId}
-                        selectedSecondaryInputId={selectedSecondaryInputId}
-                        setSelectedSecondaryInputId={setSelectedSecondaryInputId}
-                        audioInputs={audioInputs}
-                        busy={busy}
-                        selectClass={selectClass}
-                        previewVuLevel={lineVu}
-                      />
-                    )}
-                  </div>
-                </div>
-                )
-              ) : sidebarSection === "audioOut" ? (
-                <div className="divide-y divide-zinc-600/35">
-                  <div className="border-b border-zinc-600/35 bg-zinc-900/60 px-3 py-2 sm:px-4">
-                    <p className="text-[10px] font-bold uppercase tracking-[0.22em] text-zinc-200">
-                      Saída de áudio
-                    </p>
-                    <p className="mt-0.5 text-[10px] text-zinc-400">
-                      Fones · monitor e tradução
-                    </p>
-                    <p className="mt-2 text-[9px] leading-snug text-zinc-500">
-                      Os nomes vêm do navegador e podem diferir do macOS. O
-                      sufixo após “·” identifica o dispositivo na Web.
-                    </p>
-                  </div>
+  const audioOutDetailSections = (
                   <div className="grid grid-cols-1 gap-0 divide-y divide-zinc-600/35">
                     <section className="bg-zinc-900/50 p-3 sm:p-4">
                       <div className="mb-2.5 flex items-center gap-2 rounded-md bg-sky-950/25 px-2 py-1.5 ring-1 ring-sky-700/35">
@@ -2968,227 +3462,6 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                           {outputTesting ? "…" : "Testar saída"}
                         </button>
                       </div>
-                    </section>
-
-                    <section className="bg-zinc-900/50 p-3 sm:p-4">
-                      <div className="mb-2 flex items-start justify-between gap-3">
-                        <p className="min-w-0 flex-1 text-[10px] font-bold uppercase tracking-[0.18em] text-violet-300">
-                          Tradutor · idioma e tradução
-                        </p>
-                        <button
-                          type="button"
-                          role="switch"
-                          aria-checked={settings.speechLanguagesEnabled}
-                          aria-label="Ativar tradução e idiomas"
-                          disabled={busy}
-                          onClick={() => {
-                            const next = !settings.speechLanguagesEnabled;
-                            setSettings((prev) => {
-                              const merged = {
-                                ...prev,
-                                speechLanguagesEnabled: next,
-                              };
-                              saveEchoLinkSpeechSettings({
-                                speechLanguagesEnabled: next,
-                                speechReceiveLanguage: prev.speechReceiveLanguage,
-                                speechTransformLanguage:
-                                  prev.speechTransformLanguage,
-                              });
-                              return merged;
-                            });
-                          }}
-                          className={`relative mt-0.5 inline-flex h-7 w-12 shrink-0 cursor-pointer rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
-                            settings.speechLanguagesEnabled
-                              ? "border-sky-500/80 bg-sky-600/90"
-                              : "border-zinc-600 bg-zinc-700"
-                          }`}
-                        >
-                          <span
-                            className={`pointer-events-none absolute top-0.5 left-0.5 h-5 w-5 rounded-full bg-white shadow transition-transform ${
-                              settings.speechLanguagesEnabled
-                                ? "translate-x-5"
-                                : "translate-x-0"
-                            }`}
-                          />
-                        </button>
-                      </div>
-                      <p className="mb-3 text-[9px] leading-snug text-zinc-500">
-                        Idioma da fala e idioma alvo do texto. Desligado: só
-                        português (Brasil) no reconhecimento.
-                      </p>
-                      <div
-                        className={`space-y-4 ${
-                          !settings.speechLanguagesEnabled
-                            ? "pointer-events-none opacity-45"
-                            : ""
-                        }`}
-                      >
-                        <div>
-                          <label
-                            htmlFor="speech-receive-lang-out"
-                            className="mb-1.5 block text-[9px] uppercase tracking-[0.18em] text-zinc-400"
-                          >
-                            Receber fala
-                          </label>
-                          <select
-                            id="speech-receive-lang-out"
-                            className={selectClass}
-                            disabled={busy || !settings.speechLanguagesEnabled}
-                            value={settings.speechReceiveLanguage}
-                            onChange={(e) => {
-                              const v = e.target.value;
-                              setSettings((prev) => {
-                                const next = {
-                                  ...prev,
-                                  speechReceiveLanguage: v,
-                                };
-                                saveEchoLinkSpeechSettings({
-                                  speechReceiveLanguage: v,
-                                  speechLanguagesEnabled:
-                                    prev.speechLanguagesEnabled,
-                                  speechTransformLanguage:
-                                    prev.speechTransformLanguage,
-                                });
-                                return next;
-                              });
-                            }}
-                          >
-                            {SPEECH_LANGUAGE_OPTIONS.map((o) => (
-                              <option key={o.value} value={o.value}>
-                                {o.label}
-                              </option>
-                            ))}
-                          </select>
-                        </div>
-                        <div>
-                          <label
-                            htmlFor="speech-transform-lang-out"
-                            className="mb-1.5 block text-[9px] uppercase tracking-[0.18em] text-zinc-400"
-                          >
-                            Transformar para
-                          </label>
-                          <select
-                            id="speech-transform-lang-out"
-                            className={selectClass}
-                            disabled={busy || !settings.speechLanguagesEnabled}
-                            value={settings.speechTransformLanguage}
-                            onChange={(e) => {
-                              const v = e.target.value;
-                              setSettings((prev) => {
-                                const next = {
-                                  ...prev,
-                                  speechTransformLanguage: v,
-                                };
-                                saveEchoLinkSpeechSettings({
-                                  speechTransformLanguage: v,
-                                  speechLanguagesEnabled:
-                                    prev.speechLanguagesEnabled,
-                                  speechReceiveLanguage:
-                                    prev.speechReceiveLanguage,
-                                });
-                                return next;
-                              });
-                            }}
-                          >
-                            {SPEECH_LANGUAGE_OPTIONS.map((o) => (
-                              <option key={o.value} value={o.value}>
-                                {o.label}
-                              </option>
-                            ))}
-                          </select>
-                        </div>
-                      </div>
-                      <div className="mt-3">
-                        <label
-                          htmlFor="eleven-voice-out"
-                          className="mb-1.5 block text-[8px] font-bold uppercase tracking-[0.16em] text-emerald-600/95"
-                        >
-                          Voz em inglês (ElevenLabs)
-                        </label>
-                        {elevenLabsVoicesLoading ? (
-                          <p className="text-[9px] text-zinc-500">
-                            A carregar vozes da conta…
-                          </p>
-                        ) : (
-                          <>
-                            <select
-                              id="eleven-voice-out"
-                              className={selectClass}
-                              disabled={
-                                busy || elevenLabsVoiceSelectOptions.length === 0
-                              }
-                              value={elevenLabsVoiceSelectUiValue}
-                              onChange={(e) => {
-                                const v = e.target.value;
-                                setSettings((prev) => {
-                                  const next = {
-                                    ...prev,
-                                    selectedElevenLabsVoiceId: v,
-                                  };
-                                  saveEchoLinkSettingsToStorage({
-                                    selectedElevenLabsVoiceId: v,
-                                  });
-                                  return next;
-                                });
-                              }}
-                            >
-                              {elevenLabsVoiceSelectOptions.map((o) => (
-                                <option key={o.value} value={o.value}>
-                                  {o.label}
-                                </option>
-                              ))}
-                            </select>
-                            <p className="mt-1.5 text-[9px] leading-snug text-zinc-500">
-                              Lista vinda da API ElevenLabs com a voz em inglês
-                              ativa; senão, opções de reserva.
-                            </p>
-                          </>
-                        )}
-                      </div>
-                    </section>
-
-                    <section className="bg-zinc-900/50 p-3 sm:p-4">
-                      <div className="mb-2 flex items-start justify-between gap-3">
-                        <p className="min-w-0 flex-1 text-[10px] font-bold uppercase tracking-[0.18em] text-emerald-300">
-                          Voz em inglês (nuvem)
-                        </p>
-                        <label className="flex cursor-pointer items-center gap-2 text-[10px] text-zinc-300">
-                          <input
-                            type="checkbox"
-                            className="h-3.5 w-3.5 rounded border-zinc-600 bg-zinc-800 text-emerald-500"
-                            checked={voiceTranslationEnabled}
-                            disabled={busy}
-                            onChange={(e) => {
-                              const c = e.target.checked;
-                              setVoiceTranslationEnabled(c);
-                              setSettings((prev) => ({
-                                ...prev,
-                                voiceTranslationEnabled: c,
-                              }));
-                              saveEchoLinkSettingsToStorage(
-                                { voiceTranslationEnabled: c },
-                                { syncElectron: true }
-                              );
-                            }}
-                          />
-                          Ativar
-                        </label>
-                      </div>
-                      <p className="mb-2 text-[9px] leading-snug text-zinc-500">
-                        A cada frase final do STT: Amazon Translate (PT→EN) +
-                        ElevenLabs (voz clonada). Reproduz na saída selecionada em
-                        Saída de áudio.
-                      </p>
-                      {voiceTranslationEnabled && (
-                        <p className="mb-2 text-[10px] text-zinc-400">
-                          Serviço:{" "}
-                          {voiceTranslationBackendStatus?.ready
-                            ? "pronto"
-                            : voiceTranslationBackendStatus === null
-                              ? "…"
-                              : "incompleto (AWS + ELEVENLABS_*)"}
-                        </p>
-                      )}
                     </section>
 
                     <section className="bg-zinc-900/50 p-3 sm:p-4">
@@ -3296,7 +3569,765 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                       </div>
                     </section>
                   </div>
+  );
+
+  return (
+    <div className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-zinc-900 font-mono">
+        <header className="shrink-0 border-b border-zinc-800 bg-zinc-900">
+          <div className="flex flex-col gap-3 px-3 py-3 sm:px-4 lg:flex-row lg:items-center lg:justify-between lg:gap-4">
+            <div className="flex min-w-0 items-center gap-2 sm:gap-3">
+              <div
+                className="flex h-8 w-8 shrink-0 items-center justify-center rounded border border-amber-500/45 bg-zinc-800 text-[9px] font-bold text-amber-300 shadow-inner sm:h-9 sm:w-9 sm:text-[10px]"
+                aria-hidden
+              >
+                EL
+              </div>
+              <div className="min-w-0">
+                <p className="truncate font-mono text-[10px] font-semibold uppercase tracking-[0.18em] text-amber-400 sm:text-[11px] sm:tracking-[0.2em]">
+                  EchoLink
+                </p>
+                <p className="truncate font-mono text-[9px] text-zinc-500 sm:text-[10px]">
+                  Painel · E/S local · WebSocket
+                </p>
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center justify-end gap-2 sm:gap-3 lg:ml-auto">
+              <code className="max-w-[min(100%,14rem)] truncate rounded-md bg-zinc-800 px-2 py-1 text-[9px] text-emerald-300 shadow-inner ring-1 ring-zinc-600/40 sm:text-[10px]">
+                {echoLinkServiceOriginForDisplay()}
+              </code>
+              {!running ? (
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => {
+                    setSidebarSection("monitor");
+                    saveEchoLinkSettingsToStorage({ sidebarSection: "monitor" });
+                    void start();
+                  }}
+                  className="panel-bezel inline-flex h-10 min-w-32 shrink-0 items-center justify-center rounded-full bg-linear-to-b from-emerald-600 to-emerald-800 px-5 text-[11px] font-bold uppercase tracking-[0.18em] text-white shadow-[0_3px_0_rgba(6,78,59,0.85)] ring-1 ring-emerald-500/35 transition hover:brightness-110 active:translate-y-px active:shadow-none disabled:opacity-45 sm:h-11 sm:min-w-36 sm:px-6 sm:text-xs"
+                >
+                  Iniciar
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={stopAll}
+                  className="panel-bezel inline-flex h-10 min-w-32 shrink-0 items-center justify-center rounded-full bg-linear-to-b from-zinc-700 to-zinc-800 px-5 text-[11px] font-bold uppercase tracking-[0.18em] text-red-200 shadow-[0_3px_0_rgba(0,0,0,0.45)] ring-1 ring-red-900/45 transition hover:brightness-110 active:translate-y-px sm:h-11 sm:min-w-36 sm:px-6 sm:text-xs"
+                >
+                  Parar
+                </button>
+              )}
+            </div>
+          </div>
+        </header>
+
+        <div className="relative isolate flex min-h-0 flex-1 flex-col bg-zinc-900 lg:flex-row lg:items-stretch">
+            <nav
+              className="app-region-no-drag pointer-events-auto relative z-50 flex shrink-0 flex-row gap-1 overflow-x-auto border-b border-zinc-800 bg-zinc-900 p-2 lg:h-full lg:min-h-0 lg:w-52 lg:max-w-52 lg:flex-col lg:justify-start lg:gap-0 lg:overflow-x-hidden lg:overflow-y-auto lg:self-stretch lg:border-b-0 lg:border-r lg:bg-zinc-950/40 lg:p-0 lg:py-2"
+              aria-label="Navegação do painel"
+            >
+              {navEntries.map((item) => (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={() => {
+                    setSidebarSection(item.id);
+                    saveEchoLinkSettingsToStorage({
+                      sidebarSection: item.id,
+                    });
+                  }}
+                  className={`app-region-no-drag ${navItemBase} min-w-30 touch-manipulation lg:min-w-0 lg:w-full ${sidebarSection === item.id ? navItemActive : navItemIdle}`}
+                >
+                  {item.label}
+                </button>
+              ))}
+            </nav>
+
+            <div className="relative z-0 flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto bg-zinc-900">
+              {sidebarSection === "audioIn" ? (
+                audioInLayoutMode === "mixer" ? (
+                  <div className="flex min-h-0 min-w-0 flex-1 flex-col divide-y divide-zinc-600/35">
+                    <div className="shrink-0 border-b border-zinc-600/35 bg-zinc-900/60 px-3 py-2 sm:px-4">
+                      <p className="text-[10px] font-bold uppercase tracking-[0.22em] text-zinc-200">
+                        Canais de entrada
+                      </p>
+                      <p className="mt-0.5 text-[10px] text-zinc-400">
+                        Mesa de som · faders e VU. O traço no topo de cada faixa
+                        serve para arrastar e mudar a ordem (fica gravado nas
+                        definições). Em cada canal, Editar abre dispositivos,
+                        tempos de captura e teste do microfone.
+                      </p>
+                    </div>
+                    <div className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-linear-to-b from-[#0c0c0e] via-[#080809] to-black">
+                      <div
+                        className={`flex min-h-0 min-w-0 flex-1 flex-row ${mixerSideEditor ? "pointer-events-none invisible" : ""}`}
+                        aria-hidden={mixerSideEditor ? true : undefined}
+                      >
+                        <div className="flex min-h-0 shrink-0 flex-col px-3 py-3 sm:px-4 sm:py-4">
+                          <div className="flex min-h-0 min-w-0 flex-1 items-stretch justify-start gap-3 overflow-x-auto pb-1 sm:gap-5">
+                            {mixerStripOrderForUi.map(
+                              (stripSlot, stackIndex) => {
+                                const stripDnD: MixerStripDnDProps = {
+                                  mixerStripId: stripSlot,
+                                  stripStackIndex: stackIndex,
+                                  draggingMixerStripId,
+                                  onMixerStripDragStart:
+                                    handleMixerStripDragStart,
+                                  onMixerStripDragEnd: handleMixerStripDragEnd,
+                                  onMixerStripDragOver:
+                                    handleMixerStripDragOver,
+                                  onMixerStripDrop: handleMixerStripDrop,
+                                };
+                                if (stripSlot === "ch1") {
+                                  return (
+                                    <MixerConsoleInputChannel
+                                      key={stripSlot}
+                                      channelId={1}
+                                      activateOn={mixerActivate1}
+                                      onActivateToggle={() => {
+                                        setMixerActivate1((v) => {
+                                          const next = !v;
+                                          if (!next) {
+                                            setMixerMute1(true);
+                                            saveEchoLinkSettingsToStorage({
+                                              mixerChannel1Active: next,
+                                              mixerChannel1Muted: true,
+                                            });
+                                          } else {
+                                            saveEchoLinkSettingsToStorage({
+                                              mixerChannel1Active: next,
+                                            });
+                                          }
+                                          return next;
+                                        });
+                                      }}
+                                      onEdit={() => {
+                                        setMixerSideEditor("microphone");
+                                        setAudioInDetailScope("microphone");
+                                        setAudioInChannelTab("microphone");
+                                        saveEchoLinkSettingsToStorage({
+                                          audioInDetailScope: "microphone",
+                                          audioInChannelTab: "microphone",
+                                        });
+                                      }}
+                                      muted={mixerMute1}
+                                      onMuteToggle={() => {
+                                        setMixerMute1((v) => {
+                                          const next = !v;
+                                          saveEchoLinkSettingsToStorage({
+                                            mixerChannel1Muted: next,
+                                          });
+                                          return next;
+                                        });
+                                      }}
+                                      deviceLabel={
+                                        selectedInputId
+                                          ? (() => {
+                                              const d = audioInputs.find(
+                                                (x) =>
+                                                  x.deviceId ===
+                                                  selectedInputId
+                                              );
+                                              return d
+                                                ? formatMediaDeviceOptionLabel(
+                                                    d,
+                                                    "input",
+                                                    settings
+                                                      .inputDeviceAliases[
+                                                      d.deviceId
+                                                    ]
+                                                  )
+                                                : "…";
+                                            })()
+                                          : "Mic · padrão"
+                                      }
+                                      vuLevel={micVu}
+                                      faderValue={
+                                        settings.primaryChannelMixGainPercent
+                                      }
+                                      onFaderChange={(v) =>
+                                        setMixerChannelMixGainPercent(1, v)
+                                      }
+                                      faderDisabled={false}
+                                      busy={busy}
+                                      {...stripDnD}
+                                    />
+                                  );
+                                }
+                                if (stripSlot === "ch2") {
+                                  return (
+                                    <MixerConsoleInputChannel
+                                      key={stripSlot}
+                                      channelId={2}
+                                      activateOn={mixerActivate2}
+                                      onActivateToggle={() => {
+                                        setMixerActivate2((v) => {
+                                          const next = !v;
+                                          if (!next) {
+                                            setMixerMute2(true);
+                                            saveEchoLinkSettingsToStorage({
+                                              mixerChannel2Active: next,
+                                              mixerChannel2Muted: true,
+                                            });
+                                          } else {
+                                            saveEchoLinkSettingsToStorage({
+                                              mixerChannel2Active: next,
+                                            });
+                                          }
+                                          return next;
+                                        });
+                                      }}
+                                      onEdit={() => {
+                                        setMixerSideEditor("systemAudio");
+                                        setAudioInDetailScope("systemAudio");
+                                        setAudioInChannelTab("systemAudio");
+                                        saveEchoLinkSettingsToStorage({
+                                          audioInDetailScope: "systemAudio",
+                                          audioInChannelTab: "systemAudio",
+                                        });
+                                      }}
+                                      muted={mixerMute2}
+                                      onMuteToggle={() => {
+                                        setMixerMute2((v) => {
+                                          const next = !v;
+                                          saveEchoLinkSettingsToStorage({
+                                            mixerChannel2Muted: next,
+                                          });
+                                          return next;
+                                        });
+                                      }}
+                                      deviceLabel={
+                                        selectedSecondaryInputId &&
+                                        selectedSecondaryInputId !==
+                                          selectedInputId
+                                          ? (() => {
+                                              const d = audioInputs.find(
+                                                (x) =>
+                                                  x.deviceId ===
+                                                  selectedSecondaryInputId
+                                              );
+                                              return d
+                                                ? formatMediaDeviceOptionLabel(
+                                                    d,
+                                                    "input",
+                                                    settings
+                                                      .inputDeviceAliases[
+                                                      d.deviceId
+                                                    ]
+                                                  )
+                                                : "…";
+                                            })()
+                                          : "Linha · off"
+                                      }
+                                      vuLevel={lineVu}
+                                      faderValue={
+                                        settings.secondaryChannelMixGainPercent
+                                      }
+                                      onFaderChange={(v) =>
+                                        setMixerChannelMixGainPercent(2, v)
+                                      }
+                                      faderDisabled={
+                                        !selectedSecondaryInputId ||
+                                        selectedSecondaryInputId ===
+                                          selectedInputId
+                                      }
+                                      busy={busy}
+                                      {...stripDnD}
+                                    />
+                                  );
+                                }
+                                if (stripSlot === "ch3") {
+                                  return (
+                                    <MixerConsoleInputChannel
+                                      key={stripSlot}
+                                      channelId={3}
+                                      activateOn={mixerActivate3}
+                                      onActivateToggle={() => {
+                                        setMixerActivate3((v) => {
+                                          const next = !v;
+                                          if (!next) {
+                                            setMixerMute3(true);
+                                            saveEchoLinkSettingsToStorage({
+                                              mixerChannel3Active: next,
+                                              mixerChannel3Muted: true,
+                                            });
+                                          } else {
+                                            saveEchoLinkSettingsToStorage({
+                                              mixerChannel3Active: next,
+                                            });
+                                          }
+                                          return next;
+                                        });
+                                      }}
+                                      onEdit={() => {
+                                        setMixerSideEditor("media");
+                                        setAudioInDetailScope("media");
+                                        setAudioInChannelTab("media");
+                                        saveEchoLinkSettingsToStorage({
+                                          audioInDetailScope: "media",
+                                          audioInChannelTab: "media",
+                                        });
+                                      }}
+                                      muted={mixerMute3}
+                                      onMuteToggle={() => {
+                                        setMixerMute3((v) => {
+                                          const next = !v;
+                                          saveEchoLinkSettingsToStorage({
+                                            mixerChannel3Muted: next,
+                                          });
+                                          return next;
+                                        });
+                                      }}
+                                      deviceLabel={
+                                        selectedTertiaryInputId &&
+                                        selectedTertiaryInputId !==
+                                          selectedInputId &&
+                                        selectedTertiaryInputId !==
+                                          selectedSecondaryInputId
+                                          ? (() => {
+                                              const d = audioInputs.find(
+                                                (x) =>
+                                                  x.deviceId ===
+                                                  selectedTertiaryInputId
+                                              );
+                                              return d
+                                                ? formatMediaDeviceOptionLabel(
+                                                    d,
+                                                    "input",
+                                                    settings
+                                                      .inputDeviceAliases[
+                                                      d.deviceId
+                                                    ]
+                                                  )
+                                                : "…";
+                                            })()
+                                          : "MÍDIA · off"
+                                      }
+                                      vuLevel={mediaVu}
+                                      faderValue={
+                                        settings.tertiaryChannelMixGainPercent
+                                      }
+                                      onFaderChange={(v) =>
+                                        setMixerChannelMixGainPercent(3, v)
+                                      }
+                                      faderDisabled={
+                                        !selectedTertiaryInputId ||
+                                        selectedTertiaryInputId ===
+                                          selectedInputId ||
+                                        selectedTertiaryInputId ===
+                                          selectedSecondaryInputId
+                                      }
+                                      busy={busy}
+                                      {...stripDnD}
+                                    />
+                                  );
+                                }
+                                return (
+                                  <MixerConsoleOutputChannel
+                                    key={stripSlot}
+                                    activateOn={pipelineMonitorEnabled}
+                                    onActivateToggle={() => {
+                                      setPipelineMonitorEnabled((prev) => {
+                                        const next = !prev;
+                                        setSettings((p) => ({
+                                          ...p,
+                                          pipelineMonitorEnabled: next,
+                                        }));
+                                        saveEchoLinkSettingsToStorage({
+                                          pipelineMonitorEnabled: next,
+                                        });
+                                        return next;
+                                      });
+                                    }}
+                                    onEdit={() => {
+                                      setMixerSideEditor("output");
+                                    }}
+                                    muted={mixerOutputMute}
+                                    onMuteToggle={() => {
+                                      setMixerOutputMute((v) => {
+                                        const next = !v;
+                                        saveEchoLinkSettingsToStorage({
+                                          mixerOutputMuted: next,
+                                        });
+                                        return next;
+                                      });
+                                    }}
+                                    deviceLabel={
+                                      selectedOutputId.trim()
+                                        ? selectedOutputLabel ||
+                                          `${selectedOutputId.slice(0, 14)}…`
+                                        : "Saída · padrão"
+                                    }
+                                    vuLevel={pipelineOutVu}
+                                    faderValue={
+                                      settings.outputChannelMixGainPercent
+                                    }
+                                    onFaderChange={(v) =>
+                                      setMixerChannelMixGainPercent(4, v)
+                                    }
+                                    faderDisabled={!selectedOutputId.trim()}
+                                    busy={busy}
+                                    activateDisabled={busy && !running}
+                                    {...stripDnD}
+                                  />
+                                );
+                              }
+                            )}
+                          </div>
+                        </div>
+                        <div
+                          className="min-h-0 min-w-0 flex-1 bg-black"
+                          aria-hidden
+                        />
+                      </div>
+                      {mixerSideEditor ? (
+                        <div className="absolute inset-0 z-10 flex min-h-0 min-w-0 flex-col bg-zinc-950/98 ring-1 ring-zinc-700/60">
+                          <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-zinc-700/50 bg-zinc-950/90 px-3 py-2 sm:px-4">
+                            <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-zinc-300 sm:text-[11px]">
+                              {mixerSideEditor === "microphone"
+                                ? "Canal 1 · microfone"
+                                : mixerSideEditor === "systemAudio"
+                                  ? "Canal 2 · linha"
+                                  : mixerSideEditor === "media"
+                                    ? "Canal 3 · mídia"
+                                    : "Saída de áudio"}
+                            </p>
+                            <div className="flex flex-wrap items-center justify-end gap-2">
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => void refreshMediaDevices()}
+                                className={btnSecondary}
+                              >
+                                Atualizar
+                              </button>
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => void unlockMediaLabels()}
+                                className={btnSecondary}
+                              >
+                                Nomes
+                              </button>
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => setMixerSideEditor(null)}
+                                className="panel-bezel inline-flex min-h-9 items-center justify-center rounded-md bg-zinc-800 px-3 font-mono text-[10px] font-bold uppercase tracking-wide text-zinc-200 ring-1 ring-zinc-600/50 transition hover:bg-zinc-700 sm:min-h-8 sm:text-[11px]"
+                              >
+                                Fechar
+                              </button>
+                            </div>
+                          </div>
+                          <div className="min-h-0 flex-1 overflow-y-auto">
+                            {mixerSideEditor === "microphone" ? (
+                              <AudioInMicInputDetailPanel
+                                embedded
+                                audioInDetailScope="microphone"
+                                settings={settings}
+                                setSettings={setSettings}
+                                selectedInputId={selectedInputId}
+                                setSelectedInputId={setSelectedInputId}
+                                selectedSecondaryInputId={
+                                  selectedSecondaryInputId
+                                }
+                                selectedTertiaryInputId={selectedTertiaryInputId}
+                                setSelectedSecondaryInputId={
+                                  setSelectedSecondaryInputId
+                                }
+                                setSelectedTertiaryInputId={
+                                  setSelectedTertiaryInputId
+                                }
+                                audioInputs={audioInputs}
+                                busy={busy}
+                                micTesting={micTesting}
+                                outputTesting={outputTesting}
+                                meterSampleRate={meterSampleRate}
+                                selectClass={selectClass}
+                                btnSky={btnSky}
+                                setSettingsField={setSettingsField}
+                                testMicrophone={testMicrophone}
+                                elevenLabsVoiceSelectOptions={
+                                  elevenLabsVoiceSelectOptions
+                                }
+                                elevenLabsVoiceSelectUiValue={
+                                  elevenLabsVoiceSelectUiValue
+                                }
+                                elevenLabsVoicesLoading={
+                                  elevenLabsVoicesLoading
+                                }
+                                voiceTranslationEnabled={
+                                  voiceTranslationEnabled
+                                }
+                                setVoiceTranslationEnabled={
+                                  setVoiceTranslationEnabled
+                                }
+                                voiceTranslationBackendStatus={
+                                  voiceTranslationBackendStatus
+                                }
+                              />
+                            ) : mixerSideEditor === "systemAudio" ? (
+                              <AudioInLineInputDetailPanel
+                                embedded
+                                audioInDetailScope="systemAudio"
+                                settings={settings}
+                                setSettings={setSettings}
+                                selectedInputId={selectedInputId}
+                                selectedSecondaryInputId={
+                                  selectedSecondaryInputId
+                                }
+                                selectedTertiaryInputId={selectedTertiaryInputId}
+                                setSelectedSecondaryInputId={
+                                  setSelectedSecondaryInputId
+                                }
+                                setSelectedTertiaryInputId={
+                                  setSelectedTertiaryInputId
+                                }
+                                audioInputs={audioInputs}
+                                busy={busy}
+                                selectClass={selectClass}
+                                previewVuLevel={lineVu}
+                              />
+                            ) : mixerSideEditor === "media" ? (
+                              <AudioInMediaInputDetailPanel
+                                embedded
+                                audioInDetailScope="media"
+                                settings={settings}
+                                setSettings={setSettings}
+                                selectedInputId={selectedInputId}
+                                selectedSecondaryInputId={
+                                  selectedSecondaryInputId
+                                }
+                                selectedTertiaryInputId={selectedTertiaryInputId}
+                                setSelectedTertiaryInputId={
+                                  setSelectedTertiaryInputId
+                                }
+                                audioInputs={audioInputs}
+                                busy={busy}
+                                selectClass={selectClass}
+                                previewVuLevel={mediaVu}
+                              />
+                            ) : (
+                              audioOutDetailSections
+                            )}
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="divide-y divide-zinc-600/35">
+                    <div className="flex flex-wrap items-center gap-2 border-b border-zinc-600/35 bg-zinc-950/60 px-3 py-2 sm:px-4">
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => {
+                          setAudioInLayoutMode("mixer");
+                          setAudioInDetailScope("both");
+                          setMixerSideEditor(null);
+                          saveEchoLinkSettingsToStorage({
+                            audioInLayoutMode: "mixer",
+                            audioInDetailScope: "both",
+                          });
+                        }}
+                        className="panel-bezel inline-flex min-h-9 items-center justify-center rounded-md bg-zinc-800 px-3 font-mono text-[10px] font-bold uppercase tracking-wide text-zinc-200 ring-1 ring-zinc-600/50 transition hover:bg-zinc-700 sm:min-h-8 sm:text-[11px]"
+                      >
+                        Voltar à mesa
+                      </button>
+                    </div>
+                    <div className="border-b border-zinc-600/35 bg-zinc-900/60 px-3 py-2 sm:px-4">
+                      <p className="text-[10px] font-bold uppercase tracking-[0.22em] text-zinc-200">
+                        Canais de entrada
+                      </p>
+                      {audioInDetailScope === "both" ? (
+                        <p className="mt-0.5 text-[10px] text-zinc-400">
+                          Cada separador é um canal de entrada. O medidor VU, os
+                          tempos de bloco, idioma/tradução e voz ElevenLabs
+                          (nuvem) ficam no canal 1 (microfone). Os canais ativos
+                          (até três entradas) são misturados antes do STT e do
+                          envio ao serviço.
+                        </p>
+                      ) : audioInDetailScope === "microphone" ? (
+                        <p className="mt-0.5 text-[10px] text-zinc-400">
+                          Definições só do microfone (canal 1): dispositivo, nível
+                          na mesa, VU, tempos de captura, idioma/tradução, voz
+                          ElevenLabs (nuvem) e teste do mic.
+                        </p>
+                      ) : audioInDetailScope === "systemAudio" ? (
+                        <p className="mt-0.5 text-[10px] text-zinc-400">
+                          Definições da entrada adicional (canal 2): dispositivo,
+                          medidor em tempo real e nível na mesa. Tempos de bloco
+                          seguem o canal 1.
+                        </p>
+                      ) : (
+                        <p className="mt-0.5 text-[10px] text-zinc-400">
+                          Definições da entrada mídia (canal 3): dispositivo,
+                          medidor em tempo real e nível na mesa. Tempos de bloco
+                          seguem o canal 1.
+                        </p>
+                      )}
+                      <p className="mt-2 text-[9px] leading-snug text-zinc-500">
+                        Os nomes vêm do navegador e podem diferir do sistema. O
+                        sufixo após “·” identifica o dispositivo na Web.
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap gap-2 border-b border-zinc-600/35 bg-zinc-900/40 px-3 py-2 sm:px-4">
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => void refreshMediaDevices()}
+                        className={btnSecondary}
+                      >
+                        Atualizar
+                      </button>
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => void unlockMediaLabels()}
+                        className={btnSecondary}
+                      >
+                        Nomes
+                      </button>
+                    </div>
+                  {audioInDetailScope === "both" ? (
+                    <div
+                      className="border-b border-zinc-600/35 bg-zinc-950/30 px-3 py-2 sm:px-4"
+                      role="tablist"
+                      aria-label="Canais de entrada"
+                    >
+                      <div className="flex flex-wrap gap-1">
+                        <button
+                          type="button"
+                          role="tab"
+                          aria-selected={audioInChannelTab === "microphone"}
+                          id="audio-in-tab-mic"
+                          className={`panel-bezel rounded-md px-3 py-2 text-left text-[10px] font-bold uppercase tracking-[0.12em] transition sm:text-[11px] ${
+                            audioInChannelTab === "microphone"
+                              ? "bg-zinc-800 text-amber-400 ring-1 ring-amber-600/35"
+                              : "text-zinc-500 ring-1 ring-transparent hover:bg-zinc-800/50 hover:text-zinc-300"
+                          }`}
+                          onClick={() => {
+                            setAudioInChannelTab("microphone");
+                            saveEchoLinkSettingsToStorage({
+                              audioInChannelTab: "microphone",
+                            });
+                          }}
+                        >
+                          Canal 1 · microfone
+                        </button>
+                        <button
+                          type="button"
+                          role="tab"
+                          aria-selected={audioInChannelTab === "systemAudio"}
+                          id="audio-in-tab-audio"
+                          className={`panel-bezel rounded-md px-3 py-2 text-left text-[10px] font-bold uppercase tracking-[0.12em] transition sm:text-[11px] ${
+                            audioInChannelTab === "systemAudio"
+                              ? "bg-zinc-800 text-amber-400 ring-1 ring-amber-600/35"
+                              : "text-zinc-500 ring-1 ring-transparent hover:bg-zinc-800/50 hover:text-zinc-300"
+                          }`}
+                          onClick={() => {
+                            setAudioInChannelTab("systemAudio");
+                            saveEchoLinkSettingsToStorage({
+                              audioInChannelTab: "systemAudio",
+                            });
+                          }}
+                        >
+                          Canal 2 · áudio
+                        </button>
+                        <button
+                          type="button"
+                          role="tab"
+                          aria-selected={audioInChannelTab === "media"}
+                          id="audio-in-tab-media"
+                          className={`panel-bezel rounded-md px-3 py-2 text-left text-[10px] font-bold uppercase tracking-[0.12em] transition sm:text-[11px] ${
+                            audioInChannelTab === "media"
+                              ? "bg-zinc-800 text-amber-400 ring-1 ring-amber-600/35"
+                              : "text-zinc-500 ring-1 ring-transparent hover:bg-zinc-800/50 hover:text-zinc-300"
+                          }`}
+                          onClick={() => {
+                            setAudioInChannelTab("media");
+                            saveEchoLinkSettingsToStorage({
+                              audioInChannelTab: "media",
+                            });
+                          }}
+                        >
+                          Canal 3 · mídia
+                        </button>
+                      </div>
+                    </div>
+                  ) : null}
+                  <div className="grid grid-cols-1 gap-0 divide-y divide-zinc-600/35">
+                    {audioInActivePanel === "microphone" ? (
+                      <AudioInMicInputDetailPanel
+                        embedded={false}
+                        audioInDetailScope={audioInDetailScope}
+                        settings={settings}
+                        setSettings={setSettings}
+                        selectedInputId={selectedInputId}
+                        setSelectedInputId={setSelectedInputId}
+                        selectedSecondaryInputId={selectedSecondaryInputId}
+                        selectedTertiaryInputId={selectedTertiaryInputId}
+                        setSelectedSecondaryInputId={setSelectedSecondaryInputId}
+                        setSelectedTertiaryInputId={setSelectedTertiaryInputId}
+                        audioInputs={audioInputs}
+                        busy={busy}
+                        micTesting={micTesting}
+                        outputTesting={outputTesting}
+                        meterSampleRate={meterSampleRate}
+                        selectClass={selectClass}
+                        btnSky={btnSky}
+                        setSettingsField={setSettingsField}
+                        testMicrophone={testMicrophone}
+                        elevenLabsVoiceSelectOptions={
+                          elevenLabsVoiceSelectOptions
+                        }
+                        elevenLabsVoiceSelectUiValue={
+                          elevenLabsVoiceSelectUiValue
+                        }
+                        elevenLabsVoicesLoading={elevenLabsVoicesLoading}
+                        voiceTranslationEnabled={voiceTranslationEnabled}
+                        setVoiceTranslationEnabled={
+                          setVoiceTranslationEnabled
+                        }
+                        voiceTranslationBackendStatus={
+                          voiceTranslationBackendStatus
+                        }
+                      />
+                    ) : audioInActivePanel === "systemAudio" ? (
+                      <AudioInLineInputDetailPanel
+                        embedded={false}
+                        audioInDetailScope={audioInDetailScope}
+                        settings={settings}
+                        setSettings={setSettings}
+                        selectedInputId={selectedInputId}
+                        selectedSecondaryInputId={selectedSecondaryInputId}
+                        selectedTertiaryInputId={selectedTertiaryInputId}
+                        setSelectedSecondaryInputId={setSelectedSecondaryInputId}
+                        setSelectedTertiaryInputId={setSelectedTertiaryInputId}
+                        audioInputs={audioInputs}
+                        busy={busy}
+                        selectClass={selectClass}
+                        previewVuLevel={lineVu}
+                      />
+                    ) : (
+                      <AudioInMediaInputDetailPanel
+                        embedded={false}
+                        audioInDetailScope={audioInDetailScope}
+                        settings={settings}
+                        setSettings={setSettings}
+                        selectedInputId={selectedInputId}
+                        selectedSecondaryInputId={selectedSecondaryInputId}
+                        selectedTertiaryInputId={selectedTertiaryInputId}
+                        setSelectedTertiaryInputId={setSelectedTertiaryInputId}
+                        audioInputs={audioInputs}
+                        busy={busy}
+                        selectClass={selectClass}
+                        previewVuLevel={mediaVu}
+                      />
+                    )}
+                  </div>
                 </div>
+                )
               ) : sidebarSection === "monitor" ? (
                 <div className="flex min-h-0 flex-col px-3 py-3 sm:px-4 sm:py-4">
                   <div className="mb-4 flex shrink-0 flex-wrap items-start justify-between gap-3 border-b border-zinc-600/35 pb-3">
@@ -3305,8 +4336,8 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                         Monitoramento
                       </p>
                       <p className="mt-1 text-[10px] leading-snug text-zinc-400">
-                        Etapas · medidores · chat · ajustes finos nos menus Entrada
-                        e Saída
+                        Etapas · medidores · chat · ajustes finos em Controles
+                        (mesa e configurações da faixa Saída)
                         {settings.speechLanguagesEnabled &&
                         settings.speechReceiveLanguage !==
                           settings.speechTransformLanguage ? (
@@ -3470,7 +4501,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
 
                           <section className="flex min-h-0 flex-col p-3">
                             <p className="mb-2 flex min-h-[2.5rem] items-end text-[9px] font-bold uppercase leading-snug tracking-[0.24em] text-zinc-400 sm:text-[10px]">
-                              Saída de áudio
+                              Saída (pipeline)
                             </p>
                             <div className="mb-2 flex min-h-[1.25rem] items-center justify-between gap-2 text-[10px] text-zinc-400 sm:text-[11px]">
                               <span className="shrink-0">USB / WS</span>
@@ -3493,7 +4524,8 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                               />
                             </div>
                             <p className="mt-2 text-[9px] leading-snug text-zinc-600">
-                              Monitor local e ganho: menu Saída de áudio.
+                              Monitor local e ganho: Controles · engrenagem na
+                              faixa Saída.
                             </p>
                           </section>
                         </div>
@@ -3522,8 +4554,8 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                             Áudio · pipeline no navegador
                           </p>
                           <p className="mt-1 text-[9px] leading-snug text-zinc-500">
-                            Níveis pré/pós pipeline. Monitor e ganho em Saída de
-                            áudio. Injeção opcional via{" "}
+                            Níveis pré/pós pipeline. Monitor e ganho em Controles
+                            (faixa Saída). Injeção opcional via{" "}
                             <span className="font-mono text-zinc-500">
                               audioPipelineInject
                             </span>
@@ -3621,7 +4653,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                             <div className="space-y-2 text-zinc-400">
                               <p className="break-words font-mono text-[11px] leading-snug text-amber-200/90">
                                 {serviceSttBootstrapError ??
-                                  "STT não iniciou no echoLinkService (127.0.0.1:8765)."}
+                                  `STT não iniciou no echoLinkService (${echoLinkServiceOriginForDisplay()}).`}
                               </p>
                               <p className="text-[11px] leading-relaxed text-zinc-500">
                                 {hintForServiceSttFailure(
@@ -4259,13 +5291,17 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                         WebSocket · áudio (pipeline)
                       </dt>
                       <dd>
-                        <code className="break-all text-emerald-300/95">{WS_URL}</code>
+                        <code className="break-all text-emerald-300/95">
+                          {getEchoLinkMicWebSocketUrl()}
+                        </code>
                       </dd>
                       <dt className="mb-1 mt-2 text-[9px] font-bold uppercase tracking-[0.18em] text-zinc-500">
                         WebSocket · STT (PCM 16 kHz)
                       </dt>
                       <dd>
-                        <code className="break-all text-emerald-300/95">{STT_WS_URL}</code>
+                        <code className="break-all text-emerald-300/95">
+                          {getEchoLinkSttWebSocketUrl()}
+                        </code>
                       </dd>
                     </div>
                     <div className="rounded-md border border-zinc-700/50 bg-zinc-950/40 px-3 py-2.5">
