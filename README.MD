@@ -10,18 +10,19 @@ Middleware de áudio com **tradução de voz em tempo real** (PT ↔ EN). O prod
 
 ## Pontos importantes
 
-| Tema | Diretriz |
-|------|-----------|
-| Modos | **dev** (local + mock USB) vs **hardware** (RPI + ALSA/PipeWire + Gadget) |
+| Tema               | Diretriz                                                                                    |
+| ------------------ | ------------------------------------------------------------------------------------------- |
+| Modos              | **dev** (local + mock USB) vs **hardware** (RPI + ALSA/PipeWire + Gadget)                   |
 | Abstração de áudio | Entrada/saída via interfaces (`read_chunk` / `write_chunk`), não chamadas diretas ao driver |
-| Abstração de USB | Mock em dev; Gadget real em produção no RPi |
-| Config | `MODE`, drivers de áudio/USB e provedores STT/TTS via ambiente (ver `mds/resume.md`) |
-| Anti-patterns | Não misturar pipeline com ALSA; não depender de Gadget no core |
+| Abstração de USB   | Mock em dev; Gadget real em produção no RPi                                                 |
+| Config             | `MODE`, drivers de áudio/USB e provedores STT/TTS via ambiente (ver `mds/resume.md`)        |
+| Anti-patterns      | Não misturar pipeline com ALSA; não depender de Gadget no core                              |
 
 ## Estrutura do repositório
 
 - `applications/echoLinkService` — serviço Python (API local, pipeline em evolução).
 - `applications/echolinkApp` — interface Next.js + Electron.
+- `applications/echoLinkVirtualAudio` — driver de áudio virtual macOS (fork BlackHole, GPL-3.0); ver `README.pt-BR.md` na pasta.
 - `mds/` — documentação detalhada (visão de arquitetura, roadmap, convenções).
 
 ## Instalação e execução no macOS (pyenv + nvm)
@@ -104,14 +105,16 @@ A UI fica em **http://127.0.0.1:3000** e espera o serviço Python na porta **876
 
 ### Dois terminais (recomendado)
 
-| Terminal | Pasta | Comando |
-|----------|--------|---------|
-| 1 | `applications/echoLinkService` | `source .venv/bin/activate` → `python main.py` (ou `./configure.sh`) |
-| 2 | `applications/echolinkApp` | `nvm use` → `npm run dev` |
+| Terminal | Pasta                          | Comando                                                              |
+| -------- | ------------------------------ | -------------------------------------------------------------------- |
+| 1        | `applications/echoLinkService` | `source .venv/bin/activate` → `python main.py` (ou `./configure.sh`) |
+| 2        | `applications/echolinkApp`     | `nvm use` → `npm run dev`                                            |
 
 ### Desenvolvimento no Mac (sem Raspberry Pi)
 
 Quem desenvolve **não precisa de Raspberry Pi** para executar e testar: o Mac usa microfone e saída de áudio normais; o **USB gadget** do produto final só entra no modo **hardware** no Pi (ver `mds/resume.md`).
+
+**Entrada e saída virtuais no Mac:** use o driver **`applications/echoLinkVirtualAudio`** (EchoLink Virtual Audio) ou o **BlackHole** oficial. Detalhes: `mds/devVirtualAudioMac.md`.
 
 1. **Serviço Python** — terminal na pasta `applications/echoLinkService` (como acima ou `./configure.sh`).
 2. **UI** — terminal na pasta `applications/echolinkApp`, `npm run dev`, abrir **http://127.0.0.1:3000** e autorizar o microfone no browser.

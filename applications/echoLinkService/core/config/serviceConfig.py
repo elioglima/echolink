@@ -49,12 +49,15 @@ class EchoLinkConfigModel(BaseModel):
     transcriptionStartDelayMs: int = Field(default=2100, ge=0, le=15000)
     phraseSilenceCutMs: int = Field(default=1200, ge=0, le=15000)
     inputSensitivity: int = Field(default=2959, ge=10, le=5000)
+    primaryChannelMixGainPercent: int = Field(default=100, ge=0, le=150)
+    secondaryChannelMixGainPercent: int = Field(default=100, ge=0, le=150)
     inputDeviceAliases: dict[str, str] = Field(default_factory=dict)
     outputDeviceAliases: dict[str, str] = Field(default_factory=dict)
     speechReceiveLanguage: str = "pt-BR"
     speechTransformLanguage: str = "en-US"
     speechLanguagesEnabled: bool = True
     selectedInputDeviceId: str = Field(default="", max_length=512)
+    selectedSecondaryInputDeviceId: str = Field(default="", max_length=512)
     selectedOutputDeviceId: str = Field(default="", max_length=512)
     selectedElevenLabsVoiceId: str = Field(
         default="bIHbv24MWmeRgasZH58o", max_length=96
@@ -86,12 +89,21 @@ class EchoLinkConfigPatch(BaseModel):
     transcriptionStartDelayMs: int | None = Field(default=None, ge=0, le=15000)
     phraseSilenceCutMs: int | None = Field(default=None, ge=0, le=15000)
     inputSensitivity: int | None = Field(default=None, ge=10, le=5000)
+    primaryChannelMixGainPercent: int | None = Field(
+        default=None, ge=0, le=150
+    )
+    secondaryChannelMixGainPercent: int | None = Field(
+        default=None, ge=0, le=150
+    )
     inputDeviceAliases: dict[str, str] | None = None
     outputDeviceAliases: dict[str, str] | None = None
     speechReceiveLanguage: str | None = None
     speechTransformLanguage: str | None = None
     speechLanguagesEnabled: bool | None = None
     selectedInputDeviceId: str | None = Field(default=None, max_length=512)
+    selectedSecondaryInputDeviceId: str | None = Field(
+        default=None, max_length=512
+    )
     selectedOutputDeviceId: str | None = Field(default=None, max_length=512)
     selectedElevenLabsVoiceId: str | None = Field(default=None, max_length=96)
     voiceTranslationEnabled: bool | None = None

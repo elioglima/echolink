@@ -9,6 +9,8 @@ from amazon_transcribe.client import TranscribeStreamingClient
 from amazon_transcribe.handlers import TranscriptResultStreamHandler
 from amazon_transcribe.model import TranscriptEvent
 
+from core.stt.sttTranscriptQuality import stt_final_text_passes_quality_gate
+
 if TYPE_CHECKING:
     from fastapi import WebSocket
 
@@ -73,6 +75,10 @@ async def run_transcribe_streaming_ws(websocket: WebSocket) -> None:
                     continue
                 text = (alts[0].transcript or "").strip()
                 if not text:
+                    continue
+                if not result.is_partial and not stt_final_text_passes_quality_gate(
+                    text
+                ):
                     continue
                 payload: dict[str, str | bool] = {
                     "type": "partial" if result.is_partial else "final",

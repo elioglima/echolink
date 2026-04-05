@@ -1,0 +1,144 @@
+{
+  "kind": "elevenlabsPremadeVoices",
+  "localeNote": "gender: male|female → UI sigla H (homem) / F (feminino). voiceId is the API voice_id.",
+  "voices": [
+    {
+      "voiceId": "pNInz6ObpgDQGcFmaJgB",
+      "name": "Adam",
+      "description": "Dominant, Firm",
+      "gender": "male"
+    },
+    {
+      "voiceId": "Xb7hH8MSUJPsbSDYkOk2",
+      "name": "Alice",
+      "description": "Clear, Engaging Educator",
+      "gender": "female"
+    },
+    {
+      "voiceId": "weA4Q36twV5kwSaTEL0Q",
+      "name": "Ava",
+      "description": "Female Robot or AI Assistant",
+      "gender": "female"
+    },
+    {
+      "voiceId": "hpp4J3VqNfWAUOO0d1Us",
+      "name": "Bella",
+      "description": "Professional, Bright, Warm",
+      "gender": "female"
+    },
+    {
+      "voiceId": "pqHfZKP75CvOIqlyiNhV4",
+      "name": "Bill",
+      "description": "Wise, Mature, Balanced",
+      "gender": "male"
+    },
+    {
+      "voiceId": "nPczCjzI2devNBz1zQrb",
+      "name": "Brian",
+      "description": "Deep, Resonant and Comforting",
+      "gender": "male"
+    },
+    {
+      "voiceId": "N2lVS1w4EtoT3dr4eOWO",
+      "name": "Callum",
+      "description": "Husky Trickster",
+      "gender": "male"
+    },
+    {
+      "voiceId": "IKne3meq5aSn9XLyUdCD",
+      "name": "Charlie",
+      "description": "Deep, Confident, Energetic",
+      "gender": "male"
+    },
+    {
+      "voiceId": "iP95p4xoKVk53GoZ742B",
+      "name": "Chris",
+      "description": "Charming, Down-to-Earth",
+      "gender": "male"
+    },
+    {
+      "voiceId": "onwK4e9ZLuTAKQWW03F9",
+      "name": "Daniel",
+      "description": "Steady Broadcaster",
+      "gender": "male"
+    },
+    {
+      "voiceId": "cjVigY5qzO86Huf0OWal",
+      "name": "Eric",
+      "description": "Smooth, Trustworthy",
+      "gender": "male"
+    },
+    {
+      "voiceId": "JBFqnCBsd6RMkjVDRZzb",
+      "name": "George",
+      "description": "Warm, Captivating Storyteller",
+      "gender": "male"
+    },
+    {
+      "voiceId": "SOYHLrjzK2X1ezoPC6cr",
+      "name": "Harry",
+      "description": "Fierce Warrior",
+      "gender": "male"
+    },
+    {
+      "voiceId": "cgSgspJ2msm6clMCkdW9",
+      "name": "Jessica",
+      "description": "Playful, Bright, Warm",
+      "gender": "female"
+    },
+    {
+      "voiceId": "FGY2WhTYpPnrIDTdsKH5",
+      "name": "Laura",
+      "description": "Enthusiast, Quirky Attitude",
+      "gender": "female"
+    },
+    {
+      "voiceId": "TX3LPaxmHkxFdv7VOQHJ",
+      "name": "Liam",
+      "description": "Energetic, Social Media Creator",
+      "gender": "male"
+    },
+    {
+      "voiceId": "pfZP5JQG7IQiQuC4Bku",
+      "name": "Lily",
+      "description": "Velvety Actress",
+      "gender": "female"
+    },
+    {
+      "voiceId": "XrExE9yKlg1WjnnlVkGX",
+      "name": "Matilda",
+      "description": "Knowledgable, Professional",
+      "gender": "female"
+    },
+    {
+      "voiceId": "SAz9YHcvj6GT2YYXdXww",
+      "name": "River",
+      "description": "Relaxed, Neutral, Informative",
+      "gender": "female"
+    },
+    {
+      "voiceId": "CwhRBWXzGAHq8TQ4Fs17",
+      "name": "Roger",
+      "description": "Laid-Back, Casual, Resonant",
+      "gender": "male"
+    },
+    {
+      "voiceId": "EXAVITQu4vr4xnSDxMaL",
+      "name": "Sarah",
+      "description": "Mature, Reassuring, Confident",
+      "gender": "female"
+    },
+    {
+      "voiceId": "bIHbv24MWmeRgasZH58o",
+      "name": "Will",
+      "description": "Relaxed Optimist",
+      "gender": "male"
+    },
+    {
+      "voiceId": "6OzrBCQf8cjERkYgzSg8",
+      "name": "Young Jamal",
+      "description": "",
+      "gender": "male"
+    }
+  ]
+}

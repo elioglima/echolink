@@ -18,11 +18,13 @@ CONFIG_INPUT_AUDIO_PATH = CONFIGS_CACHE / "inputAudio.json"
 CONFIG_OUTPUT_AUDIO_PATH = CONFIGS_CACHE / "outputAudio.json"
 CONFIG_PARAMETERS_PATH = CONFIGS_CACHE / "parameters.json"
 CONFIG_SETTINGS_PATH = CONFIGS_CACHE / "settings.json"
+CHATS_CACHE = CACHE_ROOT / "chats"
 
 
 def ensure_cache_dirs() -> None:
     VOCABULARY_VOICES_DIR.mkdir(parents=True, exist_ok=True)
     CONFIGS_CACHE.mkdir(parents=True, exist_ok=True)
+    CHATS_CACHE.mkdir(parents=True, exist_ok=True)
 
 
 def _read_json_file(path: Path) -> dict[str, Any] | None:
@@ -179,6 +181,16 @@ def write_vocabulary_voice_entries(hash_id: str, entries: list[dict[str, Any]]) 
     )
 
 
+def read_selected_eleven_labs_voice_id_from_output_audio() -> str:
+    data = _read_json_file(CONFIG_OUTPUT_AUDIO_PATH)
+    if not data:
+        return ""
+    raw = data.get("selectedElevenLabsVoiceId")
+    if not isinstance(raw, str):
+        return ""
+    return raw.strip()[:96]
+
+
 def read_echo_link_config_slices() -> dict[str, Any]:
     ensure_cache_dirs()
     merged: dict[str, Any] = {}
@@ -199,11 +211,14 @@ def write_echo_link_config_slices(state: dict[str, Any]) -> None:
         k: state[k]
         for k in (
             "selectedInputDeviceId",
+            "selectedSecondaryInputDeviceId",
             "inputDeviceAliases",
             "audioChunkMs",
             "transcriptionStartDelayMs",
             "phraseSilenceCutMs",
             "inputSensitivity",
+            "primaryChannelMixGainPercent",
+            "secondaryChannelMixGainPercent",
         )
         if k in state
     }

@@ -10,7 +10,9 @@ export type TimingKey = keyof typeof TIMING_KEYS;
 
 export type EchoLinkSettingsKey =
   | TimingKey
-  | "inputSensitivity";
+  | "inputSensitivity"
+  | "primaryChannelMixGainPercent"
+  | "secondaryChannelMixGainPercent";
 
 export type EchoLinkSettings = {
   audioChunkMs: number;
@@ -23,11 +25,14 @@ export type EchoLinkSettings = {
   speechTransformLanguage: string;
   speechLanguagesEnabled: boolean;
   selectedInputDeviceId: string;
+  selectedSecondaryInputDeviceId: string;
   selectedOutputDeviceId: string;
   selectedElevenLabsVoiceId: string;
   voiceTranslationEnabled: boolean;
   pipelineMonitorEnabled: boolean;
   pipelineMonitorGainPercent: number;
+  primaryChannelMixGainPercent: number;
+  secondaryChannelMixGainPercent: number;
 };
 
 export const ECHO_LINK_STORAGE_KEY = "echoLink.settings.v1";
@@ -46,11 +51,14 @@ export const ECHO_LINK_SETTINGS_PLACEHOLDER: EchoLinkSettings = {
   speechTransformLanguage: "pt-BR",
   speechLanguagesEnabled: false,
   selectedInputDeviceId: "",
+  selectedSecondaryInputDeviceId: "",
   selectedOutputDeviceId: "",
   selectedElevenLabsVoiceId: "",
   voiceTranslationEnabled: false,
   pipelineMonitorEnabled: false,
-  pipelineMonitorGainPercent: 1,
+  pipelineMonitorGainPercent: 25,
+  primaryChannelMixGainPercent: 100,
+  secondaryChannelMixGainPercent: 100,
 };
 
 function sanitizeDeviceId(raw: unknown): string {
@@ -81,6 +89,8 @@ const RANGES: Record<EchoLinkSettingsKey, [number, number]> = {
   transcriptionStartDelayMs: [0, 15000],
   phraseSilenceCutMs: [0, 15000],
   inputSensitivity: [10, 5000],
+  primaryChannelMixGainPercent: [0, 150],
+  secondaryChannelMixGainPercent: [0, 150],
 };
 
 export function clampEchoLinkSetting(
@@ -150,6 +160,7 @@ function mergeEchoLinkSettingsPayload(
       }
       if (
         key === "selectedInputDeviceId" ||
+        key === "selectedSecondaryInputDeviceId" ||
         key === "selectedOutputDeviceId"
       ) {
         out[key] = sanitizeDeviceId(v);
@@ -169,6 +180,15 @@ function mergeEchoLinkSettingsPayload(
       if (key === "pipelineMonitorGainPercent") {
         if (typeof v === "number" && Number.isFinite(v)) {
           out[key] = Math.min(100, Math.max(1, Math.round(v)));
+        }
+        return;
+      }
+      if (
+        key === "primaryChannelMixGainPercent" ||
+        key === "secondaryChannelMixGainPercent"
+      ) {
+        if (typeof v === "number" && Number.isFinite(v)) {
+          out[key] = clampEchoLinkSetting(key, Math.round(v));
         }
         return;
       }
@@ -286,7 +306,11 @@ export function saveEchoLinkSettingsToStorage(
       }
       return;
     }
-    if (key === "selectedInputDeviceId" || key === "selectedOutputDeviceId") {
+    if (
+      key === "selectedInputDeviceId" ||
+      key === "selectedSecondaryInputDeviceId" ||
+      key === "selectedOutputDeviceId"
+    ) {
       if (typeof v === "string") {
         next[key] = sanitizeDeviceId(v);
       }
@@ -307,6 +331,15 @@ export function saveEchoLinkSettingsToStorage(
     if (key === "pipelineMonitorGainPercent") {
       if (typeof v === "number" && Number.isFinite(v)) {
         next[key] = Math.min(100, Math.max(1, Math.round(v)));
+      }
+      return;
+    }
+    if (
+      key === "primaryChannelMixGainPercent" ||
+      key === "secondaryChannelMixGainPercent"
+    ) {
+      if (typeof v === "number" && Number.isFinite(v)) {
+        next[key] = clampEchoLinkSetting(key, Math.round(v));
       }
       return;
     }
