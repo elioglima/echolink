@@ -10,13 +10,13 @@ Middleware de áudio com **tradução de voz em tempo real** (PT ↔ EN). O prod
 
 ## Pontos importantes
 
-| Tema | Diretriz |
-|------|-----------|
-| Modos | **dev** (local + mock USB) vs **hardware** (RPI + ALSA/PipeWire + Gadget) |
+| Tema               | Diretriz                                                                                    |
+| ------------------ | ------------------------------------------------------------------------------------------- |
+| Modos              | **dev** (local + mock USB) vs **hardware** (RPI + ALSA/PipeWire + Gadget)                   |
 | Abstração de áudio | Entrada/saída via interfaces (`read_chunk` / `write_chunk`), não chamadas diretas ao driver |
-| Abstração de USB | Mock em dev; Gadget real em produção no RPi |
-| Config | `MODE`, drivers de áudio/USB e provedores STT/TTS via ambiente (ver `mds/resume.md`) |
-| Anti-patterns | Não misturar pipeline com ALSA; não depender de Gadget no core |
+| Abstração de USB   | Mock em dev; Gadget real em produção no RPi                                                 |
+| Config             | `MODE`, drivers de áudio/USB e provedores STT/TTS via ambiente (ver `mds/resume.md`)        |
+| Anti-patterns      | Não misturar pipeline com ALSA; não depender de Gadget no core                              |
 
 ## Estrutura do repositório
 
@@ -105,10 +105,10 @@ A UI fica em **http://127.0.0.1:3000** e espera o serviço Python na porta **876
 
 ### Dois terminais (recomendado)
 
-| Terminal | Pasta | Comando |
-|----------|--------|---------|
-| 1 | `applications/echoLinkService` | `source .venv/bin/activate` → `python main.py` (ou `./configure.sh`) |
-| 2 | `applications/echolinkApp` | `nvm use` → `npm run dev` |
+| Terminal | Pasta                          | Comando                                                              |
+| -------- | ------------------------------ | -------------------------------------------------------------------- |
+| 1        | `applications/echoLinkService` | `source .venv/bin/activate` → `python main.py` (ou `./configure.sh`) |
+| 2        | `applications/echolinkApp`     | `nvm use` → `npm run dev`                                            |
 
 ### Desenvolvimento no Mac (sem Raspberry Pi)
 
