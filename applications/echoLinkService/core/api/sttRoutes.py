@@ -5,6 +5,7 @@ from typing import Any
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from core.files.runtimeState import ws_stt_enter, ws_stt_leave
+from core.stt.sttTranscriptQuality import stt_final_text_passes_quality_gate
 
 
 def _stt_engine() -> str:
@@ -125,7 +126,11 @@ async def _run_vosk_stt_stream(websocket: WebSocket) -> None:
             if rec.AcceptWaveform(data):
                 res = json.loads(rec.Result())
                 text = (res.get("text") or "").strip()
-                if text and _stt_final_is_reliable(res):
+                if (
+                    text
+                    and _stt_final_is_reliable(res)
+                    and stt_final_text_passes_quality_gate(text)
+                ):
                     await websocket.send_json({"type": "final", "text": text})
             else:
                 partial = json.loads(rec.PartialResult())
@@ -138,7 +143,11 @@ async def _run_vosk_stt_stream(websocket: WebSocket) -> None:
         try:
             final = json.loads(rec.FinalResult())
             text = (final.get("text") or "").strip()
-            if text and _stt_final_is_reliable(final):
+            if (
+                text
+                and _stt_final_is_reliable(final)
+                and stt_final_text_passes_quality_gate(text)
+            ):
                 await websocket.send_json({"type": "final", "text": text})
         except Exception:
             pass

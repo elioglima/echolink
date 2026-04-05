@@ -22,6 +22,7 @@ Middleware de áudio com **tradução de voz em tempo real** (PT ↔ EN). O prod
 
 - `applications/echoLinkService` — serviço Python (API local, pipeline em evolução).
 - `applications/echolinkApp` — interface Next.js + Electron.
+- `applications/echoLinkVirtualAudio` — driver de áudio virtual macOS (fork BlackHole, GPL-3.0); ver `README.pt-BR.md` na pasta.
 - `mds/` — documentação detalhada (visão de arquitetura, roadmap, convenções).
 
 ## Instalação e execução no macOS (pyenv + nvm)
@@ -112,6 +113,8 @@ A UI fica em **http://127.0.0.1:3000** e espera o serviço Python na porta **876
 ### Desenvolvimento no Mac (sem Raspberry Pi)
 
 Quem desenvolve **não precisa de Raspberry Pi** para executar e testar: o Mac usa microfone e saída de áudio normais; o **USB gadget** do produto final só entra no modo **hardware** no Pi (ver `mds/resume.md`).
+
+**Entrada e saída virtuais no Mac:** use o driver **`applications/echoLinkVirtualAudio`** (EchoLink Virtual Audio) ou o **BlackHole** oficial. Detalhes: `mds/devVirtualAudioMac.md`.
 
 1. **Serviço Python** — terminal na pasta `applications/echoLinkService` (como acima ou `./configure.sh`).
 2. **UI** — terminal na pasta `applications/echolinkApp`, `npm run dev`, abrir **http://127.0.0.1:3000** e autorizar o microfone no browser.

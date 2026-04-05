@@ -12,6 +12,7 @@ from core.api.micRoutes import router as mic_router
 from core.api.sttRoutes import router as stt_router
 from core.api.vocabularyCacheRoutes import router as vocabulary_cache_router
 from core.api.voiceTranslationRoutes import router as voice_translation_router
+from core.api.chatRoutes import router as chat_router
 from core.files.localFileCache import ensure_cache_dirs
 from core.files.runtimeState import mark_server_started, mark_server_stopped, service_bind_from_env
 
@@ -55,6 +56,7 @@ app.include_router(mic_router)
 app.include_router(stt_router)
 app.include_router(vocabulary_cache_router)
 app.include_router(voice_translation_router)
+app.include_router(chat_router)
 
 
 @app.get("/health")
@@ -76,6 +78,8 @@ def capture_info() -> dict[str, str]:
         "fileCacheConfigs": "files/cache/configs",
         "fileCacheVocabulary": "files/cache/vocabulary",
         "fileCacheRuntime": "files/cache/runtime",
+        "fileCacheChats": "files/cache/chats",
+        "chatsSessionsPath": "/chats/sessions",
         "runtimeStatePath": "files/cache/runtime/state.json",
         "runtimePath": "/runtime",
         "runtimeCapturePath": "/runtime/capture",

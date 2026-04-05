@@ -41,7 +41,11 @@ export async function fetchVoiceTranslationStatus(): Promise<VoiceTranslationSta
   return (await res.json()) as VoiceTranslationStatus;
 }
 
-export type ElevenLabsVoiceOption = { voice_id: string; name: string };
+export type ElevenLabsVoiceOption = {
+  voice_id: string;
+  name: string;
+  genderSigla?: string;
+};
 
 export async function fetchElevenLabsVoiceDisplay(): Promise<ElevenLabsVoiceDisplayBundle> {
   try {
@@ -65,7 +69,11 @@ export async function fetchElevenLabsVoiceDisplay(): Promise<ElevenLabsVoiceDisp
         }
       }
     }
-    const fallbackVoiceOptions: { value: string; label: string }[] = [];
+    const fallbackVoiceOptions: {
+      value: string;
+      label: string;
+      genderSigla?: string;
+    }[] = [];
     const rawFb = rec.fallbackVoiceOptions;
     if (Array.isArray(rawFb)) {
       for (const item of rawFb) {
@@ -76,11 +84,32 @@ export async function fetchElevenLabsVoiceDisplay(): Promise<ElevenLabsVoiceDisp
         const value = typeof o.value === "string" ? o.value.trim() : "";
         const label = typeof o.label === "string" ? o.label.trim() : "";
         if (value && label) {
-          fallbackVoiceOptions.push({ value, label });
+          const row: {
+            value: string;
+            label: string;
+            genderSigla?: string;
+          } = { value, label };
+          const gs = o.genderSigla ?? o.gender_sigla;
+          if (typeof gs === "string" && (gs === "H" || gs === "F")) {
+            row.genderSigla = gs;
+          }
+          fallbackVoiceOptions.push(row);
         }
       }
     }
-    return { voiceLabels, fallbackVoiceOptions };
+    const voiceGenderSiglaById: Record<string, "H" | "F"> = {};
+    const rawG = rec.voiceGenderSiglaById ?? rec.voice_gender_sigla_by_id;
+    if (rawG !== null && typeof rawG === "object" && !Array.isArray(rawG)) {
+      for (const [k, v] of Object.entries(rawG)) {
+        const ks = typeof k === "string" ? k.trim().toLowerCase() : "";
+        if (v === "H" || v === "F") {
+          if (ks) {
+            voiceGenderSiglaById[ks] = v;
+          }
+        }
+      }
+    }
+    return { voiceLabels, fallbackVoiceOptions, voiceGenderSiglaById };
   } catch {
     return EMPTY_ELEVEN_LABS_VOICE_DISPLAY;
   }
@@ -112,7 +141,12 @@ export async function fetchElevenLabsVoices(): Promise<ElevenLabsVoiceOption[]> 
       typeof rec.name === "string" && rec.name.trim()
         ? rec.name.trim()
         : voice_id;
-    out.push({ voice_id, name });
+    const gs = rec.genderSigla ?? rec.gender_sigla;
+    if (typeof gs === "string" && (gs === "H" || gs === "F")) {
+      out.push({ voice_id, name, genderSigla: gs });
+    } else {
+      out.push({ voice_id, name });
+    }
   }
   return out;
 }

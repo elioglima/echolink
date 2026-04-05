@@ -104,3 +104,117 @@ body {
   opacity: 0.45;
 }
 
+.echo-range-vertical {
+  width: 9rem;
+  min-width: 9rem;
+  height: 2.75rem;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.echo-mixer-fader-slot {
+  container-type: size;
+}
+
+.echo-mixer-fader-input.echo-console-fader {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  z-index: 10;
+  transform: translate(-50%, -50%) rotate(-90deg);
+  width: 13.5rem;
+  min-width: 13.5rem;
+  height: 5.75rem;
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+
+@media (min-width: 640px) {
+  .echo-mixer-fader-input.echo-console-fader {
+    width: 15rem;
+    min-width: 15rem;
+  }
+}
+
+@supports (width: 1cqh) {
+  .echo-mixer-fader-input.echo-console-fader {
+    width: 100cqh;
+    min-width: 100cqh;
+    height: min(6rem, 92cqw);
+    max-height: min(6rem, 92cqw);
+  }
+}
+
+.echo-console-fader {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 8.5rem;
+  min-width: 8.5rem;
+  height: 2rem;
+  background: transparent;
+  cursor: pointer;
+}
+
+.echo-console-fader::-webkit-slider-runnable-track {
+  height: 14px;
+  border-radius: 7px;
+  background: linear-gradient(
+    90deg,
+    #0a0a0b 0%,
+    #27272a 40%,
+    #3f3f46 50%,
+    #27272a 60%,
+    #0a0a0b 100%
+  );
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.9);
+}
+
+.echo-console-fader::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 46px;
+  height: 30px;
+  margin-top: -8px;
+  border-radius: 9999px;
+  border: 1px solid #3f3f46;
+  background: linear-gradient(180deg, #e4e4e7 0%, #71717a 45%, #52525b 100%);
+  box-shadow:
+    0 2px 6px rgba(0, 0, 0, 0.65),
+    inset 0 1px 0 rgba(255, 255, 255, 0.35);
+}
+
+.echo-console-fader:disabled::-webkit-slider-thumb {
+  cursor: not-allowed;
+  opacity: 0.45;
+  filter: grayscale(0.4);
+}
+
+.echo-console-fader-main::-webkit-slider-thumb {
+  border-color: #7f1d1d;
+  background: linear-gradient(180deg, #fecaca 0%, #dc2626 45%, #991b1b 100%);
+  box-shadow:
+    0 2px 5px rgba(0, 0, 0, 0.7),
+    inset 0 1px 0 rgba(255, 255, 255, 0.4);
+}
+
+.echo-console-fader::-moz-range-track {
+  height: 14px;
+  border-radius: 7px;
+  background: #27272a;
+}
+
+.echo-console-fader::-moz-range-thumb {
+  width: 46px;
+  height: 30px;
+  border-radius: 9999px;
+  border: 1px solid #3f3f46;
+  background: linear-gradient(180deg, #e4e4e7, #52525b);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.65);
+}
+
+.echo-console-fader-main::-moz-range-thumb {
+  border-color: #7f1d1d;
+  background: linear-gradient(180deg, #fecaca, #991b1b);
+}
+

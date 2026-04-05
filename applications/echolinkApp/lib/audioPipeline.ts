@@ -31,6 +31,14 @@ export type ConnectMonitorBranchOptions = {
   inject?: AudioPipelineInject;
 };
 
+type AudioContextWithSink = AudioContext & {
+  setSinkId?: (id: string) => Promise<void>;
+};
+
+type HtmlAudioWithSink = HTMLAudioElement & {
+  setSinkId?: (id: string) => Promise<void>;
+};
+
 export async function connectMonitorBranch(
   context: AudioContext,
   source: MediaStreamAudioSourceNode,
@@ -40,12 +48,8 @@ export async function connectMonitorBranch(
   outputAnalyser: AnalyserNode;
   disconnect: () => void;
 }> {
-  const withSink = context as AudioContext & {
-    setSinkId?: (id: string) => Promise<void>;
-  };
-  if (options.outputDeviceId && typeof withSink.setSinkId === "function") {
-    await withSink.setSinkId(options.outputDeviceId);
-  }
+  await context.resume().catch(() => undefined);
+
   const injectFn = options.inject ?? defaultPipelineInject;
   const gainNode = context.createGain();
   gainNode.gain.value = options.monitorGain;
@@ -55,7 +59,44 @@ export async function connectMonitorBranch(
   outputAnalyser.fftSize = 512;
   outputAnalyser.smoothingTimeConstant = 0.75;
   gainNode.connect(outputAnalyser);
-  outputAnalyser.connect(context.destination);
+
+  const sinkId = options.outputDeviceId?.trim() ?? "";
+  const ctxTyped = context as AudioContextWithSink;
+
+  let monitorEl: HTMLAudioElement | null = null;
+  let monitorDest: MediaStreamAudioDestinationNode | null = null;
+
+  if (sinkId) {
+    let routedViaContext = false;
+    if (typeof ctxTyped.setSinkId === "function") {
+      try {
+        await ctxTyped.setSinkId(sinkId);
+        outputAnalyser.connect(context.destination);
+        routedViaContext = true;
+      } catch {
+        routedViaContext = false;
+      }
+    }
+    if (!routedViaContext) {
+      monitorDest = context.createMediaStreamDestination();
+      outputAnalyser.connect(monitorDest);
+      monitorEl = new Audio();
+      monitorEl.playsInline = true;
+      monitorEl.srcObject = monitorDest.stream;
+      const elTyped = monitorEl as HtmlAudioWithSink;
+      if (typeof elTyped.setSinkId === "function") {
+        try {
+          await elTyped.setSinkId(sinkId);
+        } catch {
+          /* fall back to default sink */
+        }
+      }
+      await monitorEl.play().catch(() => undefined);
+    }
+  } else {
+    outputAnalyser.connect(context.destination);
+  }
+
   const disconnect = () => {
     injectCleanup();
     try {
@@ -68,6 +109,17 @@ export async function connectMonitorBranch(
     } catch {
       /* ignore */
     }
+    if (monitorEl) {
+      try {
+        monitorEl.pause();
+      } catch {
+        /* ignore */
+      }
+      monitorEl.srcObject = null;
+      monitorEl = null;
+    }
+    monitorDest = null;
   };
+
   return { gainNode, outputAnalyser, disconnect };
 }

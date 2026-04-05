@@ -6,6 +6,8 @@ from typing import Any
 
 import httpx
 
+from core.files.localFileCache import read_selected_eleven_labs_voice_id_from_output_audio
+
 _log = logging.getLogger(__name__)
 
 _AWS_REGION = os.environ.get("AWS_REGION", "us-east-1").strip() or "us-east-1"
@@ -18,7 +20,10 @@ def _eleven_api_key() -> str:
 
 
 def _eleven_voice_id() -> str:
-    return os.environ.get("ELEVENLABS_VOICE_ID", "").strip()
+    env_vid = os.environ.get("ELEVENLABS_VOICE_ID", "").strip()
+    if env_vid:
+        return env_vid
+    return read_selected_eleven_labs_voice_id_from_output_audio()
 
 
 def _eleven_model_id() -> str:
@@ -200,7 +205,23 @@ def run_voice_translation_pt_to_en_mp3(
     return mp3
 
 
+def _gender_sigla_from_eleven_labels(item: dict[str, Any]) -> str:
+    labels = item.get("labels")
+    if not isinstance(labels, dict):
+        return ""
+    g = str(labels.get("gender") or "").strip().lower()
+    if g in ("male", "m"):
+        return "H"
+    if g in ("female", "f"):
+        return "F"
+    return ""
+
+
 def list_elevenlabs_voices() -> list[dict[str, str]]:
+    from core.voiceTranslation.elevenlabsPremadeCatalog import (
+        load_premade_gender_sigla_by_voice_id_lowercase,
+    )
+
     api_key = _eleven_api_key()
     if not api_key:
         raise RuntimeError("ElevenLabs API key not configured")
@@ -220,14 +241,22 @@ def list_elevenlabs_voices() -> list[dict[str, str]]:
     voices = data.get("voices") if isinstance(data, dict) else None
     if not isinstance(voices, list):
         return []
+    premade_lower = load_premade_gender_sigla_by_voice_id_lowercase()
     out: list[dict[str, str]] = []
     for item in voices:
         if not isinstance(item, dict):
             continue
-        vid = str(item.get("voice_id") or "").strip()
+        vid = str(item.get("voice_id") or item.get("voiceId") or "").strip()
         if not vid:
             continue
         name = str(item.get("name") or "").strip() or vid
-        out.append({"voice_id": vid, "name": name})
+        sigla = _gender_sigla_from_eleven_labels(item) or premade_lower.get(
+            vid.lower(), ""
+        )
+        row: dict[str, str] = {"voice_id": vid, "name": name}
+        if sigla:
+            row["genderSigla"] = sigla
+            row["gender_sigla"] = sigla
+        out.append(row)
     out.sort(key=lambda x: x["name"].lower())
     return out

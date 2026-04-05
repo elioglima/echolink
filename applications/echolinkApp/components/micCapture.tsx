@@ -21,7 +21,21 @@ import {
   type EchoLinkSettingsKey,
 } from "../lib/echoLinkSettings";
 import { hydrateEchoLinkSettingsFromServer } from "../lib/echoLinkServerConfig";
+import {
+  mixCaptureAudioStreams,
+  passThroughCaptureWithGain,
+} from "../lib/mixCaptureAudioStreams";
 import { postEchoLinkRuntimeCapture } from "../lib/echoLinkRuntimeClient";
+import {
+  postEchoLinkChatSession,
+  putEchoLinkChatSessionSnapshot,
+} from "../lib/echoLinkChatSessionClient";
+import {
+  fetchEchoLinkChatSession,
+  fetchEchoLinkChatSessions,
+  type EchoLinkChatSessionDetail,
+  type EchoLinkChatSessionListItem,
+} from "../lib/echoLinkChatHistoryClient";
 import {
   connectMonitorBranch,
   type AudioPipelineInject,
@@ -37,14 +51,24 @@ import {
   fetchVoiceTranslationStatus,
   fetchTranslatedVoiceAudioWithText,
   playMp3OnDeviceSink,
+  type ElevenLabsVoiceOption,
   type VoiceTranslationStatus,
 } from "../lib/voiceTranslationClient";
 import {
   EMPTY_ELEVEN_LABS_VOICE_DISPLAY,
   labelForElevenLabsVoiceId,
+  resolveElevenLabsGenderSigla,
   type ElevenLabsVoiceDisplayBundle,
 } from "../lib/elevenLabsVoiceDisplay";
+import { formatMediaDeviceOptionLabel } from "../lib/mediaDeviceOptionLabel";
 import { isSubstantivePhraseForJournal } from "../lib/substantivePhraseForJournal";
+import { sttFinalTextPassesQualityGate } from "../lib/sttTranscriptQuality";
+import { timingRangeProgress } from "../lib/timingRangeProgress";
+import { safeCloseAudioContext } from "../lib/safeCloseAudioContext";
+import {
+  subscribeEchoLinkChatAppend,
+  type EchoLinkChatSpeaker,
+} from "../lib/echoLinkChatBridge";
 import {
   arrayBufferToBase64Mp3,
   createTranscriptJournalKey,
@@ -58,6 +82,10 @@ import {
   type TranscriptJournalRow,
   upsertTranscriptJournalRow,
 } from "../lib/transcriptJournalDb";
+import {
+  AudioInLineInputDetailPanel,
+  AudioInMicInputDetailPanel,
+} from "./audioInChannelInputPanels";
 
 const WS_URL = "ws://127.0.0.1:8765/ws/mic";
 const RX_DECAY = 0.91;
@@ -70,6 +98,8 @@ const CHUNK_MS_MAX = 4000;
 const CUT_MS_MAX = 15000;
 const INPUT_SENS_MIN = 10;
 const INPUT_SENS_MAX = 5000;
+const LINE_CHANNEL_VU_SENSITIVITY_PERCENT = 100;
+const IDLE_PREVIEW_MIX_HEADROOM = 0.92;
 
 type AnalyserByteDomainBuffer = Parameters<
   AnalyserNode["getByteTimeDomainData"]
@@ -77,12 +107,6 @@ type AnalyserByteDomainBuffer = Parameters<
 
 function createByteDomainBuffer(size: number): AnalyserByteDomainBuffer {
   return new Uint8Array(new ArrayBuffer(size)) as AnalyserByteDomainBuffer;
-}
-
-function timingRangeProgress(value: number, min: number, max: number): string {
-  if (max <= min) return "0%";
-  const p = ((value - min) / (max - min)) * 100;
-  return `${Math.min(100, Math.max(0, p))}%`;
 }
 
 function mapRmsToMeterLevel(
@@ -125,11 +149,261 @@ type SidebarSection =
   | "audioOut"
   | "monitor"
   | "vocabulary"
+  | "chats"
   | "info";
+
+type AudioInChannelTab = "microphone" | "systemAudio";
+
+type AudioInLayoutMode = "mixer" | "detail";
+
+type AudioInDetailScope = "both" | "microphone" | "systemAudio";
+
+type CaptureGainControlsRef =
+  | {
+      mode: "single";
+      setPrimaryLinear: (n: number) => void;
+    }
+  | {
+      mode: "dual";
+      setPrimaryLinear: (n: number) => void;
+      setSecondaryLinear: (n: number) => void;
+    };
+
+const MIX_FADER_MAX = 150;
+
+function formatMixFaderDbLabel(percent: number): string {
+  if (percent <= 0) return "−∞";
+  const db = 20 * Math.log10(percent / 100);
+  if (db > 9) return "+10";
+  if (db >= -0.35 && db <= 0.35) return "0";
+  const rounded = Math.round(db);
+  return rounded >= 0 ? `+${rounded}` : `${rounded}`;
+}
+
+function MixerVuStrip({
+  level,
+  className = "h-36 w-5",
+}: {
+  level: number;
+  className?: string;
+}) {
+  const h = Math.min(100, Math.max(0, level * 100));
+  return (
+    <div
+      className={`relative shrink-0 overflow-hidden rounded-sm bg-zinc-950 shadow-[inset_0_0_12px_rgba(0,0,0,0.92)] ring-1 ring-zinc-700/70 ${className}`}
+      aria-hidden
+    >
+      <div
+        className="absolute bottom-0 left-0 right-0 bg-linear-to-t from-emerald-600 via-amber-400 to-red-500 opacity-[0.88] transition-[height] duration-75 ease-out"
+        style={{ height: `${h}%` }}
+      />
+      <div
+        className="pointer-events-none absolute inset-0 opacity-40"
+        style={{
+          backgroundImage:
+            "repeating-linear-gradient(to top, transparent 0px, transparent 5px, rgba(0,0,0,0.55) 5px, rgba(0,0,0,0.55) 6px)",
+        }}
+      />
+    </div>
+  );
+}
+
+function MixerFaderDbScale({
+  level,
+  className = "",
+}: {
+  level: number;
+  className?: string;
+}) {
+  const pct = Math.min(100, Math.max(0, level * 100));
+  const labelClass =
+    "relative z-10 text-right font-mono text-[10px] font-medium leading-none text-zinc-200 drop-shadow-[0_1px_2px_rgba(0,0,0,1)] sm:text-[11px]";
+  return (
+    <div
+      className={`relative h-full shrink-0 overflow-hidden bg-black ${className}`}
+      role="meter"
+      aria-valuenow={Math.round(pct)}
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-label="Nível de áudio na escala em dB"
+    >
+      <div
+        className="pointer-events-none absolute bottom-0 left-0 right-0 opacity-[0.92] transition-[height] duration-75 ease-out bg-linear-to-t from-emerald-600/80 via-amber-400/65 to-red-500/55"
+        style={{ height: `${pct}%` }}
+        aria-hidden
+      />
+      <div
+        className="pointer-events-none absolute inset-0 z-1 opacity-35"
+        style={{
+          backgroundImage:
+            "repeating-linear-gradient(to top, transparent 0px, transparent 5px, rgba(0,0,0,0.45) 5px, rgba(0,0,0,0.45) 6px)",
+        }}
+        aria-hidden
+      />
+      <div className="relative z-2 flex h-full flex-col justify-between">
+        <span className={labelClass}>+10</span>
+        <span className={labelClass}>0</span>
+        <span className={labelClass}>−10</span>
+        <span className={labelClass}>−20</span>
+        <span className={labelClass}>−30</span>
+        <span className={labelClass}>−40</span>
+        <span className={labelClass}>−60</span>
+        <span
+          className={`${labelClass} text-[9px] text-zinc-400 sm:text-[10px]`}
+        >
+          −∞
+        </span>
+      </div>
+    </div>
+  );
+}
+
+type MixerConsoleInputChannelProps = {
+  channelId: 1 | 2;
+  activateOn: boolean;
+  onActivateToggle: () => void;
+  onEdit: () => void;
+  muted: boolean;
+  onMuteToggle: () => void;
+  deviceLabel: string;
+  vuLevel: number;
+  faderValue: number;
+  onFaderChange: (v: number) => void;
+  faderDisabled: boolean;
+  busy: boolean;
+};
+
+function MixerConsoleInputChannel({
+  channelId,
+  activateOn,
+  onActivateToggle,
+  onEdit,
+  muted,
+  onMuteToggle,
+  deviceLabel,
+  vuLevel,
+  faderValue,
+  onFaderChange,
+  faderDisabled,
+  busy,
+}: MixerConsoleInputChannelProps) {
+  const btnBase =
+    "panel-bezel w-full rounded-md py-2 text-[10px] font-bold uppercase tracking-wide transition disabled:opacity-40 sm:text-[11px]";
+  const vuLevelShown =
+    activateOn && !muted && !faderDisabled ? vuLevel : 0;
+  const stripDim =
+    !activateOn ? "opacity-40" : muted ? "opacity-55" : "";
+  const faderZoneMutedVisual =
+    faderDisabled && activateOn ? "opacity-[0.55]" : "";
+  const muteEngaged = !activateOn || muted;
+  const faderDomId = `echo-mixer-fader-ch${channelId}`;
+  const faderAria =
+    channelId === 1
+      ? "Ganho do microfone na mistura"
+      : "Ganho da entrada adicional na mistura";
+  const mixerFaderTitle = channelId === 1 ? "MIC" : "Linha";
+  return (
+    <div
+      className="relative isolate flex min-h-0 w-[11.5rem] shrink-0 flex-col overflow-hidden border-l border-white/10 bg-linear-to-b from-zinc-800/30 via-zinc-950 to-[#050506] px-2.5 pb-0 pt-2 first:border-l-0 first:pl-0 sm:w-[13.25rem] sm:px-3"
+      style={{ zIndex: channelId }}
+    >
+      <p className="mb-[8px] shrink-0 text-center font-mono text-[12px] font-bold uppercase tracking-[0.2em] text-zinc-100 sm:text-[13px] sm:tracking-[0.22em]">
+        {mixerFaderTitle}
+      </p>
+      <div className="mb-1.5 flex min-w-0 shrink-0 flex-col gap-1">
+        <button
+          type="button"
+          disabled={busy}
+          onClick={onActivateToggle}
+          className={`${btnBase} ${
+            activateOn
+              ? "bg-amber-600 text-zinc-950 shadow-[0_0_12px_rgba(245,158,11,0.4)] ring-1 ring-amber-300/50"
+              : "bg-zinc-700/95 text-zinc-500 ring-1 ring-zinc-600/60 hover:bg-zinc-600"
+          }`}
+        >
+          Ativar
+        </button>
+        <button
+          type="button"
+          disabled={busy || !activateOn}
+          onClick={onEdit}
+          className={`${btnBase} ${
+            activateOn
+              ? "bg-sky-950/90 text-sky-200 ring-1 ring-sky-800/50 hover:bg-sky-900/80"
+              : "bg-zinc-800/80 text-zinc-600 ring-1 ring-zinc-700/50"
+          }`}
+        >
+          Editar
+        </button>
+        <button
+          type="button"
+          disabled={busy || !activateOn}
+          onClick={onMuteToggle}
+          className={`${btnBase} ${
+            muted && activateOn
+              ? "bg-red-900/95 text-red-100 shadow-[0_0_10px_rgba(239,68,68,0.35)] ring-1 ring-red-600/50"
+              : "bg-zinc-700/95 text-zinc-400 ring-1 ring-zinc-600/60 hover:bg-zinc-600"
+          }`}
+        >
+          Mudo
+        </button>
+      </div>
+      <p className="mb-1 line-clamp-2 min-h-8 shrink-0 text-center text-[8px] leading-snug text-zinc-400 sm:text-[9px]">
+        {deviceLabel}
+      </p>
+      <div
+        className={`flex min-h-0 flex-1 flex-col bg-black pb-2 ${stripDim}`}
+      >
+        <div
+          className={`flex min-h-[11rem] min-w-0 flex-1 items-stretch gap-1.5 sm:min-h-[12rem] ${faderZoneMutedVisual}`}
+        >
+          <div className="flex h-full min-h-0 min-w-0 flex-1 overflow-hidden bg-black">
+            <MixerVuStrip
+              level={vuLevelShown}
+              className="h-full! w-5 shrink-0 rounded-none! ring-0! sm:w-5"
+            />
+            <div className="echo-mixer-fader-slot relative isolate h-full min-h-0 min-w-[5.25rem] flex-1 overflow-hidden bg-black sm:min-w-[6rem]">
+              <div
+                className="pointer-events-none absolute inset-0 z-0 shadow-[inset_0_0_20px_rgba(0,0,0,1)]"
+                aria-hidden
+              />
+              <input
+                id={faderDomId}
+                name={`echoMixerFaderCh${channelId}`}
+                type="range"
+                min={0}
+                max={MIX_FADER_MAX}
+                step={1}
+                disabled={busy}
+                value={faderValue}
+                onChange={(e) =>
+                  onFaderChange(Number.parseInt(e.target.value, 10))
+                }
+                className="echo-mixer-fader-input echo-console-fader"
+                aria-label={faderAria}
+              />
+            </div>
+          </div>
+          <MixerFaderDbScale
+            level={vuLevelShown}
+            className="w-9 shrink-0 sm:w-10"
+          />
+        </div>
+        <div className="pt-1 text-center font-mono text-[8px] tabular-nums text-zinc-500 sm:text-[9px]">
+          {formatMixFaderDbLabel(faderValue)} · {faderValue}%
+        </div>
+        <div className="border-t border-zinc-800/50 pt-1.5 text-center font-mono text-xs font-semibold tabular-nums text-zinc-100">
+          {channelId}
+        </div>
+      </div>
+    </div>
+  );
+}
 
 type TranscriptLineEntry = {
   id: number;
   journalKey: string;
+  chatSpeaker: EchoLinkChatSpeaker;
   pt: string;
   en?: string;
   translationAudio?: ArrayBuffer;
@@ -140,6 +414,41 @@ type TranscriptLineEntry = {
   audioBase64?: string;
   replayCount?: number;
 };
+
+function serializeChatLinesForService(
+  lines: TranscriptLineEntry[]
+): Record<string, unknown>[] {
+  return lines.map((line) => {
+    const o: Record<string, unknown> = {
+      id: line.id,
+      journalKey: line.journalKey,
+      chatSpeaker: line.chatSpeaker,
+      pt: line.pt,
+    };
+    if (line.en) {
+      o.en = line.en;
+    }
+    if (line.journalDate) {
+      o.journalDate = line.journalDate;
+    }
+    if (line.voiceId) {
+      o.voiceId = line.voiceId;
+    }
+    if (line.voiceLabel) {
+      o.voiceLabel = line.voiceLabel;
+    }
+    if (line.translationOrigin) {
+      o.translationOrigin = line.translationOrigin;
+    }
+    if (typeof line.replayCount === "number") {
+      o.replayCount = line.replayCount;
+    }
+    if (line.audioBase64) {
+      o.audioBase64 = line.audioBase64;
+    }
+    return o;
+  });
+}
 
 function createTestBeepWavUrl(
   frequencyHz: number,
@@ -196,24 +505,6 @@ async function playTestBeep(outputDeviceId: string): Promise<void> {
   }
 }
 
-function formatMediaDeviceOptionLabel(
-  d: MediaDeviceInfo,
-  kind: "input" | "output",
-  friendlyAlias?: string
-): string {
-  const idTail = d.deviceId.length >= 6 ? d.deviceId.slice(-6) : d.deviceId;
-  const trimmed = friendlyAlias?.trim();
-  if (trimmed) {
-    return `${trimmed} · ${idTail}`;
-  }
-  const base =
-    d.label?.trim() ||
-    (kind === "input"
-      ? `Entrada (${d.deviceId.slice(0, 10)}…)`
-      : `Saída (${d.deviceId.slice(0, 10)}…)`);
-  return `${base} · ${idTail}`;
-}
-
 export type MicCaptureProps = {
   audioPipelineInject?: AudioPipelineInject;
 };
@@ -222,6 +513,8 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
   const wsRef = useRef<WebSocket | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const mixDisposeRef = useRef<(() => void) | null>(null);
+  const captureGainControlsRef = useRef<CaptureGainControlsRef | null>(null);
   const testStreamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const mediaStreamSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
@@ -232,11 +525,18 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
   const pipelineOutRafRef = useRef<number>(0);
   const pipelineOutSmoothRef = useRef(0);
   const pipelineInjectRef = useRef<AudioPipelineInject | undefined>(undefined);
+  const idlePreviewMonitorGainRef = useRef<GainNode | null>(null);
+  const idlePreviewPrimGainRef = useRef<GainNode | null>(null);
+  const idlePreviewSecGainRef = useRef<GainNode | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
+  const mixPrimaryAnalyserRef = useRef<AnalyserNode | null>(null);
+  const mixSecondaryAnalyserRef = useRef<AnalyserNode | null>(null);
   const rafRef = useRef<number>(0);
   const timeDomainRef = useRef<AnalyserByteDomainBuffer | null>(null);
+  const timeDomainSecondaryRef = useRef<AnalyserByteDomainBuffer | null>(null);
   const rxPulseRef = useRef(0);
   const micVuSmoothRef = useRef(0);
+  const lineVuSmoothRef = useRef(0);
   const serviceSttCleanupRef = useRef<(() => void) | null>(null);
   const phraseSilenceCutMsRef = useRef(
     ECHO_LINK_SETTINGS_PLACEHOLDER.phraseSilenceCutMs
@@ -247,7 +547,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
   const speechReceiveLangRef = useRef(
     ECHO_LINK_SETTINGS_PLACEHOLDER.speechReceiveLanguage
   );
-  const logScrollRef = useRef<HTMLDivElement | null>(null);
+  const chatScrollRef = useRef<HTMLDivElement | null>(null);
   const handleSttFinalRef = useRef<(text: string) => void>(() => {});
   const selectedOutputIdRef = useRef("");
   const voicePlayChainRef = useRef(Promise.resolve());
@@ -258,12 +558,18 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
   const [serviceChunks, setServiceChunks] = useState(0);
   const [connected, setConnected] = useState(false);
   const [micVu, setMicVu] = useState(0);
+  const [lineVu, setLineVu] = useState(0);
+  const [captureStarting, setCaptureStarting] = useState(false);
   const [rxLevel, setRxLevel] = useState(0);
   const [audioInputs, setAudioInputs] = useState<MediaDeviceInfo[]>([]);
   const [audioOutputs, setAudioOutputs] = useState<MediaDeviceInfo[]>([]);
   const [selectedInputId, setSelectedInputId] = useState<string>(
     () => ECHO_LINK_SETTINGS_PLACEHOLDER.selectedInputDeviceId
   );
+  const [selectedSecondaryInputId, setSelectedSecondaryInputId] =
+    useState<string>(
+      () => ECHO_LINK_SETTINGS_PLACEHOLDER.selectedSecondaryInputDeviceId
+    );
   const [selectedOutputId, setSelectedOutputId] = useState<string>(
     () => ECHO_LINK_SETTINGS_PLACEHOLDER.selectedOutputDeviceId
   );
@@ -272,7 +578,13 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
   const [transcriptLines, setTranscriptLines] = useState<TranscriptLineEntry[]>(
     []
   );
+  const transcriptLinesRef = useRef<TranscriptLineEntry[]>([]);
   const transcriptLineIdRef = useRef(0);
+  const captureChatSessionIdRef = useRef<string | null>(null);
+  const [captureChatSessionId, setCaptureChatSessionId] = useState<
+    string | null
+  >(null);
+  const [chatPanelExpanded, setChatPanelExpanded] = useState(false);
   const [interimTranscript, setInterimTranscript] = useState("");
   const [serviceSttReady, setServiceSttReady] = useState(false);
   const [serviceSttFailed, setServiceSttFailed] = useState(false);
@@ -284,6 +596,23 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
   }));
   const [sidebarSection, setSidebarSection] =
     useState<SidebarSection>("info");
+  const [audioInChannelTab, setAudioInChannelTab] =
+    useState<AudioInChannelTab>("microphone");
+  const [audioInDetailScope, setAudioInDetailScope] =
+    useState<AudioInDetailScope>("both");
+  const [audioInLayoutMode, setAudioInLayoutMode] =
+    useState<AudioInLayoutMode>("mixer");
+  const audioInActivePanel: AudioInChannelTab =
+    audioInDetailScope === "both"
+      ? audioInChannelTab
+      : audioInDetailScope;
+  const [mixerActivate1, setMixerActivate1] = useState(true);
+  const [mixerActivate2, setMixerActivate2] = useState(false);
+  const [mixerMute1, setMixerMute1] = useState(false);
+  const [mixerMute2, setMixerMute2] = useState(false);
+  const [mixerSideEditor, setMixerSideEditor] = useState<
+    AudioInChannelTab | null
+  >(null);
   const [vocabularyRows, setVocabularyRows] = useState<TranscriptJournalRow[]>(
     []
   );
@@ -294,6 +623,17 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
     useState("");
   const [vocabularyLoading, setVocabularyLoading] = useState(false);
   const [vocabularyRegistryLoading, setVocabularyRegistryLoading] =
+    useState(false);
+  const [chatHistoryItems, setChatHistoryItems] = useState<
+    EchoLinkChatSessionListItem[]
+  >([]);
+  const [chatHistoryLoading, setChatHistoryLoading] = useState(false);
+  const [chatHistorySelectedId, setChatHistorySelectedId] = useState<
+    string | null
+  >(null);
+  const [chatHistoryDetail, setChatHistoryDetail] =
+    useState<EchoLinkChatSessionDetail | null>(null);
+  const [chatHistoryDetailLoading, setChatHistoryDetailLoading] =
     useState(false);
   const [pipelineMonitorEnabled, setPipelineMonitorEnabled] = useState(
     () => ECHO_LINK_SETTINGS_PLACEHOLDER.pipelineMonitorEnabled
@@ -318,7 +658,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
   const [voiceTranslationBackendStatus, setVoiceTranslationBackendStatus] =
     useState<VoiceTranslationStatus | null>(null);
   const [elevenLabsVoicesFromApi, setElevenLabsVoicesFromApi] = useState<
-    { voice_id: string; name: string }[] | null
+    ElevenLabsVoiceOption[] | null
   >(null);
   const [elevenLabsVoicesLoading, setElevenLabsVoicesLoading] = useState(false);
   const [elevenLabsVoiceDisplayBundle, setElevenLabsVoiceDisplayBundle] =
@@ -354,6 +694,47 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
   }, []);
 
   useEffect(() => {
+    if (sidebarSection !== "chats") {
+      return;
+    }
+    let cancelled = false;
+    setChatHistoryLoading(true);
+    void fetchEchoLinkChatSessions()
+      .then((list) => {
+        if (!cancelled) {
+          setChatHistoryItems(list);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setChatHistoryLoading(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [sidebarSection]);
+
+  useEffect(() => {
+    if (sidebarSection !== "chats" || !chatHistorySelectedId) {
+      setChatHistoryDetail(null);
+      setChatHistoryDetailLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setChatHistoryDetailLoading(true);
+    void fetchEchoLinkChatSession(chatHistorySelectedId).then((d) => {
+      if (!cancelled) {
+        setChatHistoryDetail(d);
+        setChatHistoryDetailLoading(false);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [sidebarSection, chatHistorySelectedId]);
+
+  useEffect(() => {
     elevenLabsVoiceLabelsRef.current = elevenLabsVoiceDisplayBundle.voiceLabels;
   }, [elevenLabsVoiceDisplayBundle]);
 
@@ -363,6 +744,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
 
   const applyUiFromEchoLinkSettings = useCallback((s: EchoLinkSettings) => {
     setSelectedInputId(s.selectedInputDeviceId);
+    setSelectedSecondaryInputId(s.selectedSecondaryInputDeviceId);
     setSelectedOutputId(s.selectedOutputDeviceId);
     setVoiceTranslationEnabled(s.voiceTranslationEnabled);
     setPipelineMonitorEnabled(s.pipelineMonitorEnabled);
@@ -423,12 +805,47 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
     []
   );
 
+  const setMixerChannelMixGainPercent = useCallback(
+    (ch: 1 | 2, v: number) => {
+      if (ch === 1) {
+        setSettings((prev) => ({ ...prev, primaryChannelMixGainPercent: v }));
+        saveEchoLinkSettingsToStorage({ primaryChannelMixGainPercent: v });
+        return;
+      }
+      setSettings((prev) => ({
+        ...prev,
+        secondaryChannelMixGainPercent: v,
+      }));
+      saveEchoLinkSettingsToStorage({ secondaryChannelMixGainPercent: v });
+    },
+    []
+  );
+
   useEffect(() => {
-    const el = logScrollRef.current;
+    transcriptLinesRef.current = transcriptLines;
+  }, [transcriptLines]);
+
+  useEffect(() => {
+    const el = chatScrollRef.current;
     if (el) {
       el.scrollTop = el.scrollHeight;
     }
   }, [transcriptLines, interimTranscript]);
+
+  useEffect(() => {
+    if (!running || !captureChatSessionId) {
+      return;
+    }
+    const sid = captureChatSessionId;
+    const handle = window.setTimeout(() => {
+      void putEchoLinkChatSessionSnapshot(sid, {
+        messages: serializeChatLinesForService(transcriptLinesRef.current),
+        interimPt: interimTranscript.trim() || null,
+        ended: false,
+      });
+    }, 400);
+    return () => window.clearTimeout(handle);
+  }, [transcriptLines, interimTranscript, running, captureChatSessionId]);
 
   useEffect(() => {
     serviceChunksRef.current = serviceChunks;
@@ -464,6 +881,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
       const payload = {
         journalKey: line.journalKey,
         date: line.journalDate,
+        chatSpeaker: line.chatSpeaker,
         voice_id: line.voiceId ?? "",
         ...(line.voiceLabel
           ? { voice_label: line.voiceLabel }
@@ -693,15 +1111,42 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
 
   useEffect(() => {
     handleSttFinalRef.current = (text: string) => {
+      if (!sttFinalTextPassesQualityGate(text)) {
+        setInterimTranscript("");
+        return;
+      }
       bumpPipelineUtteranceRef.current();
       setInterimTranscript("");
       const id = (transcriptLineIdRef.current += 1);
       const journalKey = createTranscriptJournalKey();
-      setTranscriptLines((prev) => [...prev, { id, journalKey, pt: text }]);
+      setTranscriptLines((prev) => [
+        ...prev,
+        { id, journalKey, chatSpeaker: "self", pt: text },
+      ]);
       if (voiceTranslationEnabled && text.trim()) {
         runVoiceTranslationPlayback(id, text.trim(), journalKey);
       }
     };
+  }, [voiceTranslationEnabled, runVoiceTranslationPlayback]);
+
+  useEffect(() => {
+    return subscribeEchoLinkChatAppend((payload) => {
+      const text = payload.pt.trim();
+      if (!text || !sttFinalTextPassesQualityGate(text)) {
+        return;
+      }
+      bumpPipelineUtteranceRef.current();
+      const id = (transcriptLineIdRef.current += 1);
+      const journalKey = createTranscriptJournalKey();
+      const speaker = payload.speaker;
+      setTranscriptLines((prev) => [
+        ...prev,
+        { id, journalKey, chatSpeaker: speaker, pt: text },
+      ]);
+      if (voiceTranslationEnabled && text) {
+        runVoiceTranslationPlayback(id, text, journalKey);
+      }
+    });
   }, [voiceTranslationEnabled, runVoiceTranslationPlayback]);
 
   useEffect(() => {
@@ -802,6 +1247,21 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
   }, [audioInputs, selectedInputId]);
 
   useEffect(() => {
+    if (!selectedSecondaryInputId) return;
+    if (
+      !audioInputs.some((d) => d.deviceId === selectedSecondaryInputId) ||
+      selectedSecondaryInputId === selectedInputId
+    ) {
+      setSelectedSecondaryInputId("");
+      setSettings((prev) => ({
+        ...prev,
+        selectedSecondaryInputDeviceId: "",
+      }));
+      saveEchoLinkSettingsToStorage({ selectedSecondaryInputDeviceId: "" });
+    }
+  }, [audioInputs, selectedSecondaryInputId, selectedInputId]);
+
+  useEffect(() => {
     if (
       selectedOutputId &&
       !audioOutputs.some((d) => d.deviceId === selectedOutputId)
@@ -843,28 +1303,47 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
     pipelineBranchCleanupRef.current = null;
     pipelineGainNodeRef.current = null;
     mediaStreamSourceRef.current = null;
-    void audioContextRef.current?.close();
+    const meterCtx = audioContextRef.current;
     audioContextRef.current = null;
+    safeCloseAudioContext(meterCtx);
     analyserRef.current = null;
+    mixPrimaryAnalyserRef.current = null;
+    mixSecondaryAnalyserRef.current = null;
     timeDomainRef.current = null;
+    timeDomainSecondaryRef.current = null;
     rxPulseRef.current = 0;
     micVuSmoothRef.current = 0;
+    lineVuSmoothRef.current = 0;
     setMicVu(0);
+    setLineVu(0);
     setRxLevel(0);
     setMeterSampleRate(0);
     setPipelineBranchLive(false);
   }, [stopPipelineOutLevelLoop]);
 
   const stopAll = useCallback(() => {
+    const sid = captureChatSessionIdRef.current;
+    if (sid) {
+      void putEchoLinkChatSessionSnapshot(sid, {
+        messages: serializeChatLinesForService(transcriptLinesRef.current),
+        interimPt: null,
+        ended: true,
+      });
+    }
+    captureChatSessionIdRef.current = null;
+    setCaptureChatSessionId(null);
     voicePlayChainRef.current = Promise.resolve();
     stopServiceStt();
     mediaRecorderRef.current?.stop();
     mediaRecorderRef.current = null;
+    captureGainControlsRef.current = null;
+    stopMeterLoop();
+    mixDisposeRef.current?.();
+    mixDisposeRef.current = null;
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
     wsRef.current?.close();
     wsRef.current = null;
-    stopMeterLoop();
     setRunning(false);
     setConnected(false);
     void postEchoLinkRuntimeCapture(false);
@@ -913,40 +1392,90 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
   const startMeter = useCallback(
     async (stream: MediaStream, withRx: boolean) => {
       micVuSmoothRef.current = 0;
+      lineVuSmoothRef.current = 0;
       const ctx = new AudioContext();
       await ctx.resume().catch(() => undefined);
       setMeterSampleRate(ctx.sampleRate);
       const source = ctx.createMediaStreamSource(stream);
       mediaStreamSourceRef.current = source;
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 512;
-      analyser.smoothingTimeConstant = 0.75;
-      source.connect(analyser);
+      const mixP = mixPrimaryAnalyserRef.current;
+      const mixS = mixSecondaryAnalyserRef.current;
+      if (mixP) {
+        analyserRef.current = null;
+        timeDomainRef.current = createByteDomainBuffer(mixP.fftSize);
+        timeDomainSecondaryRef.current = mixS
+          ? createByteDomainBuffer(mixS.fftSize)
+          : null;
+      } else {
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 512;
+        analyser.smoothingTimeConstant = 0.75;
+        source.connect(analyser);
+        analyserRef.current = analyser;
+        timeDomainRef.current = createByteDomainBuffer(analyser.fftSize);
+        timeDomainSecondaryRef.current = null;
+      }
       audioContextRef.current = ctx;
-      analyserRef.current = analyser;
-      timeDomainRef.current = createByteDomainBuffer(analyser.fftSize);
 
       const tick = () => {
-        const a = analyserRef.current;
-        const buf = timeDomainRef.current;
-        if (a && buf) {
-          a.getByteTimeDomainData(buf);
+        const sens = inputSensitivityRef.current;
+        const mp = mixPrimaryAnalyserRef.current;
+        const ms = mixSecondaryAnalyserRef.current;
+        const fallbackA = analyserRef.current;
+        const buf1 = timeDomainRef.current;
+        const buf2 = timeDomainSecondaryRef.current;
+        if (mp && buf1) {
+          mp.getByteTimeDomainData(buf1);
           let sum = 0;
-          for (let i = 0; i < buf.length; i++) {
-            const v = (buf[i] - 128) / 128;
+          for (let i = 0; i < buf1.length; i++) {
+            const v = (buf1[i] - 128) / 128;
             sum += v * v;
           }
-          const rms = Math.sqrt(sum / buf.length);
-          const instant = mapRmsToMeterLevel(
-            rms,
-            inputSensitivityRef.current
-          );
+          const rms = Math.sqrt(sum / buf1.length);
+          const instant = mapRmsToMeterLevel(rms, sens);
           const prev = micVuSmoothRef.current;
           micVuSmoothRef.current =
             instant > prev
               ? prev * 0.78 + instant * 0.22
               : prev * 0.91 + instant * 0.09;
           setMicVu(micVuSmoothRef.current);
+        } else if (fallbackA && buf1) {
+          fallbackA.getByteTimeDomainData(buf1);
+          let sum = 0;
+          for (let i = 0; i < buf1.length; i++) {
+            const v = (buf1[i] - 128) / 128;
+            sum += v * v;
+          }
+          const rms = Math.sqrt(sum / buf1.length);
+          const instant = mapRmsToMeterLevel(rms, sens);
+          const prev = micVuSmoothRef.current;
+          micVuSmoothRef.current =
+            instant > prev
+              ? prev * 0.78 + instant * 0.22
+              : prev * 0.91 + instant * 0.09;
+          setMicVu(micVuSmoothRef.current);
+        }
+        if (ms && buf2) {
+          ms.getByteTimeDomainData(buf2);
+          let sum2 = 0;
+          for (let i = 0; i < buf2.length; i++) {
+            const v = (buf2[i] - 128) / 128;
+            sum2 += v * v;
+          }
+          const rms2 = Math.sqrt(sum2 / buf2.length);
+          const instant2 = mapRmsToMeterLevel(
+            rms2,
+            LINE_CHANNEL_VU_SENSITIVITY_PERCENT
+          );
+          const prev2 = lineVuSmoothRef.current;
+          lineVuSmoothRef.current =
+            instant2 > prev2
+              ? prev2 * 0.78 + instant2 * 0.22
+              : prev2 * 0.91 + instant2 * 0.09;
+          setLineVu(lineVuSmoothRef.current);
+        } else if (mp) {
+          lineVuSmoothRef.current = 0;
+          setLineVu(0);
         }
         if (withRx) {
           rxPulseRef.current *= RX_DECAY;
@@ -1004,7 +1533,10 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
   };
 
   const start = async () => {
+    setCaptureStarting(true);
     setError(null);
+    captureChatSessionIdRef.current = null;
+    setCaptureChatSessionId(null);
     setServiceBytes(0);
     setServiceChunks(0);
     setServiceChunksBaseline(0);
@@ -1016,20 +1548,79 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
     setServiceSttBootstrapError(null);
     setPipelineUtteranceVersion((v) => v + 1);
     rxPulseRef.current = 0;
+    let primaryForCleanup: MediaStream | null = null;
+    let secondaryForCleanup: MediaStream | null = null;
     try {
-      const audioConstraints: MediaTrackConstraints = {
+      const baseAudio: MediaTrackConstraints = {
         echoCancellation: false,
         noiseSuppression: true,
         autoGainControl: false,
       };
+      const primaryConstraints: MediaTrackConstraints = { ...baseAudio };
       if (selectedInputId) {
-        audioConstraints.deviceId = { exact: selectedInputId };
+        primaryConstraints.deviceId = { exact: selectedInputId };
       }
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: audioConstraints,
+      primaryForCleanup = await navigator.mediaDevices.getUserMedia({
+        audio: primaryConstraints,
       });
-      streamRef.current = stream;
-      await startMeter(stream, true);
+      let captureStream: MediaStream;
+      const secondaryId =
+        selectedSecondaryInputId &&
+        selectedSecondaryInputId !== selectedInputId
+          ? selectedSecondaryInputId
+          : "";
+      const pLin = Math.max(
+        0,
+        Math.min(2, settings.primaryChannelMixGainPercent / 100)
+      );
+      const sLin = Math.max(
+        0,
+        Math.min(2, settings.secondaryChannelMixGainPercent / 100)
+      );
+      captureGainControlsRef.current = null;
+      mixPrimaryAnalyserRef.current = null;
+      mixSecondaryAnalyserRef.current = null;
+      if (secondaryId) {
+        const secondaryConstraints: MediaTrackConstraints = { ...baseAudio };
+        secondaryConstraints.deviceId = { exact: secondaryId };
+        secondaryForCleanup = await navigator.mediaDevices.getUserMedia({
+          audio: secondaryConstraints,
+        });
+        const {
+          mixedStream,
+          dispose,
+          controls,
+          primaryAnalyser,
+          secondaryAnalyser,
+        } = await mixCaptureAudioStreams(primaryForCleanup, secondaryForCleanup, {
+          primaryLinear: pLin,
+          secondaryLinear: sLin,
+        });
+        mixDisposeRef.current = dispose;
+        mixPrimaryAnalyserRef.current = primaryAnalyser;
+        mixSecondaryAnalyserRef.current = secondaryAnalyser;
+        captureGainControlsRef.current = {
+          mode: "dual",
+          setPrimaryLinear: controls.setPrimaryLinear,
+          setSecondaryLinear: controls.setSecondaryLinear,
+        };
+        primaryForCleanup = null;
+        secondaryForCleanup = null;
+        captureStream = mixedStream;
+      } else {
+        const pt = await passThroughCaptureWithGain(primaryForCleanup, pLin);
+        mixDisposeRef.current = pt.dispose;
+        mixPrimaryAnalyserRef.current = pt.primaryAnalyser;
+        mixSecondaryAnalyserRef.current = null;
+        captureGainControlsRef.current = {
+          mode: "single",
+          setPrimaryLinear: pt.setGainLinear,
+        };
+        primaryForCleanup = null;
+        captureStream = pt.stream;
+      }
+      streamRef.current = captureStream;
+      await startMeter(captureStream, true);
 
       const ws = new WebSocket(WS_URL);
       ws.binaryType = "arraybuffer";
@@ -1064,8 +1655,8 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
 
       const mimeType = pickMimeType();
       const recorder = mimeType
-        ? new MediaRecorder(stream, { mimeType })
-        : new MediaRecorder(stream);
+        ? new MediaRecorder(captureStream, { mimeType })
+        : new MediaRecorder(captureStream);
       mediaRecorderRef.current = recorder;
 
       recorder.ondataavailable = async (e: BlobEvent) => {
@@ -1076,6 +1667,10 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
       };
 
       recorder.start(settings.audioChunkMs);
+      const chatSess = await postEchoLinkChatSession();
+      const newChatId = chatSess?.sessionId ?? null;
+      captureChatSessionIdRef.current = newChatId;
+      setCaptureChatSessionId(newChatId);
       setRunning(true);
       void postEchoLinkRuntimeCapture(true);
       if (settings.transcriptionStartDelayMs > 0) {
@@ -1121,19 +1716,113 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
         }
       }
     } catch (e) {
+      mixDisposeRef.current?.();
+      mixDisposeRef.current = null;
+      mixPrimaryAnalyserRef.current = null;
+      mixSecondaryAnalyserRef.current = null;
+      primaryForCleanup?.getTracks().forEach((t) => t.stop());
+      secondaryForCleanup?.getTracks().forEach((t) => t.stop());
       const msg =
         e instanceof Error ? e.message : "Não foi possível iniciar a captura.";
       setError(msg);
       stopAll();
+    } finally {
+      setCaptureStarting(false);
     }
   };
 
   useEffect(() => {
-    const g = pipelineGainNodeRef.current;
+    const g =
+      pipelineGainNodeRef.current ?? idlePreviewMonitorGainRef.current;
     if (g) {
       g.gain.value = pipelineMonitorGain;
     }
   }, [pipelineMonitorGain]);
+
+  useEffect(() => {
+    if (running) {
+      return;
+    }
+    const gp = idlePreviewPrimGainRef.current;
+    const gs = idlePreviewSecGainRef.current;
+    if (!gp && !gs) {
+      return;
+    }
+    const ch2Ok =
+      Boolean(selectedSecondaryInputId) &&
+      selectedSecondaryInputId !== selectedInputId;
+    const pRaw = settings.primaryChannelMixGainPercent / 100;
+    const sRaw = settings.secondaryChannelMixGainPercent / 100;
+    const p =
+      mixerActivate1 && !mixerMute1
+        ? Math.max(0, Math.min(2, pRaw))
+        : 0;
+    const s =
+      mixerActivate2 && !mixerMute2 && ch2Ok
+        ? Math.max(0, Math.min(2, sRaw))
+        : 0;
+    if (gp) {
+      gp.gain.value = IDLE_PREVIEW_MIX_HEADROOM * p;
+    }
+    if (gs) {
+      gs.gain.value = IDLE_PREVIEW_MIX_HEADROOM * s;
+    }
+  }, [
+    running,
+    mixerActivate1,
+    mixerMute1,
+    mixerActivate2,
+    mixerMute2,
+    settings.primaryChannelMixGainPercent,
+    settings.secondaryChannelMixGainPercent,
+    selectedSecondaryInputId,
+    selectedInputId,
+  ]);
+
+  useEffect(() => {
+    if (!running) return;
+    const c = captureGainControlsRef.current;
+    if (!c) return;
+    const ch2Ok =
+      Boolean(selectedSecondaryInputId) &&
+      selectedSecondaryInputId !== selectedInputId;
+    const pRaw = settings.primaryChannelMixGainPercent / 100;
+    const sRaw = settings.secondaryChannelMixGainPercent / 100;
+    const p =
+      mixerActivate1 && !mixerMute1
+        ? Math.max(0, Math.min(2, pRaw))
+        : 0;
+    const s =
+      mixerActivate2 && !mixerMute2 && ch2Ok
+        ? Math.max(0, Math.min(2, sRaw))
+        : 0;
+    c.setPrimaryLinear(p);
+    if (c.mode === "dual") {
+      c.setSecondaryLinear(s);
+    }
+  }, [
+    running,
+    mixerActivate1,
+    mixerActivate2,
+    mixerMute1,
+    mixerMute2,
+    settings.primaryChannelMixGainPercent,
+    settings.secondaryChannelMixGainPercent,
+    selectedSecondaryInputId,
+    selectedInputId,
+  ]);
+
+  useEffect(() => {
+    if (!mixerActivate1) {
+      setMixerMute1(true);
+    }
+  }, [mixerActivate1]);
+
+  useEffect(() => {
+    if (!mixerActivate2) {
+      setMixerMute2(true);
+    }
+  }, [mixerActivate2]);
 
   useEffect(() => {
     if (!running) return;
@@ -1187,7 +1876,322 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
     startPipelineOutLevelLoop,
   ]);
 
-  const busy = running || micTesting || outputTesting;
+  const busy =
+    running || micTesting || outputTesting || captureStarting;
+
+  const idleInputMeterDepKey = useMemo(
+    () =>
+      [
+        running,
+        micTesting,
+        outputTesting,
+        captureStarting,
+        mixerActivate1,
+        mixerMute1,
+        mixerActivate2,
+        mixerMute2,
+        selectedInputId,
+        selectedSecondaryInputId,
+        pipelineMonitorEnabled,
+        selectedOutputId,
+        settings.primaryChannelMixGainPercent,
+        settings.secondaryChannelMixGainPercent,
+      ].join("\0"),
+    [
+      running,
+      micTesting,
+      outputTesting,
+      captureStarting,
+      mixerActivate1,
+      mixerMute1,
+      mixerActivate2,
+      mixerMute2,
+      selectedInputId,
+      selectedSecondaryInputId,
+      pipelineMonitorEnabled,
+      selectedOutputId,
+      settings.primaryChannelMixGainPercent,
+      settings.secondaryChannelMixGainPercent,
+    ]
+  );
+
+  useEffect(() => {
+    if (running || micTesting || outputTesting || captureStarting) {
+      return;
+    }
+    let cancelled = false;
+    let rafId = 0;
+    const streams: MediaStream[] = [];
+    let ctx: AudioContext | null = null;
+    let an1: AnalyserNode | null = null;
+    let an2: AnalyserNode | null = null;
+    let ms1Node: MediaStreamAudioSourceNode | null = null;
+    let ms2Node: MediaStreamAudioSourceNode | null = null;
+    let previewMeterCtx: AudioContext | null = null;
+    let previewBranchDisconnect: (() => void) | null = null;
+    let previewMixDest: MediaStreamAudioDestinationNode | null = null;
+    let previewSumGain: GainNode | null = null;
+
+    const run = async () => {
+      const ch2Ok =
+        Boolean(selectedSecondaryInputId) &&
+        selectedSecondaryInputId !== selectedInputId;
+      const want1 = mixerActivate1 && !mixerMute1;
+      const want2 = mixerActivate2 && !mixerMute2 && ch2Ok;
+      if (!want1 && !want2) {
+        setMicVu(0);
+        setLineVu(0);
+        setMeterSampleRate(0);
+        micVuSmoothRef.current = 0;
+        lineVuSmoothRef.current = 0;
+        return;
+      }
+      try {
+        ctx = new AudioContext();
+        await ctx.resume();
+        if (cancelled) {
+          safeCloseAudioContext(ctx);
+          return;
+        }
+        setMeterSampleRate(ctx.sampleRate);
+        const baseAudio: MediaTrackConstraints = {
+          echoCancellation: false,
+          noiseSuppression: true,
+          autoGainControl: false,
+        };
+        const silent = ctx.createGain();
+        silent.gain.value = 0;
+        silent.connect(ctx.destination);
+        if (want1) {
+          const c: MediaTrackConstraints = { ...baseAudio };
+          if (selectedInputId) {
+            c.deviceId = { exact: selectedInputId };
+          }
+          const s = await navigator.mediaDevices.getUserMedia({ audio: c });
+          if (cancelled) {
+            s.getTracks().forEach((t) => t.stop());
+            safeCloseAudioContext(ctx);
+            return;
+          }
+          streams.push(s);
+          ms1Node = ctx.createMediaStreamSource(s);
+          an1 = ctx.createAnalyser();
+          an1.fftSize = 512;
+          an1.smoothingTimeConstant = 0.75;
+          ms1Node.connect(an1);
+          an1.connect(silent);
+        }
+        if (want2) {
+          const c: MediaTrackConstraints = {
+            ...baseAudio,
+            deviceId: { exact: selectedSecondaryInputId },
+          };
+          const s = await navigator.mediaDevices.getUserMedia({ audio: c });
+          if (cancelled) {
+            s.getTracks().forEach((t) => t.stop());
+            safeCloseAudioContext(ctx);
+            return;
+          }
+          streams.push(s);
+          ms2Node = ctx.createMediaStreamSource(s);
+          an2 = ctx.createAnalyser();
+          an2.fftSize = 512;
+          an2.smoothingTimeConstant = 0.75;
+          ms2Node.connect(an2);
+          an2.connect(silent);
+        }
+        const buf1 = an1 ? createByteDomainBuffer(an1.fftSize) : null;
+        const buf2 = an2 ? createByteDomainBuffer(an2.fftSize) : null;
+        micVuSmoothRef.current = 0;
+        lineVuSmoothRef.current = 0;
+        const tick = () => {
+          if (cancelled) {
+            return;
+          }
+          const sens = inputSensitivityRef.current;
+          if (an1 && buf1) {
+            an1.getByteTimeDomainData(buf1);
+            let sum = 0;
+            for (let i = 0; i < buf1.length; i++) {
+              const v = (buf1[i] - 128) / 128;
+              sum += v * v;
+            }
+            const rms = Math.sqrt(sum / buf1.length);
+            const instant = mapRmsToMeterLevel(rms, sens);
+            const prev = micVuSmoothRef.current;
+            micVuSmoothRef.current =
+              instant > prev
+                ? prev * 0.78 + instant * 0.22
+                : prev * 0.91 + instant * 0.09;
+            setMicVu(micVuSmoothRef.current);
+          } else {
+            micVuSmoothRef.current = 0;
+            setMicVu(0);
+          }
+          if (an2 && buf2) {
+            an2.getByteTimeDomainData(buf2);
+            let sum2 = 0;
+            for (let i = 0; i < buf2.length; i++) {
+              const v = (buf2[i] - 128) / 128;
+              sum2 += v * v;
+            }
+            const rms2 = Math.sqrt(sum2 / buf2.length);
+            const instant2 = mapRmsToMeterLevel(
+              rms2,
+              LINE_CHANNEL_VU_SENSITIVITY_PERCENT
+            );
+            const prev2 = lineVuSmoothRef.current;
+            lineVuSmoothRef.current =
+              instant2 > prev2
+                ? prev2 * 0.78 + instant2 * 0.22
+                : prev2 * 0.91 + instant2 * 0.09;
+            setLineVu(lineVuSmoothRef.current);
+          } else {
+            lineVuSmoothRef.current = 0;
+            setLineVu(0);
+          }
+          rafId = requestAnimationFrame(tick);
+        };
+        rafId = requestAnimationFrame(tick);
+
+        const ch2OkMix =
+          Boolean(selectedSecondaryInputId) &&
+          selectedSecondaryInputId !== selectedInputId;
+        const pLin =
+          mixerActivate1 && !mixerMute1
+            ? Math.max(
+                0,
+                Math.min(
+                  2,
+                  settings.primaryChannelMixGainPercent / 100
+                )
+              )
+            : 0;
+        const sLin =
+          mixerActivate2 && !mixerMute2 && ch2OkMix
+            ? Math.max(
+                0,
+                Math.min(
+                  2,
+                  settings.secondaryChannelMixGainPercent / 100
+                )
+              )
+            : 0;
+        if (
+          pipelineMonitorEnabled &&
+          selectedOutputId.trim() &&
+          (want1 || want2) &&
+          !cancelled
+        ) {
+          try {
+            previewSumGain = ctx.createGain();
+            previewSumGain.gain.value = 1;
+            previewMixDest = ctx.createMediaStreamDestination();
+            previewSumGain.connect(previewMixDest);
+            idlePreviewPrimGainRef.current = null;
+            idlePreviewSecGainRef.current = null;
+            if (want1 && ms1Node) {
+              const gP = ctx.createGain();
+              gP.gain.value = IDLE_PREVIEW_MIX_HEADROOM * pLin;
+              ms1Node.connect(gP);
+              gP.connect(previewSumGain);
+              idlePreviewPrimGainRef.current = gP;
+            }
+            if (want2 && ms2Node) {
+              const gS = ctx.createGain();
+              gS.gain.value = IDLE_PREVIEW_MIX_HEADROOM * sLin;
+              ms2Node.connect(gS);
+              gS.connect(previewSumGain);
+              idlePreviewSecGainRef.current = gS;
+            }
+            previewMeterCtx = new AudioContext();
+            await previewMeterCtx.resume();
+            if (cancelled) {
+              previewBranchDisconnect?.();
+              previewBranchDisconnect = null;
+              safeCloseAudioContext(previewMeterCtx);
+              previewMeterCtx = null;
+              idlePreviewMonitorGainRef.current = null;
+              idlePreviewPrimGainRef.current = null;
+              idlePreviewSecGainRef.current = null;
+              setPipelineBranchLive(false);
+              return;
+            }
+            const prevSrc = previewMeterCtx.createMediaStreamSource(
+              previewMixDest.stream
+            );
+            const branch = await connectMonitorBranch(
+              previewMeterCtx,
+              prevSrc,
+              {
+                monitorGain: pipelineMonitorGainRef.current,
+                outputDeviceId: selectedOutputId.trim(),
+                inject: pipelineInjectRef.current,
+              }
+            );
+            if (cancelled) {
+              branch.disconnect();
+              safeCloseAudioContext(previewMeterCtx);
+              previewMeterCtx = null;
+              idlePreviewMonitorGainRef.current = null;
+              idlePreviewPrimGainRef.current = null;
+              idlePreviewSecGainRef.current = null;
+              setPipelineBranchLive(false);
+              return;
+            }
+            previewBranchDisconnect = branch.disconnect;
+            idlePreviewMonitorGainRef.current = branch.gainNode;
+            setPipelineBranchLive(true);
+          } catch (e) {
+            previewBranchDisconnect?.();
+            previewBranchDisconnect = null;
+            safeCloseAudioContext(previewMeterCtx);
+            previewMeterCtx = null;
+            idlePreviewMonitorGainRef.current = null;
+            idlePreviewPrimGainRef.current = null;
+            idlePreviewSecGainRef.current = null;
+            setPipelineBranchLive(false);
+            const msg =
+              e instanceof Error
+                ? e.message
+                : "Pré-visualização do monitor falhou";
+            setError(msg);
+          }
+        }
+      } catch {
+        safeCloseAudioContext(ctx);
+        if (!cancelled) {
+          setMicVu(0);
+          setLineVu(0);
+          setMeterSampleRate(0);
+        }
+      }
+    };
+
+    void run();
+
+    return () => {
+      cancelled = true;
+      previewBranchDisconnect?.();
+      previewBranchDisconnect = null;
+      safeCloseAudioContext(previewMeterCtx);
+      previewMeterCtx = null;
+      idlePreviewMonitorGainRef.current = null;
+      idlePreviewPrimGainRef.current = null;
+      idlePreviewSecGainRef.current = null;
+      setPipelineBranchLive(false);
+      if (rafId) {
+        cancelAnimationFrame(rafId);
+      }
+      streams.forEach((s) => s.getTracks().forEach((t) => t.stop()));
+      safeCloseAudioContext(ctx);
+      setMicVu(0);
+      setLineVu(0);
+      micVuSmoothRef.current = 0;
+      lineVuSmoothRef.current = 0;
+      setMeterSampleRate(0);
+    };
+  }, [idleInputMeterDepKey]);
 
   const selectClass =
     "panel-bezel h-10 w-full rounded-md bg-zinc-800 px-3 font-mono text-[12px] text-zinc-100 shadow-[inset_0_2px_8px_rgba(0,0,0,0.35)] outline-none ring-1 ring-zinc-600/50 transition focus:ring-2 focus:ring-amber-500/40 disabled:cursor-not-allowed disabled:opacity-45 sm:text-[13px]";
@@ -1250,23 +2254,44 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
   );
 
   const elevenLabsVoiceSelectOptions = useMemo(() => {
+    const labelWithGender = (base: string, sigla?: "H" | "F") => {
+      const t = base.trim() || "Voz";
+      return sigla === "H" || sigla === "F" ? `[${sigla}] ${t}` : t;
+    };
+    const bundle = elevenLabsVoiceDisplayBundle;
     let rows =
       elevenLabsVoicesFromApi && elevenLabsVoicesFromApi.length > 0
         ? elevenLabsVoicesFromApi.map((vo) => ({
             value: vo.voice_id,
-            label: `${vo.name} · ${vo.voice_id}`,
+            label: labelWithGender(
+              vo.name || "",
+              resolveElevenLabsGenderSigla(vo.voice_id, bundle, vo.genderSigla)
+            ),
           }))
-        : [...elevenLabsVoiceDisplayBundle.fallbackVoiceOptions];
+        : bundle.fallbackVoiceOptions.map((o) => ({
+            value: o.value,
+            label: labelWithGender(
+              o.label,
+              resolveElevenLabsGenderSigla(o.value, bundle, o.genderSigla)
+            ),
+          }));
     const sel = settings.selectedElevenLabsVoiceId.trim();
     if (sel && !rows.some((r) => r.value === sel)) {
       const lb = labelForElevenLabsVoiceId(
         sel,
         elevenLabsVoiceDisplayBundle.voiceLabels
       );
+      const fbG = elevenLabsVoiceDisplayBundle.fallbackVoiceOptions.find(
+        (o) => o.value === sel
+      )?.genderSigla;
+      const base = lb ? lb : "Outra voz";
       rows = [
         {
           value: sel,
-          label: lb ? `${lb} · ${sel}` : sel,
+          label: labelWithGender(
+            base,
+            resolveElevenLabsGenderSigla(sel, elevenLabsVoiceDisplayBundle, fbG)
+          ),
         },
         ...rows,
       ];
@@ -1278,12 +2303,36 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
     elevenLabsVoiceDisplayBundle,
   ]);
 
+  const elevenLabsVoiceSelectUiValue = useMemo(() => {
+    const opts = elevenLabsVoiceSelectOptions;
+    const cur = settings.selectedElevenLabsVoiceId.trim();
+    if (opts.length === 0) {
+      return cur;
+    }
+    return opts.some((o) => o.value === cur) ? cur : opts[0].value;
+  }, [elevenLabsVoiceSelectOptions, settings.selectedElevenLabsVoiceId]);
+
+  useEffect(() => {
+    const opts = elevenLabsVoiceSelectOptions;
+    if (opts.length === 0) {
+      return;
+    }
+    const cur = settings.selectedElevenLabsVoiceId.trim();
+    if (opts.some((o) => o.value === cur)) {
+      return;
+    }
+    const pick = opts[0].value;
+    setSettings((p) => ({ ...p, selectedElevenLabsVoiceId: pick }));
+    saveEchoLinkSettingsToStorage({ selectedElevenLabsVoiceId: pick });
+  }, [elevenLabsVoiceSelectOptions, settings.selectedElevenLabsVoiceId]);
+
   const navEntries: { id: SidebarSection; label: string }[] = [
     { id: "info", label: "Informações" },
-    { id: "audioIn", label: "Entrada de áudio" },
+    { id: "audioIn", label: "Canais de entrada" },
     { id: "audioOut", label: "Saída de áudio" },
     { id: "monitor", label: "Monitoramento" },
     { id: "vocabulary", label: "Vocabulário" },
+    { id: "chats", label: "Históricos" },
   ];
 
   const selectedOutputLabel =
@@ -1360,24 +2409,26 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
   ]);
 
   const meterForLogDisplay = useMemo(() => {
+    const combined = Math.max(micVu, lineVu);
     const sttMeter =
       settings.speechLanguagesEnabled &&
       serviceSttReady &&
       !serviceSttFailed;
     if (!running || !sttMeter) {
-      return micVu;
+      return combined;
     }
     const aligned =
       interimTranscript.length > 0 ||
       transcriptLines.length > 0 ||
-      micVu >= METER_LOG_ALIGN_MIN;
-    return aligned ? micVu : micVu * METER_LOG_IDLE_SCALE;
+      combined >= METER_LOG_ALIGN_MIN;
+    return aligned ? combined : combined * METER_LOG_IDLE_SCALE;
   }, [
     running,
     settings.speechLanguagesEnabled,
     serviceSttReady,
     serviceSttFailed,
     micVu,
+    lineVu,
     interimTranscript,
     transcriptLines,
   ]);
@@ -1448,317 +2499,363 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
               ))}
             </nav>
 
-            <div className="relative z-0 min-h-0 min-w-0 flex-1 overflow-y-auto bg-zinc-900">
+            <div className="relative z-0 flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto bg-zinc-900">
               {sidebarSection === "audioIn" ? (
-                <div className="divide-y divide-zinc-600/35">
-                  <div className="border-b border-zinc-600/35 bg-zinc-900/60 px-3 py-2 sm:px-4">
-                    <p className="text-[10px] font-bold uppercase tracking-[0.22em] text-zinc-200">
-                      Entrada de áudio
-                    </p>
-                    <p className="mt-0.5 text-[10px] text-zinc-400">
-                      Microfone · fonte e captura (medidor e tempos)
-                    </p>
-                    <p className="mt-2 text-[9px] leading-snug text-zinc-500">
-                      Os nomes vêm do navegador e podem diferir do macOS. O
-                      sufixo após “·” identifica o dispositivo na Web.
-                    </p>
-                  </div>
-                  <div className="grid grid-cols-1 gap-0 divide-y divide-zinc-600/35">
-                    <section className="bg-zinc-900/50 p-3 sm:p-4">
-                      <div className="mb-2.5 flex items-center gap-2 rounded-md bg-sky-950/25 px-2 py-1.5 ring-1 ring-sky-700/35">
-                        <span className="text-[9px] font-bold uppercase tracking-[0.18em] text-sky-300 sm:text-[10px] sm:tracking-[0.2em]">
-                          Microfone
-                        </span>
-                        <span className="text-[9px] text-zinc-400">
-                          Canal 1
-                        </span>
+                audioInLayoutMode === "mixer" ? (
+                  <div className="flex min-h-0 min-w-0 flex-1 flex-col divide-y divide-zinc-600/35">
+                    <div className="shrink-0 border-b border-zinc-600/35 bg-zinc-900/60 px-3 py-2 sm:px-4">
+                      <p className="text-[10px] font-bold uppercase tracking-[0.22em] text-zinc-200">
+                        Canais de entrada
+                      </p>
+                      <p className="mt-0.5 text-[10px] text-zinc-400">
+                        Mesa de som · faders e VU. Em cada canal, Editar abre
+                        dispositivos, tempos de captura e teste do microfone.
+                      </p>
+                    </div>
+                    <div className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-linear-to-b from-[#0c0c0e] via-[#080809] to-black">
+                      <div
+                        className={`flex min-h-0 min-w-0 flex-1 flex-row ${mixerSideEditor ? "pointer-events-none invisible" : ""}`}
+                        aria-hidden={mixerSideEditor ? true : undefined}
+                      >
+                        <div className="flex min-h-0 shrink-0 flex-col px-3 py-3 sm:px-4 sm:py-4">
+                          <div className="flex min-h-0 min-w-0 flex-1 items-stretch justify-start gap-3 overflow-x-auto pb-1 sm:gap-5">
+                            <MixerConsoleInputChannel
+                              key="echo-mixer-strip-ch1"
+                              channelId={1}
+                              activateOn={mixerActivate1}
+                              onActivateToggle={() => {
+                                setMixerActivate1((v) => {
+                                  const next = !v;
+                                  if (!next) {
+                                    setMixerMute1(true);
+                                  }
+                                  return next;
+                                });
+                              }}
+                              onEdit={() => {
+                                setMixerSideEditor("microphone");
+                                setAudioInDetailScope("microphone");
+                                setAudioInChannelTab("microphone");
+                              }}
+                              muted={mixerMute1}
+                              onMuteToggle={() => setMixerMute1((v) => !v)}
+                              deviceLabel={
+                                selectedInputId
+                                  ? (() => {
+                                      const d = audioInputs.find(
+                                        (x) => x.deviceId === selectedInputId
+                                      );
+                                      return d
+                                        ? formatMediaDeviceOptionLabel(
+                                            d,
+                                            "input",
+                                            settings.inputDeviceAliases[
+                                              d.deviceId
+                                            ]
+                                          )
+                                        : "…";
+                                    })()
+                                  : "Mic · padrão"
+                              }
+                              vuLevel={micVu}
+                              faderValue={
+                                settings.primaryChannelMixGainPercent
+                              }
+                              onFaderChange={(v) =>
+                                setMixerChannelMixGainPercent(1, v)
+                              }
+                              faderDisabled={false}
+                              busy={busy}
+                            />
+                            <MixerConsoleInputChannel
+                              key="echo-mixer-strip-ch2"
+                              channelId={2}
+                              activateOn={mixerActivate2}
+                              onActivateToggle={() => {
+                                setMixerActivate2((v) => {
+                                  const next = !v;
+                                  if (!next) {
+                                    setMixerMute2(true);
+                                  }
+                                  return next;
+                                });
+                              }}
+                              onEdit={() => {
+                                setMixerSideEditor("systemAudio");
+                                setAudioInDetailScope("systemAudio");
+                                setAudioInChannelTab("systemAudio");
+                              }}
+                              muted={mixerMute2}
+                              onMuteToggle={() => setMixerMute2((v) => !v)}
+                              deviceLabel={
+                                selectedSecondaryInputId &&
+                                selectedSecondaryInputId !== selectedInputId
+                                  ? (() => {
+                                      const d = audioInputs.find(
+                                        (x) =>
+                                          x.deviceId ===
+                                          selectedSecondaryInputId
+                                      );
+                                      return d
+                                        ? formatMediaDeviceOptionLabel(
+                                            d,
+                                            "input",
+                                            settings.inputDeviceAliases[
+                                              d.deviceId
+                                            ]
+                                          )
+                                        : "…";
+                                    })()
+                                  : "Linha · off"
+                              }
+                              vuLevel={lineVu}
+                              faderValue={
+                                settings.secondaryChannelMixGainPercent
+                              }
+                              onFaderChange={(v) =>
+                                setMixerChannelMixGainPercent(2, v)
+                              }
+                              faderDisabled={
+                                !selectedSecondaryInputId ||
+                                selectedSecondaryInputId === selectedInputId
+                              }
+                              busy={busy}
+                            />
+                          </div>
+                          {meterSampleRate > 0 && (
+                            <p className="mt-3 shrink-0 font-mono text-[10px] text-zinc-600 sm:text-[11px]">
+                              Taxa de amostragem · {meterSampleRate} Hz
+                            </p>
+                          )}
+                        </div>
+                        <div
+                          className="min-h-0 min-w-0 flex-1 bg-black"
+                          aria-hidden
+                        />
                       </div>
-                      <label
-                        htmlFor="echo-input-device"
-                        className="mb-1.5 block text-[9px] uppercase tracking-[0.18em] text-zinc-400"
-                      >
-                        Entrada
-                      </label>
-                      <select
-                        id="echo-input-device"
-                        className={selectClass}
-                        disabled={busy}
-                        value={selectedInputId}
-                        onChange={(e) => {
-                          const v = e.target.value;
-                          setSelectedInputId(v);
-                          setSettings((prev) => ({
-                            ...prev,
-                            selectedInputDeviceId: v,
-                          }));
-                          saveEchoLinkSettingsToStorage({
-                            selectedInputDeviceId: v,
-                          });
-                        }}
-                      >
-                        <option value="">Principal / padrão</option>
-                        {audioInputs.map((d) => (
-                          <option key={d.deviceId} value={d.deviceId}>
-                            {formatMediaDeviceOptionLabel(
-                              d,
-                              "input",
-                              settings.inputDeviceAliases[d.deviceId]
+                      {mixerSideEditor ? (
+                        <div className="absolute inset-0 z-10 flex min-h-0 min-w-0 flex-col bg-zinc-950/98 ring-1 ring-zinc-700/60">
+                          <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-zinc-700/50 bg-zinc-950/90 px-3 py-2 sm:px-4">
+                            <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-zinc-300 sm:text-[11px]">
+                              {mixerSideEditor === "microphone"
+                                ? "Canal 1 · microfone"
+                                : "Canal 2 · linha"}
+                            </p>
+                            <div className="flex flex-wrap items-center justify-end gap-2">
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => void refreshMediaDevices()}
+                                className={btnSecondary}
+                              >
+                                Atualizar
+                              </button>
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => void unlockMediaLabels()}
+                                className={btnSecondary}
+                              >
+                                Nomes
+                              </button>
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => setMixerSideEditor(null)}
+                                className="panel-bezel inline-flex min-h-9 items-center justify-center rounded-md bg-zinc-800 px-3 font-mono text-[10px] font-bold uppercase tracking-wide text-zinc-200 ring-1 ring-zinc-600/50 transition hover:bg-zinc-700 sm:min-h-8 sm:text-[11px]"
+                              >
+                                Fechar
+                              </button>
+                            </div>
+                          </div>
+                          <div className="min-h-0 flex-1 overflow-y-auto">
+                            {mixerSideEditor === "microphone" ? (
+                              <AudioInMicInputDetailPanel
+                                embedded
+                                audioInDetailScope="microphone"
+                                settings={settings}
+                                setSettings={setSettings}
+                                selectedInputId={selectedInputId}
+                                setSelectedInputId={setSelectedInputId}
+                                selectedSecondaryInputId={
+                                  selectedSecondaryInputId
+                                }
+                                setSelectedSecondaryInputId={
+                                  setSelectedSecondaryInputId
+                                }
+                                audioInputs={audioInputs}
+                                busy={busy}
+                                micTesting={micTesting}
+                                outputTesting={outputTesting}
+                                meterSampleRate={meterSampleRate}
+                                selectClass={selectClass}
+                                btnSky={btnSky}
+                                setSettingsField={setSettingsField}
+                                testMicrophone={testMicrophone}
+                              />
+                            ) : (
+                              <AudioInLineInputDetailPanel
+                                embedded
+                                audioInDetailScope="systemAudio"
+                                settings={settings}
+                                setSettings={setSettings}
+                                selectedInputId={selectedInputId}
+                                selectedSecondaryInputId={
+                                  selectedSecondaryInputId
+                                }
+                                setSelectedSecondaryInputId={
+                                  setSelectedSecondaryInputId
+                                }
+                                audioInputs={audioInputs}
+                                busy={busy}
+                                selectClass={selectClass}
+                                previewVuLevel={lineVu}
+                              />
                             )}
-                          </option>
-                        ))}
-                      </select>
-                      <div className="mt-2 space-y-1 rounded-md border border-zinc-700/40 bg-zinc-950/35 px-2.5 py-2">
-                        <p className="mb-1 text-[8px] font-bold uppercase tracking-[0.16em] text-zinc-500">
-                          Configurações · números
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="divide-y divide-zinc-600/35">
+                    <div className="flex flex-wrap items-center gap-2 border-b border-zinc-600/35 bg-zinc-950/60 px-3 py-2 sm:px-4">
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => {
+                          setAudioInLayoutMode("mixer");
+                          setAudioInDetailScope("both");
+                          setMixerSideEditor(null);
+                        }}
+                        className="panel-bezel inline-flex min-h-9 items-center justify-center rounded-md bg-zinc-800 px-3 font-mono text-[10px] font-bold uppercase tracking-wide text-zinc-200 ring-1 ring-zinc-600/50 transition hover:bg-zinc-700 sm:min-h-8 sm:text-[11px]"
+                      >
+                        Voltar à mesa
+                      </button>
+                    </div>
+                    <div className="border-b border-zinc-600/35 bg-zinc-900/60 px-3 py-2 sm:px-4">
+                      <p className="text-[10px] font-bold uppercase tracking-[0.22em] text-zinc-200">
+                        Canais de entrada
+                      </p>
+                      {audioInDetailScope === "both" ? (
+                        <p className="mt-0.5 text-[10px] text-zinc-400">
+                          Cada separador é um canal de entrada. Os tempos e o
+                          medidor do VU estão no canal 1 (microfone). Os canais
+                          ativos são misturados antes do STT e do envio ao
+                          serviço.
                         </p>
-                        <div className="flex flex-wrap justify-between gap-x-2 gap-y-0.5 text-[9px]">
-                          <span className="text-zinc-500">Sensibilidade</span>
-                          <span className="tabular-nums text-zinc-300">
-                            {settings.inputSensitivity}%
-                          </span>
-                        </div>
-                        <div className="flex flex-wrap justify-between gap-x-2 gap-y-0.5 text-[9px]">
-                          <span className="text-zinc-500">Bloco (ms)</span>
-                          <span className="tabular-nums text-zinc-300">
-                            {settings.audioChunkMs}
-                          </span>
-                        </div>
-                        <div className="flex flex-wrap justify-between gap-x-2 gap-y-0.5 text-[9px]">
-                          <span className="text-zinc-500">Atraso texto (ms)</span>
-                          <span className="tabular-nums text-zinc-300">
-                            {settings.transcriptionStartDelayMs}
-                          </span>
-                        </div>
-                        <div className="flex flex-wrap justify-between gap-x-2 gap-y-0.5 text-[9px]">
-                          <span className="text-zinc-500">Corte visor (ms)</span>
-                          <span className="tabular-nums text-zinc-300">
-                            {settings.phraseSilenceCutMs}
-                          </span>
-                        </div>
-                        <div className="flex flex-wrap justify-between gap-x-2 gap-y-0.5 text-[9px]">
-                          <span className="text-zinc-500">Taxa de amostragem</span>
-                          <span className="tabular-nums text-zinc-300">
-                            {meterSampleRate > 0
-                              ? `${meterSampleRate} Hz`
-                              : "—"}
-                          </span>
-                        </div>
-                      </div>
-                      <div className="mt-3 flex flex-wrap gap-2 sm:gap-1.5">
-                        <button
-                          type="button"
-                          disabled={busy}
-                          onClick={() => void refreshMediaDevices()}
-                          className={btnSecondary}
-                        >
-                          Atualizar
-                        </button>
-                        <button
-                          type="button"
-                          disabled={busy}
-                          onClick={() => void unlockMediaLabels()}
-                          className={btnSecondary}
-                        >
-                          Nomes
-                        </button>
-                        <button
-                          type="button"
-                          disabled={busy}
-                          onClick={() => void testMicrophone()}
-                          className={btnSky}
-                        >
-                          {micTesting ? "…" : "Testar mic"}
-                        </button>
-                      </div>
-                    </section>
-
-                    <section className="bg-zinc-900/50 p-3 sm:p-4">
-                      <p className="mb-2 text-[10px] font-bold uppercase tracking-[0.18em] text-violet-300">
-                        Captura · medidor e tempo
+                      ) : audioInDetailScope === "microphone" ? (
+                        <p className="mt-0.5 text-[10px] text-zinc-400">
+                          Definições só do microfone (canal 1): dispositivo, nível
+                          na mesa, VU, tempos de captura e teste do mic.
+                        </p>
+                      ) : (
+                        <p className="mt-0.5 text-[10px] text-zinc-400">
+                          Definições da entrada adicional (canal 2): dispositivo,
+                          medidor em tempo real e nível na mesa. Tempos de bloco
+                          seguem o canal 1.
+                        </p>
+                      )}
+                      <p className="mt-2 text-[9px] leading-snug text-zinc-500">
+                        Os nomes vêm do navegador e podem diferir do sistema. O
+                        sufixo após “·” identifica o dispositivo na Web.
                       </p>
-                      <p className="mb-3 text-[9px] leading-snug text-zinc-500">
-                        Sensibilidade do VU, blocos ao serviço e corte do texto
-                        no visor. Valores salvos automaticamente.
-                      </p>
-                      <div className="space-y-4">
-                        <div className="space-y-2">
-                          <div className="flex items-end justify-between gap-2">
-                            <label
-                              htmlFor="entrada-input-sensitivity"
-                              className="text-[9px] uppercase tracking-wider text-zinc-500"
-                            >
-                              Sensibilidade de entrada (%)
-                            </label>
-                            <span className="tabular-nums text-[10px] text-zinc-400">
-                              {settings.inputSensitivity}%
-                            </span>
-                          </div>
-                          <input
-                            id="entrada-input-sensitivity"
-                            type="range"
-                            min={INPUT_SENS_MIN}
-                            max={INPUT_SENS_MAX}
-                            step={5}
-                            disabled={micTesting || outputTesting}
-                            value={settings.inputSensitivity}
-                            onChange={(e) =>
-                              setSettingsField(
-                                "inputSensitivity",
-                                e.target.value
-                              )
-                            }
-                            className="echo-range h-6 w-full cursor-pointer"
-                            style={
-                              {
-                                "--range-progress": timingRangeProgress(
-                                  settings.inputSensitivity,
-                                  INPUT_SENS_MIN,
-                                  INPUT_SENS_MAX
-                                ),
-                              } as CSSProperties
-                            }
-                          />
-                          <p className="text-[9px] leading-snug text-zinc-600">
-                            Ganho do medidor de microfone (100% = padrão).
-                          </p>
-                        </div>
-                        <div className="space-y-2">
-                          <div className="flex items-end justify-between gap-2">
-                            <label
-                              htmlFor="entrada-chunk-ms"
-                              className="text-[9px] uppercase tracking-wider text-zinc-500"
-                            >
-                              Tempo de entrada (ms)
-                            </label>
-                            <span className="tabular-nums text-[10px] text-zinc-400">
-                              {settings.audioChunkMs} ms
-                            </span>
-                          </div>
-                          <input
-                            id="entrada-chunk-ms"
-                            type="range"
-                            min={CHUNK_MS_MIN}
-                            max={CHUNK_MS_MAX}
-                            step={10}
-                            disabled={micTesting || outputTesting}
-                            value={settings.audioChunkMs}
-                            onChange={(e) =>
-                              setSettingsField("audioChunkMs", e.target.value)
-                            }
-                            className="echo-range h-6 w-full cursor-pointer"
-                            style={
-                              {
-                                "--range-progress": timingRangeProgress(
-                                  settings.audioChunkMs,
-                                  CHUNK_MS_MIN,
-                                  CHUNK_MS_MAX
-                                ),
-                              } as CSSProperties
-                            }
-                          />
-                          <p className="text-[9px] leading-snug text-zinc-600">
-                            Duração de cada bloco enviado ao serviço. Vale na
-                            próxima captura ou ao reiniciar.
-                          </p>
-                        </div>
-                        <div className="space-y-2">
-                          <div className="flex items-end justify-between gap-2">
-                            <label
-                              htmlFor="entrada-stt-delay-ms"
-                              className="text-[9px] uppercase tracking-wider text-zinc-500"
-                            >
-                              Atraso início texto (ms)
-                            </label>
-                            <span className="tabular-nums text-[10px] text-zinc-400">
-                              {settings.transcriptionStartDelayMs} ms
-                            </span>
-                          </div>
-                          <input
-                            id="entrada-stt-delay-ms"
-                            type="range"
-                            min={0}
-                            max={CUT_MS_MAX}
-                            step={50}
-                            disabled={micTesting || outputTesting}
-                            value={settings.transcriptionStartDelayMs}
-                            onChange={(e) =>
-                              setSettingsField(
-                                "transcriptionStartDelayMs",
-                                e.target.value
-                              )
-                            }
-                            className="echo-range h-6 w-full cursor-pointer"
-                            style={
-                              {
-                                "--range-progress": timingRangeProgress(
-                                  settings.transcriptionStartDelayMs,
-                                  0,
-                                  CUT_MS_MAX
-                                ),
-                              } as CSSProperties
-                            }
-                          />
-                          <p className="text-[9px] leading-snug text-zinc-600">
-                            Espera antes de ligar o reconhecimento de voz após
-                            iniciar a captura.
-                          </p>
-                        </div>
-                        <div className="space-y-2">
-                          <div className="flex items-end justify-between gap-2">
-                            <label
-                              htmlFor="entrada-cut-ms"
-                              className="text-[9px] uppercase tracking-wider text-zinc-500"
-                            >
-                              Corte em tempo real (ms)
-                            </label>
-                            <span className="tabular-nums text-[10px] text-zinc-400">
-                              {settings.phraseSilenceCutMs} ms
-                            </span>
-                          </div>
-                          <input
-                            id="entrada-cut-ms"
-                            type="range"
-                            min={0}
-                            max={CUT_MS_MAX}
-                            step={50}
-                            disabled={micTesting || outputTesting}
-                            value={settings.phraseSilenceCutMs}
-                            onChange={(e) =>
-                              setSettingsField(
-                                "phraseSilenceCutMs",
-                                e.target.value
-                              )
-                            }
-                            className="echo-range h-6 w-full cursor-pointer"
-                            style={
-                              {
-                                "--range-progress": timingRangeProgress(
-                                  settings.phraseSilenceCutMs,
-                                  0,
-                                  CUT_MS_MAX
-                                ),
-                              } as CSSProperties
-                            }
-                          />
-                          <p className="text-[9px] leading-snug text-zinc-600">
-                            Silêncio após texto provisório para fechar linha no
-                            log. Pode ajustar com a captura ligada.
-                          </p>
-                        </div>
-                        <dl className="border-t border-zinc-700/40 pt-3">
-                          <div className="flex justify-between gap-2 text-[10px] text-zinc-400">
-                            <dt>Taxa de amostragem</dt>
-                            <dd className="tabular-nums text-zinc-300">
-                              {meterSampleRate > 0
-                                ? `${meterSampleRate} Hz`
-                                : "—"}
-                            </dd>
-                          </div>
-                        </dl>
+                    </div>
+                    <div className="flex flex-wrap gap-2 border-b border-zinc-600/35 bg-zinc-900/40 px-3 py-2 sm:px-4">
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => void refreshMediaDevices()}
+                        className={btnSecondary}
+                      >
+                        Atualizar
+                      </button>
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => void unlockMediaLabels()}
+                        className={btnSecondary}
+                      >
+                        Nomes
+                      </button>
+                    </div>
+                  {audioInDetailScope === "both" ? (
+                    <div
+                      className="border-b border-zinc-600/35 bg-zinc-950/30 px-3 py-2 sm:px-4"
+                      role="tablist"
+                      aria-label="Canais de entrada"
+                    >
+                      <div className="flex flex-wrap gap-1">
+                        <button
+                          type="button"
+                          role="tab"
+                          aria-selected={audioInChannelTab === "microphone"}
+                          id="audio-in-tab-mic"
+                          className={`panel-bezel rounded-md px-3 py-2 text-left text-[10px] font-bold uppercase tracking-[0.12em] transition sm:text-[11px] ${
+                            audioInChannelTab === "microphone"
+                              ? "bg-zinc-800 text-amber-400 ring-1 ring-amber-600/35"
+                              : "text-zinc-500 ring-1 ring-transparent hover:bg-zinc-800/50 hover:text-zinc-300"
+                          }`}
+                          onClick={() => setAudioInChannelTab("microphone")}
+                        >
+                          Canal 1 · microfone
+                        </button>
+                        <button
+                          type="button"
+                          role="tab"
+                          aria-selected={audioInChannelTab === "systemAudio"}
+                          id="audio-in-tab-audio"
+                          className={`panel-bezel rounded-md px-3 py-2 text-left text-[10px] font-bold uppercase tracking-[0.12em] transition sm:text-[11px] ${
+                            audioInChannelTab === "systemAudio"
+                              ? "bg-zinc-800 text-amber-400 ring-1 ring-amber-600/35"
+                              : "text-zinc-500 ring-1 ring-transparent hover:bg-zinc-800/50 hover:text-zinc-300"
+                          }`}
+                          onClick={() => setAudioInChannelTab("systemAudio")}
+                        >
+                          Canal 2 · áudio
+                        </button>
                       </div>
-                    </section>
+                    </div>
+                  ) : null}
+                  <div className="grid grid-cols-1 gap-0 divide-y divide-zinc-600/35">
+                    {audioInActivePanel === "microphone" ? (
+                      <AudioInMicInputDetailPanel
+                        embedded={false}
+                        audioInDetailScope={audioInDetailScope}
+                        settings={settings}
+                        setSettings={setSettings}
+                        selectedInputId={selectedInputId}
+                        setSelectedInputId={setSelectedInputId}
+                        selectedSecondaryInputId={selectedSecondaryInputId}
+                        setSelectedSecondaryInputId={setSelectedSecondaryInputId}
+                        audioInputs={audioInputs}
+                        busy={busy}
+                        micTesting={micTesting}
+                        outputTesting={outputTesting}
+                        meterSampleRate={meterSampleRate}
+                        selectClass={selectClass}
+                        btnSky={btnSky}
+                        setSettingsField={setSettingsField}
+                        testMicrophone={testMicrophone}
+                      />
+                    ) : (
+                      <AudioInLineInputDetailPanel
+                        embedded={false}
+                        audioInDetailScope={audioInDetailScope}
+                        settings={settings}
+                        setSettings={setSettings}
+                        selectedInputId={selectedInputId}
+                        selectedSecondaryInputId={selectedSecondaryInputId}
+                        setSelectedSecondaryInputId={setSelectedSecondaryInputId}
+                        audioInputs={audioInputs}
+                        busy={busy}
+                        selectClass={selectClass}
+                        previewVuLevel={lineVu}
+                      />
+                    )}
                   </div>
                 </div>
+                )
               ) : sidebarSection === "audioOut" ? (
                 <div className="divide-y divide-zinc-600/35">
                   <div className="border-b border-zinc-600/35 bg-zinc-900/60 px-3 py-2 sm:px-4">
@@ -2017,8 +3114,10 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                             <select
                               id="eleven-voice-out"
                               className={selectClass}
-                              disabled={busy}
-                              value={settings.selectedElevenLabsVoiceId}
+                              disabled={
+                                busy || elevenLabsVoiceSelectOptions.length === 0
+                              }
+                              value={elevenLabsVoiceSelectUiValue}
                               onChange={(e) => {
                                 const v = e.target.value;
                                 setSettings((prev) => {
@@ -2033,9 +3132,6 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                                 });
                               }}
                             >
-                              <option value="">
-                                Padrão do serviço (env / arranque)
-                              </option>
                               {elevenLabsVoiceSelectOptions.map((o) => (
                                 <option key={o.value} value={o.value}>
                                   {o.label}
@@ -2044,8 +3140,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                             </select>
                             <p className="mt-1.5 text-[9px] leading-snug text-zinc-500">
                               Lista vinda da API ElevenLabs com a voz em inglês
-                              ativa; senão, opções de reserva. Valor vazio usa o
-                              ID definido no serviço.
+                              ativa; senão, opções de reserva.
                             </p>
                           </>
                         )}
@@ -2145,7 +3240,13 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                             ? pipelineMonitorEnabled
                               ? "Ativo no fluxo atual"
                               : "Desligado"
-                            : "Ligue a captura para ouvir"}
+                            : pipelineMonitorEnabled
+                              ? !selectedOutputId.trim()
+                                ? "Escolha saída de áudio (fones)"
+                                : pipelineBranchLive
+                                  ? "Ativo sem captura"
+                                  : "Ative um canal na mesa de entrada"
+                              : "Desligado"}
                         </span>
                       </div>
                       <div>
@@ -2161,7 +3262,9 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                           type="range"
                           min={1}
                           max={100}
-                          disabled={!running || busy}
+                          disabled={
+                            micTesting || outputTesting || captureStarting
+                          }
                           value={Math.round(pipelineMonitorGain * 100)}
                           onChange={(e) => {
                             const pct = Number(e.target.value);
@@ -2202,7 +3305,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                         Monitoramento
                       </p>
                       <p className="mt-1 text-[10px] leading-snug text-zinc-400">
-                        Etapas · medidores · log · ajustes finos nos menus Entrada
+                        Etapas · medidores · chat · ajustes finos nos menus Entrada
                         e Saída
                         {settings.speechLanguagesEnabled &&
                         settings.speechReceiveLanguage !==
@@ -2219,19 +3322,39 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                         ) : null}
                       </p>
                     </div>
-                    <button
-                      type="button"
-                      disabled={busy}
-                      onClick={() => {
-                        setTranscriptLines([]);
-                        transcriptLineIdRef.current = 0;
-                        setInterimTranscript("");
-                        bumpPipelineUtterance();
-                      }}
-                      className="shrink-0 text-[11px] uppercase tracking-wide text-zinc-400 transition hover:text-amber-400 disabled:opacity-45"
-                    >
-                      Limpar log
-                    </button>
+                    <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+                      {!chatPanelExpanded ? (
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() => setChatPanelExpanded(true)}
+                          className="shrink-0 text-[11px] uppercase tracking-wide text-zinc-400 transition hover:text-emerald-400 disabled:opacity-45"
+                        >
+                          Expandir chat
+                        </button>
+                      ) : null}
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => {
+                          setTranscriptLines([]);
+                          transcriptLineIdRef.current = 0;
+                          setInterimTranscript("");
+                          bumpPipelineUtterance();
+                          const sid = captureChatSessionIdRef.current;
+                          if (sid && running) {
+                            void putEchoLinkChatSessionSnapshot(sid, {
+                              messages: [],
+                              interimPt: null,
+                              ended: false,
+                            });
+                          }
+                        }}
+                        className="shrink-0 text-[11px] uppercase tracking-wide text-zinc-400 transition hover:text-amber-400 disabled:opacity-45"
+                      >
+                        Limpar chat
+                      </button>
+                    </div>
                   </div>
 
                   <div className="flex min-h-[min(52vh,28rem)] min-w-0 flex-1 flex-col gap-5 lg:flex-row lg:items-stretch lg:gap-6">
@@ -2452,17 +3575,46 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                         </div>
                       </div>
 
-                      <div className="flex min-h-0 min-w-0 flex-1 flex-col pb-2">
+                      <div
+                        className={
+                          chatPanelExpanded
+                            ? "fixed inset-0 z-[100] flex min-h-0 min-w-0 flex-col bg-zinc-950/97 p-3 shadow-[0_0_0_1px_rgba(63,63,70,0.45)] sm:p-5"
+                            : "flex min-h-0 min-w-0 flex-1 flex-col pb-2"
+                        }
+                      >
+                        {chatPanelExpanded ? (
+                          <div className="mb-2 flex shrink-0 items-center justify-between gap-2 border-b border-zinc-700/45 pb-2">
+                            <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-zinc-400">
+                              Chat expandido
+                            </p>
+                            <button
+                              type="button"
+                              onClick={() => setChatPanelExpanded(false)}
+                              className="shrink-0 rounded-md border border-zinc-600/60 bg-zinc-800/90 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-zinc-200 transition hover:border-emerald-700/55 hover:text-emerald-200"
+                            >
+                              Reduzir
+                            </button>
+                          </div>
+                        ) : null}
                         <p className="mb-3 text-[9px] font-bold uppercase tracking-[0.2em] text-zinc-500">
-                          Log · fala → texto
+                          Chat · fala → texto
+                          {captureChatSessionId ? (
+                            <span className="ml-2 font-mono text-[8px] font-normal normal-case tracking-normal text-zinc-600">
+                              · ficheiro: files/cache/chats/{captureChatSessionId}.json
+                            </span>
+                          ) : null}
                         </p>
                         <div
-                          ref={logScrollRef}
-                          className="panel-bezel min-h-48 flex-1 space-y-2 overflow-y-auto rounded-md bg-[#0c1412] px-4 py-3 text-[12px] leading-relaxed text-emerald-300 shadow-[inset_0_0_20px_rgba(0,0,0,0.45)] ring-1 ring-zinc-600/45 sm:px-4 sm:py-3.5 sm:text-[13px] lg:min-h-[min(32vh,20rem)]"
+                          ref={chatScrollRef}
+                          className={
+                            chatPanelExpanded
+                              ? "panel-bezel flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto rounded-md bg-[#0c1412] px-3 py-3 text-[12px] leading-relaxed shadow-[inset_0_0_20px_rgba(0,0,0,0.45)] ring-1 ring-zinc-600/45 sm:px-4 sm:py-3.5 sm:text-[13px]"
+                              : "panel-bezel flex min-h-48 flex-1 flex-col gap-3 overflow-y-auto rounded-md bg-[#0c1412] px-3 py-3 text-[12px] leading-relaxed shadow-[inset_0_0_20px_rgba(0,0,0,0.45)] ring-1 ring-zinc-600/45 sm:px-4 sm:py-3.5 sm:text-[13px] lg:min-h-[min(32vh,20rem)]"
+                          }
                         >
                           {!settings.speechLanguagesEnabled ? (
                             <p className="text-zinc-400">
-                              Ative idiomas em Entrada de áudio para enviar PCM ao
+                              Ative idiomas em Canais de entrada para enviar PCM ao
                               serviço Python (STT) e ver o texto aqui.
                             </p>
                           ) : running && serviceSttFailed ? (
@@ -2491,110 +3643,128 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                                   Pronto — inicie a captura e fale.
                                 </p>
                               ) : null}
-                              {transcriptLines.map((line) => (
-                                <div
-                                  key={line.id}
-                                  className="space-y-1.5 border-b border-zinc-800/50 pb-2 last:border-b-0 last:pb-0"
-                                >
-                                  <p className="text-[13px] leading-snug text-emerald-300/95 sm:text-[14px]">
-                                    <span className="text-emerald-500/90">▌ </span>
-                                    {line.pt}
-                                  </p>
-                                  {line.en ? (
-                                    <div className="space-y-1">
-                                      <div className="flex flex-wrap items-start gap-2 sm:gap-3">
-                                        <p className="min-w-0 flex-1 text-[13px] leading-snug text-sky-300/95 sm:text-[14px]">
-                                          <span className="text-sky-500/85">◇ </span>
-                                          {line.en}
-                                        </p>
-                                        {line.translationAudio ? (
-                                          <button
-                                            type="button"
-                                            aria-label="Ouvir tradução em inglês novamente"
-                                            onClick={() => {
-                                              const b = line.translationAudio;
-                                              if (!b) {
-                                                return;
-                                              }
-                                              const jk = line.journalKey;
-                                              setTranscriptLines((prev) =>
-                                                prev.map((l) => {
-                                                  if (l.id !== line.id) {
-                                                    return l;
+                              {transcriptLines.map((line) => {
+                                const side = line.chatSpeaker === "other" ? "other" : "self";
+                                const bubble =
+                                  side === "self"
+                                    ? "bg-emerald-950/80 ring-emerald-800/45"
+                                    : "bg-zinc-800/85 ring-zinc-600/45";
+                                return (
+                                  <div
+                                    key={line.id}
+                                    className={`flex w-full ${side === "self" ? "justify-end" : "justify-start"}`}
+                                  >
+                                    <div
+                                      className={`max-w-[min(88%,26rem)] space-y-1.5 rounded-2xl px-3 py-2.5 ring-1 ${bubble}`}
+                                    >
+                                      <p className="text-[13px] leading-snug text-emerald-200/95 sm:text-[14px]">
+                                        <span className="text-emerald-500/90">▌ </span>
+                                        {line.pt}
+                                      </p>
+                                      {line.en ? (
+                                        <div className="space-y-1">
+                                          <div className="flex flex-wrap items-start gap-2 sm:gap-3">
+                                            <p className="min-w-0 flex-1 text-[13px] leading-snug text-sky-300/95 sm:text-[14px]">
+                                              <span className="text-sky-500/85">◇ </span>
+                                              {line.en}
+                                            </p>
+                                            {line.translationAudio ? (
+                                              <button
+                                                type="button"
+                                                aria-label="Ouvir tradução em inglês novamente"
+                                                onClick={() => {
+                                                  const b = line.translationAudio;
+                                                  if (!b) {
+                                                    return;
                                                   }
-                                                  const next = (l.replayCount ?? 0) + 1;
-                                                  if (l.voiceId) {
-                                                    void patchTranscriptJournalSelected(
-                                                      jk,
-                                                      next,
-                                                      l.voiceId
-                                                    );
-                                                  }
-                                                  return { ...l, replayCount: next };
-                                                })
-                                              );
-                                              queueTranslationReplay(b);
-                                            }}
-                                            className="shrink-0 rounded-md border border-sky-800/60 bg-sky-950/40 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wide text-sky-200/95 transition hover:border-sky-600/70 hover:bg-sky-900/45"
-                                          >
-                                            Ouvir de novo
-                                          </button>
-                                        ) : null}
-                                      </div>
-                                      {line.translationOrigin ? (
-                                        <p className="text-[9px] font-medium uppercase tracking-wider text-zinc-500">
-                                          {line.translationOrigin === "cache" ? (
-                                            <span className="rounded border border-amber-900/55 bg-amber-950/35 px-1.5 py-0.5 text-amber-200/90">
-                                              Áudio · cache local
-                                            </span>
-                                          ) : (
-                                            <span className="rounded border border-emerald-900/50 bg-emerald-950/30 px-1.5 py-0.5 text-emerald-200/90">
-                                              Áudio · API
-                                            </span>
-                                          )}
-                                        </p>
-                                      ) : null}
-                                      {line.journalDate ? (
-                                        <div className="mt-2 flex flex-wrap gap-2">
-                                          <button
-                                            type="button"
-                                            aria-label="Copiar registo completo em JSON"
-                                            onClick={() =>
-                                              void copyJournalPayloadJson(line)
-                                            }
-                                            className="shrink-0 rounded-md border border-zinc-600/60 bg-zinc-800/80 px-2.5 py-1 font-mono text-[9px] font-semibold uppercase tracking-wide text-zinc-200 transition hover:border-zinc-500 hover:bg-zinc-700/80"
-                                          >
-                                            Copiar JSON
-                                          </button>
-                                          <button
-                                            type="button"
-                                            aria-label="Copiar frase em português e tradução, sem Base64"
-                                            onClick={() =>
-                                              void copyJournalPlainTexts(line)
-                                            }
-                                            className="shrink-0 rounded-md border border-zinc-600/60 bg-zinc-800/80 px-2.5 py-1 font-mono text-[9px] font-semibold uppercase tracking-wide text-zinc-200 transition hover:border-zinc-500 hover:bg-zinc-700/80"
-                                          >
-                                            Copiar textos
-                                          </button>
+                                                  const jk = line.journalKey;
+                                                  setTranscriptLines((prev) =>
+                                                    prev.map((l) => {
+                                                      if (l.id !== line.id) {
+                                                        return l;
+                                                      }
+                                                      const next =
+                                                        (l.replayCount ?? 0) + 1;
+                                                      if (l.voiceId) {
+                                                        void patchTranscriptJournalSelected(
+                                                          jk,
+                                                          next,
+                                                          l.voiceId
+                                                        );
+                                                      }
+                                                      return { ...l, replayCount: next };
+                                                    })
+                                                  );
+                                                  queueTranslationReplay(b);
+                                                }}
+                                                className="shrink-0 rounded-md border border-sky-800/60 bg-sky-950/40 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wide text-sky-200/95 transition hover:border-sky-600/70 hover:bg-sky-900/45"
+                                              >
+                                                Ouvir de novo
+                                              </button>
+                                            ) : null}
+                                          </div>
+                                          {line.translationOrigin ? (
+                                            <p className="text-[9px] font-medium uppercase tracking-wider text-zinc-500">
+                                              {line.translationOrigin === "cache" ? (
+                                                <span className="rounded border border-amber-900/55 bg-amber-950/35 px-1.5 py-0.5 text-amber-200/90">
+                                                  Áudio · cache local
+                                                </span>
+                                              ) : (
+                                                <span className="rounded border border-emerald-900/50 bg-emerald-950/30 px-1.5 py-0.5 text-emerald-200/90">
+                                                  Áudio · API
+                                                </span>
+                                              )}
+                                            </p>
+                                          ) : null}
+                                          {line.journalDate ? (
+                                            <div className="mt-2 flex flex-wrap gap-2">
+                                              <button
+                                                type="button"
+                                                aria-label="Copiar registo completo em JSON"
+                                                onClick={() =>
+                                                  void copyJournalPayloadJson(line)
+                                                }
+                                                className="shrink-0 rounded-md border border-zinc-600/60 bg-zinc-800/80 px-2.5 py-1 font-mono text-[9px] font-semibold uppercase tracking-wide text-zinc-200 transition hover:border-zinc-500 hover:bg-zinc-700/80"
+                                              >
+                                                Copiar JSON
+                                              </button>
+                                              <button
+                                                type="button"
+                                                aria-label="Copiar frase em português e tradução, sem Base64"
+                                                onClick={() =>
+                                                  void copyJournalPlainTexts(line)
+                                                }
+                                                className="shrink-0 rounded-md border border-zinc-600/60 bg-zinc-800/80 px-2.5 py-1 font-mono text-[9px] font-semibold uppercase tracking-wide text-zinc-200 transition hover:border-zinc-500 hover:bg-zinc-700/80"
+                                              >
+                                                Copiar textos
+                                              </button>
+                                            </div>
+                                          ) : null}
                                         </div>
+                                      ) : voiceTranslationEnabled ? (
+                                        <p className="text-[10px] text-zinc-500">
+                                          A traduzir…
+                                        </p>
                                       ) : null}
                                     </div>
-                                  ) : voiceTranslationEnabled ? (
-                                    <p className="text-[10px] text-zinc-500">
-                                      A traduzir…
-                                    </p>
-                                  ) : null}
-                                </div>
-                              ))}
+                                  </div>
+                                );
+                              })}
                               {interimTranscript ? (
-                                <p className="text-amber-300">{interimTranscript}</p>
+                                <div className="flex w-full justify-end">
+                                  <div className="max-w-[min(88%,26rem)] rounded-2xl border border-amber-800/45 bg-amber-950/35 px-3 py-2 text-[13px] leading-snug text-amber-200/95 sm:text-[14px]">
+                                    {interimTranscript}
+                                  </div>
+                                </div>
                               ) : null}
                             </>
                           )}
                         </div>
                         <p className="mt-4 shrink-0 leading-snug text-[10px] uppercase tracking-wider text-zinc-400 sm:mt-5 sm:text-[11px]">
-                          Texto via echoLinkService (WS /ws/stt · Transcribe ou Vosk) ·
-                          o painel só envia PCM
+                          Chat: STT via echoLinkService (WS /ws/stt) · a sua fala à
+                          direita; outras mensagens à esquerda. Cada início de
+                          captura cria um JSON em files/cache/chats/ com cópia do
+                          conteúdo.
                         </p>
                       </div>
                     </div>
@@ -2776,6 +3946,191 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                                 </li>
                               ))}
                             </ul>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ) : sidebarSection === "chats" ? (
+                <div className="flex min-h-0 flex-1 flex-col px-3 py-3 sm:px-4 sm:py-4">
+                  <div className="mb-4 flex shrink-0 flex-wrap items-end justify-between gap-3 border-b border-zinc-600/35 pb-3">
+                    <div className="min-w-0">
+                      <p className="text-[10px] font-bold uppercase tracking-[0.22em] text-zinc-200">
+                        Históricos
+                      </p>
+                      <p className="mt-1 text-[10px] leading-snug text-zinc-400">
+                        Sessões em{" "}
+                        <span className="font-mono text-[9px] text-zinc-500">
+                          files/cache/chats/*.json
+                        </span>{" "}
+                        no echoLinkService.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setChatHistorySelectedId(null);
+                        void (async () => {
+                          setChatHistoryLoading(true);
+                          const list = await fetchEchoLinkChatSessions();
+                          setChatHistoryItems(list);
+                          setChatHistoryLoading(false);
+                        })();
+                      }}
+                      className={`${btnSecondary} shrink-0 flex-none`}
+                    >
+                      Atualizar
+                    </button>
+                  </div>
+                  {chatHistoryLoading && chatHistoryItems.length === 0 ? (
+                    <p className="text-[10px] text-zinc-500">A carregar…</p>
+                  ) : chatHistoryItems.length === 0 ? (
+                    <p className="text-[10px] leading-relaxed text-zinc-500">
+                      Ainda não há sessões no histórico. Inicie a captura no
+                      monitoramento para criar um ficheiro por sessão.
+                    </p>
+                  ) : (
+                    <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-3 overflow-hidden lg:flex-row lg:gap-4">
+                      <aside className="flex max-h-48 shrink-0 flex-col gap-1 overflow-hidden lg:max-h-none lg:w-56 lg:border-r lg:border-zinc-700/40 lg:pr-3">
+                        <p className="mb-1 text-[8px] font-bold uppercase tracking-[0.16em] text-zinc-500">
+                          Sessões
+                        </p>
+                        <div className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto">
+                          {chatHistoryItems.map((row) => {
+                            const active = chatHistorySelectedId === row.sessionId;
+                            return (
+                              <button
+                                key={row.sessionId}
+                                type="button"
+                                onClick={() =>
+                                  setChatHistorySelectedId(row.sessionId)
+                                }
+                                className={`rounded-md border px-2.5 py-2 text-left text-[10px] leading-snug transition lg:w-full ${
+                                  active
+                                    ? "border-emerald-600/70 bg-emerald-950/40 text-emerald-200"
+                                    : "border-zinc-700/55 bg-zinc-900/60 text-zinc-300 hover:border-zinc-600"
+                                }`}
+                              >
+                                <span className="block font-mono text-[9px] text-zinc-400">
+                                  {row.fileName}
+                                </span>
+                                <span className="mt-0.5 block text-zinc-500">
+                                  {row.messageCount}{" "}
+                                  {row.messageCount === 1
+                                    ? "mensagem"
+                                    : "mensagens"}
+                                </span>
+                                {row.startedAt ? (
+                                  <span className="mt-0.5 block text-[9px] text-zinc-600">
+                                    {row.startedAt}
+                                  </span>
+                                ) : null}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </aside>
+                      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+                        {!chatHistorySelectedId ? (
+                          <p className="text-[10px] text-zinc-500">
+                            Selecione uma sessão à esquerda.
+                          </p>
+                        ) : chatHistoryDetailLoading ? (
+                          <p className="text-[10px] text-zinc-500">
+                            A carregar sessão…
+                          </p>
+                        ) : !chatHistoryDetail ? (
+                          <p className="text-[10px] text-zinc-500">
+                            Não foi possível ler esta sessão.
+                          </p>
+                        ) : (
+                          <>
+                            <div className="mb-2 flex shrink-0 flex-wrap items-center justify-between gap-2">
+                              <p className="text-[9px] uppercase tracking-wider text-zinc-500">
+                                {chatHistoryDetail.sessionId ?? chatHistorySelectedId}{" "}
+                                {chatHistoryDetail.endedAt
+                                  ? "· encerrada"
+                                  : "· sem data de fim no ficheiro"}
+                              </p>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  void navigator.clipboard.writeText(
+                                    JSON.stringify(
+                                      {
+                                        ...chatHistoryDetail,
+                                        messages: chatHistoryDetail.messages,
+                                      },
+                                      null,
+                                      2
+                                    )
+                                  );
+                                }}
+                                className={`${btnSecondary} shrink-0`}
+                              >
+                                Copiar JSON
+                              </button>
+                            </div>
+                            {chatHistoryDetail.interimPt ? (
+                              <p className="mb-2 shrink-0 rounded-md border border-amber-900/40 bg-amber-950/25 px-2 py-1.5 text-[10px] text-amber-200/90">
+                                <span className="font-semibold text-amber-500/90">
+                                  Provisório:{" "}
+                                </span>
+                                {chatHistoryDetail.interimPt}
+                              </p>
+                            ) : null}
+                            <div className="min-h-0 flex-1 space-y-2 overflow-y-auto rounded-md border border-zinc-800/60 bg-[#0c1412] p-3">
+                              {chatHistoryDetail.messages.length === 0 ? (
+                                <p className="text-[10px] text-zinc-500">
+                                  Sem mensagens neste ficheiro.
+                                </p>
+                              ) : (
+                                chatHistoryDetail.messages.map((m, idx) => {
+                                  const pt =
+                                    typeof m.pt === "string" ? m.pt : "";
+                                  const en =
+                                    typeof m.en === "string" ? m.en : "";
+                                  const speaker =
+                                    m.chatSpeaker === "other"
+                                      ? "other"
+                                      : "self";
+                                  const bubble =
+                                    speaker === "self"
+                                      ? "bg-emerald-950/75 ring-emerald-800/40"
+                                      : "bg-zinc-800/80 ring-zinc-600/45";
+                                  const key =
+                                    typeof m.id === "number"
+                                      ? `m-${m.id}`
+                                      : `m-${idx}`;
+                                  return (
+                                    <div
+                                      key={key}
+                                      className={`flex w-full ${speaker === "self" ? "justify-end" : "justify-start"}`}
+                                    >
+                                      <div
+                                        className={`max-w-[min(92%,24rem)] space-y-1 rounded-xl px-2.5 py-2 ring-1 ${bubble}`}
+                                      >
+                                        <p className="text-[12px] leading-snug text-emerald-200/95">
+                                          <span className="text-emerald-500/85">
+                                            ▌{" "}
+                                          </span>
+                                          {pt || "—"}
+                                        </p>
+                                        {en ? (
+                                          <p className="text-[12px] leading-snug text-sky-300/95">
+                                            <span className="text-sky-500/85">
+                                              ◇{" "}
+                                            </span>
+                                            {en}
+                                          </p>
+                                        ) : null}
+                                      </div>
+                                    </div>
+                                  );
+                                })
+                              )}
+                            </div>
                           </>
                         )}
                       </div>
