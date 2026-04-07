@@ -1,15 +1,17 @@
 import { applyMaxChannelWebAudioNodes } from "./echoLinkMultiChannelAudio";
 import {
   echoLinkServiceOriginForDisplay,
-  openEchoLinkServiceWebSocket,
+  getEchoLinkSttWebSocketUrl,
 } from "./echoLinkLocalTransport";
 
 export { getEchoLinkSttWebSocketUrl } from "./echoLinkLocalTransport";
 
 const TARGET_RATE = 16000;
 const STT_LOWPASS_HZ = 7200;
-const STT_INPUT_RMS_FLOOR = 0.01;
+const STT_INPUT_RMS_FLOOR = 0.0015;
 const STT_PEAK_CEILING = 0.88;
+const STT_INPUT_GAIN_MIN = 0.35;
+const STT_INPUT_GAIN_MAX = 8;
 
 export type ServiceSttClientEvent =
   | { kind: "partial"; text: string }
@@ -83,8 +85,14 @@ function floatToInt16(f: Float32Array): Int16Array {
 function attachPcmTap(
   audioContext: AudioContext,
   source: MediaStreamAudioSourceNode,
-  sendPcm: (data: Int16Array) => void
+  sendPcm: (data: Int16Array) => void,
+  inputSensitivityPercent?: number
 ): () => void {
+  const sens = inputSensitivityPercent ?? 100;
+  const gainLinear = Math.min(
+    STT_INPUT_GAIN_MAX,
+    Math.max(STT_INPUT_GAIN_MIN, sens / 100)
+  );
   const lowpass = audioContext.createBiquadFilter();
   lowpass.type = "lowpass";
   const nyquistIn = audioContext.sampleRate * 0.5;
@@ -108,7 +116,7 @@ function attachPcmTap(
         mono[i] += c[i] ?? 0;
       }
     }
-    const inv = 1 / n;
+    const inv = (1 / n) * gainLinear;
     for (let i = 0; i < len; i++) {
       mono[i] *= inv;
     }
@@ -142,12 +150,18 @@ function attachPcmTap(
   };
 }
 
+export type StartServiceSttSessionOptions = {
+  phraseSilenceCutMs?: number;
+  inputSensitivityPercent?: number;
+};
+
 export async function startServiceSttSession(
   audioContext: AudioContext,
   source: MediaStreamAudioSourceNode,
-  onClientEvent: (ev: ServiceSttClientEvent) => void
+  onClientEvent: (ev: ServiceSttClientEvent) => void,
+  options?: StartServiceSttSessionOptions
 ): Promise<() => void> {
-  const ws = openEchoLinkServiceWebSocket("/ws/stt");
+  const ws = new WebSocket(getEchoLinkSttWebSocketUrl(options?.phraseSilenceCutMs));
   ws.binaryType = "arraybuffer";
 
   await new Promise<void>((resolve, reject) => {
@@ -216,7 +230,12 @@ export async function startServiceSttSession(
       ws.send(data);
     }
   };
-  const detachTap = attachPcmTap(audioContext, source, sendPcm);
+  const detachTap = attachPcmTap(
+    audioContext,
+    source,
+    sendPcm,
+    options?.inputSensitivityPercent
+  );
 
   return () => {
     detachTap();

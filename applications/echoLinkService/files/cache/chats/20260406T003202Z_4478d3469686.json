@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "sessionId": "20260406T003202Z_4478d3469686",
+  "startedAt": "2026-04-06T00:32:02Z",
+  "endedAt": "2026-04-06T00:32:17Z",
+  "interimPt": null,
+  "messages": [
+    {
+      "id": 2,
+      "journalKey": "17d2cac7-cf2c-4e8d-82e8-a22f8bcf4cea",
+      "chatSpeaker": "self",
+      "pt": "Giet é muito.",
+      "en": "Giet is a lot.",
+      "translationOrigin": "cache"
+    }
+  ]
+}

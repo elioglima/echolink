@@ -1,8 +1,9 @@
 {
-  "selectedOutputDeviceId": "8d09e551a266492b65e70da8f61d54e45c5751786bad9348fbf1f1fdedad0371",
+  "selectedOutputDeviceId": "72c642c9698d32a29c3f4953e0b3bbe9568132fb1d46511dc50d4585426698de",
   "outputDeviceAliases": {},
+  "pipelineMasterOutputEnabled": true,
   "pipelineMonitorEnabled": true,
-  "pipelineMonitorGainPercent": 100,
+  "pipelineMonitorGainPercent": 58,
   "speechReceiveLanguage": "pt-BR",
   "speechTransformLanguage": "en-US",
   "speechLanguagesEnabled": true,

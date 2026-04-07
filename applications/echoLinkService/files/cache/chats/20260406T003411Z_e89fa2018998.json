@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "sessionId": "20260406T003411Z_e89fa2018998",
+  "startedAt": "2026-04-06T00:34:11Z",
+  "endedAt": "2026-04-06T00:35:21Z",
+  "interimPt": null,
+  "messages": [
+    {
+      "id": 2,
+      "journalKey": "200a69ed-df6d-4792-bfb1-ed0fde5132f5",
+      "chatSpeaker": "self",
+      "pt": "eh, eu vou ver se eu entrego aquela task por volta das 10h.",
+      "en": "Hey, I'm going to see if I deliver that task around 10 a.m.",
+      "translationOrigin": "cache"
+    }
+  ]
+}

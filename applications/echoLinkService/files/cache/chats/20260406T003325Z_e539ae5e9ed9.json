@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "sessionId": "20260406T003325Z_e539ae5e9ed9",
+  "startedAt": "2026-04-06T00:33:25Z",
+  "endedAt": "2026-04-06T00:33:48Z",
+  "interimPt": null,
+  "messages": [
+    {
+      "id": 2,
+      "journalKey": "a6a5d155-83b2-4206-8649-4e635b603549",
+      "chatSpeaker": "self",
+      "pt": "Hoje eu vou ver se eu termino aquela tarefa.",
+      "en": "Today I'm going to see if I finish that task.",
+      "translationOrigin": "cache"
+    }
+  ]
+}

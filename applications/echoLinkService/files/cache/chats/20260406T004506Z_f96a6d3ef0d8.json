@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "sessionId": "20260406T004506Z_f96a6d3ef0d8",
+  "startedAt": "2026-04-06T00:45:06Z",
+  "endedAt": "2026-04-06T00:46:50Z",
+  "interimPt": null,
+  "messages": [
+    {
+      "id": 2,
+      "journalKey": "f5596fda-a4da-48a5-a8c2-cf7e7824d182",
+      "chatSpeaker": "self",
+      "pt": "Você está fazendo um teste aí?",
+      "en": "Are you taking a test there?",
+      "translationOrigin": "cache"
+    },
+    {
+      "id": 4,
+      "journalKey": "c1f3c687-1f32-48d5-a9c2-4bb654365f88",
+      "chatSpeaker": "self",
+      "pt": "Claus.",
+      "en": "Claus.",
+      "translationOrigin": "cache"
+    },
+    {
+      "id": 6,
+      "journalKey": "5ac9bf0f-7204-4fcc-be3a-e808d93e88e4",
+      "chatSpeaker": "self",
+      "pt": "Lá está.",
+      "en": "There it is.",
+      "translationOrigin": "cache"
+    },
+    {
+      "id": 8,
+      "journalKey": "6842a968-ef67-4049-9592-fa0d0925d542",
+      "chatSpeaker": "self",
+      "pt": "é aqui pramar a.",
+      "en": "It's here to stop the.",
+      "translationOrigin": "cache"
+    },
+    {
+      "id": 10,
+      "journalKey": "a5343a04-1e4a-47db-ab69-415dfed161e4",
+      "chatSpeaker": "self",
+      "pt": "vai bem.",
+      "en": "It's going well.",
+      "translationOrigin": "cache"
+    },
+    {
+      "id": 12,
+      "journalKey": "6540c908-41ff-45b6-9868-04ca76266055",
+      "chatSpeaker": "self",
+      "pt": "on the on the days.",
+      "en": "On the on the days.",
+      "translationOrigin": "cache"
+    }
+  ]
+}

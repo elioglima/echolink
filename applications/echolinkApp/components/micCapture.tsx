@@ -29,7 +29,11 @@ import {
   mixCaptureAudioStreamsTriple,
   passThroughCaptureWithGain,
 } from "../lib/mixCaptureAudioStreams";
-import { postEchoLinkRuntimeCapture } from "../lib/echoLinkRuntimeClient";
+import {
+  fetchEchoLinkRuntimeSnapshot,
+  postEchoLinkRuntimeCapture,
+  type EchoLinkRuntimeSnapshot,
+} from "../lib/echoLinkRuntimeClient";
 import {
   postEchoLinkChatSession,
   putEchoLinkChatSessionSnapshot,
@@ -63,12 +67,17 @@ import {
 } from "../lib/elevenLabsVoiceDisplay";
 import { formatMediaDeviceOptionLabel } from "../lib/mediaDeviceOptionLabel";
 import { isSubstantivePhraseForJournal } from "../lib/substantivePhraseForJournal";
-import { sttFinalTextPassesQualityGate } from "../lib/sttTranscriptQuality";
+import {
+  sttFinalTextPassesQualityGate,
+  sttPartialWorthSending,
+} from "../lib/sttTranscriptQuality";
 import { timingRangeProgress } from "../lib/timingRangeProgress";
 import {
   applyMaxChannelWebAudioNodes,
   withIdealMultiChannelCapture,
 } from "../lib/echoLinkMultiChannelAudio";
+import { findEchoLinkVirtualOutputDeviceId } from "../lib/echoLinkOutputDevices";
+import { playTestBeepOnSink } from "../lib/playTestBeepOnSink";
 import { safeCloseAudioContext } from "../lib/safeCloseAudioContext";
 import {
   subscribeEchoLinkChatAppend,
@@ -98,6 +107,16 @@ import {
   AudioInMediaInputDetailPanel,
   AudioInMicInputDetailPanel,
 } from "./audioInChannelInputPanels";
+import {
+  MixerConsoleInputChannel,
+} from "./mixerConsoleInputChannel";
+import { MixerConsoleMonitorChannel } from "./mixerConsoleMonitorChannel";
+import { MixerConsoleOutputChannel } from "./mixerConsoleOutputChannel";
+import {
+  MIXER_STRIP_DND_TYPE,
+  moveMixerStripInOrder,
+  type MixerStripDnDProps,
+} from "./mixerConsoleShared";
 
 const RX_DECAY = 0.91;
 const RX_SPIKE = 0.42;
@@ -120,24 +139,27 @@ function createByteDomainBuffer(size: number): AnalyserByteDomainBuffer {
   return new Uint8Array(new ArrayBuffer(size)) as AnalyserByteDomainBuffer;
 }
 
-const RMS_METER_NOISE_FLOOR = 0.018;
+const RMS_METER_NOISE_FLOOR = 0.004;
 
 function mapRmsToMeterLevel(
   rms: number,
   inputSensitivityPercent: number
 ): number {
   const sensRatio = Math.max(0, inputSensitivityPercent / 100);
-  const adaptiveFloor =
-    RMS_METER_NOISE_FLOOR +
-    Math.min(0.058, Math.max(0, sensRatio - 1) * 0.0026);
+  const extraFloorWhenLowSens = Math.min(
+    0.028,
+    Math.max(0, 1 - sensRatio) * 0.035
+  );
+  const adaptiveFloor = RMS_METER_NOISE_FLOOR + extraFloorWhenLowSens;
   const gated = Math.max(0, rms - adaptiveFloor);
   if (gated <= 0) {
     return 0;
   }
-  const linearGain = 3.6 * Math.max(sensRatio, 0.01);
-  const gain = Math.min(linearGain, 26);
-  const x = Math.min(1, gated * gain);
-  return 1 - Math.exp(-2.85 * x);
+  const preBoost = 1.35 + Math.min(18, Math.max(0, sensRatio - 1)) * 0.04;
+  const linearGain = 6.5 * Math.max(sensRatio, 0.01);
+  const gain = Math.min(linearGain, 72);
+  const x = Math.min(1, gated * preBoost * gain);
+  return 1 - Math.exp(-5.1 * x);
 }
 
 function smoothVuLevel(prev: number, instant: number): number {
@@ -180,7 +202,10 @@ type SidebarSection = EchoLinkSidebarSection;
 
 type AudioInChannelTab = "microphone" | "systemAudio" | "media";
 
-type MixerSideEditorTab = AudioInChannelTab | "output";
+type MixerSideEditorTab =
+  | AudioInChannelTab
+  | "outputMaster"
+  | "outputMonitor";
 
 type AudioInLayoutMode = "mixer" | "detail";
 
@@ -190,627 +215,33 @@ type CaptureGainControlsRef =
   | {
       mode: "single";
       setPrimaryLinear: (n: number) => void;
+      setPrimaryRouteMaster: (on: boolean) => void;
+      setPrimaryRouteMonitor: (on: boolean) => void;
+      setPrimaryExcludeFromProgramBus: (on: boolean) => void;
     }
   | {
       mode: "dual";
       setPrimaryLinear: (n: number) => void;
       setSecondaryLinear: (n: number) => void;
+      setPrimaryRouteMaster: (on: boolean) => void;
+      setPrimaryRouteMonitor: (on: boolean) => void;
+      setSecondaryRouteMaster: (on: boolean) => void;
+      setSecondaryRouteMonitor: (on: boolean) => void;
+      setPrimaryExcludeFromProgramBus: (on: boolean) => void;
     }
   | {
       mode: "triple";
       setPrimaryLinear: (n: number) => void;
       setSecondaryLinear: (n: number) => void;
       setTertiaryLinear: (n: number) => void;
+      setPrimaryRouteMaster: (on: boolean) => void;
+      setPrimaryRouteMonitor: (on: boolean) => void;
+      setSecondaryRouteMaster: (on: boolean) => void;
+      setSecondaryRouteMonitor: (on: boolean) => void;
+      setTertiaryRouteMaster: (on: boolean) => void;
+      setTertiaryRouteMonitor: (on: boolean) => void;
+      setPrimaryExcludeFromProgramBus: (on: boolean) => void;
     };
-
-const MIX_FADER_MAX = 150;
-
-function formatMixFaderDbLabel(percent: number): string {
-  if (percent <= 0) return "−∞";
-  const db = 20 * Math.log10(percent / 100);
-  if (db > 9) return "+10";
-  if (db >= -0.35 && db <= 0.35) return "0";
-  const rounded = Math.round(db);
-  return rounded >= 0 ? `+${rounded}` : `${rounded}`;
-}
-
-const MIXER_TOOLBAR_ICON_CLASS =
-  "pointer-events-none mx-auto block h-8 w-8 shrink-0 sm:h-10 sm:w-10";
-
-function IconMixerPower({ className }: { className?: string }) {
-  return (
-    <svg
-      className={className}
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden
-    >
-      <path d="M12 2v10" />
-      <path d="M18.36 6.64a9 9 0 1 1-12.73 0" />
-    </svg>
-  );
-}
-
-function IconMixerSettings({ className }: { className?: string }) {
-  return (
-    <svg
-      className={className}
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden
-    >
-      <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" />
-      <circle cx="12" cy="12" r="3" />
-    </svg>
-  );
-}
-
-function IconMixerVolumeOn({ className }: { className?: string }) {
-  return (
-    <svg
-      className={className}
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden
-    >
-      <path d="M11 5L6 9H2v6h4l5 4V5z" />
-      <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
-      <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
-    </svg>
-  );
-}
-
-function IconMixerVolumeMuted({ className }: { className?: string }) {
-  return (
-    <svg
-      className={className}
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden
-    >
-      <path d="M11 5L6 9H2v6h4l5 4V5z" />
-      <line x1="22" x2="16" y1="9" y2="15" />
-      <line x1="16" x2="22" y1="9" y2="15" />
-    </svg>
-  );
-}
-
-function MixerFaderDbScale({
-  level,
-  className = "",
-}: {
-  level: number;
-  className?: string;
-}) {
-  const pct = Math.min(100, Math.max(0, level * 100));
-  const labelClass =
-    "relative z-10 text-right font-mono text-[10px] font-medium leading-none text-zinc-200 drop-shadow-[0_1px_2px_rgba(0,0,0,1)] sm:text-[11px]";
-  return (
-    <div
-      className={`relative h-full min-h-0 overflow-hidden bg-black ${className}`}
-      role="meter"
-      aria-valuenow={Math.round(pct)}
-      aria-valuemin={0}
-      aria-valuemax={100}
-      aria-label="Nível de áudio na escala em dB"
-    >
-      <div
-        className="pointer-events-none absolute bottom-0 left-0 right-0 opacity-[0.92] transition-[height] duration-75 ease-out bg-linear-to-t from-emerald-600/80 via-amber-400/65 to-red-500/55"
-        style={{ height: `${pct}%` }}
-        aria-hidden
-      />
-      <div
-        className="pointer-events-none absolute inset-0 z-1 opacity-35"
-        style={{
-          backgroundImage:
-            "repeating-linear-gradient(to top, transparent 0px, transparent 5px, rgba(0,0,0,0.45) 5px, rgba(0,0,0,0.45) 6px)",
-        }}
-        aria-hidden
-      />
-      <div className="relative z-2 flex h-full flex-col justify-between">
-        <span className={labelClass}>+10</span>
-        <span className={labelClass}>0</span>
-        <span className={labelClass}>−10</span>
-        <span className={labelClass}>−20</span>
-        <span className={labelClass}>−30</span>
-        <span className={labelClass}>−40</span>
-        <span className={labelClass}>−60</span>
-        <span
-          className={`${labelClass} text-[9px] text-zinc-400 sm:text-[10px]`}
-        >
-          −∞
-        </span>
-      </div>
-    </div>
-  );
-}
-
-function mixerChannelStripBorderColorClass(
-  role: "input" | "output",
-  activateOn: boolean,
-  muted: boolean,
-  faderDisabled?: boolean
-): string {
-  const pathOff = !activateOn || Boolean(faderDisabled);
-  if (pathOff) {
-    return "border-amber-400";
-  }
-  if (muted) {
-    return "border-red-500";
-  }
-  if (role === "output") {
-    return "border-blue-500";
-  }
-  return "border-emerald-500";
-}
-
-function mixerChannelStripBadgeToneClassName(
-  role: "input" | "output",
-  activateOn: boolean,
-  muted: boolean,
-  faderDisabled?: boolean
-): string {
-  const pathOff = !activateOn || Boolean(faderDisabled);
-  if (pathOff) {
-    return "bg-amber-400 text-black";
-  }
-  if (muted) {
-    return "bg-red-600 text-white";
-  }
-  if (role === "output") {
-    return "bg-sky-500 text-black";
-  }
-  return "bg-emerald-500 text-black";
-}
-
-const MIXER_STRIP_DND_TYPE = "application/x-echolink-mixer-strip";
-
-function moveMixerStripInOrder(
-  order: EchoLinkMixerStripId[],
-  fromId: EchoLinkMixerStripId,
-  toId: EchoLinkMixerStripId
-): EchoLinkMixerStripId[] {
-  if (fromId === toId) {
-    return order;
-  }
-  const next = order.filter((x) => x !== fromId);
-  const i = next.indexOf(toId);
-  if (i < 0) {
-    return order;
-  }
-  next.splice(i, 0, fromId);
-  return next;
-}
-
-function MixerStripTopDragHandle({
-  stripId,
-  draggingStripId,
-  onDragStart,
-  onDragEnd,
-}: {
-  stripId: EchoLinkMixerStripId;
-  draggingStripId: EchoLinkMixerStripId | null;
-  onDragStart: (id: EchoLinkMixerStripId) => void;
-  onDragEnd: () => void;
-}) {
-  return (
-    <div
-      className="mb-1.5 flex shrink-0 cursor-grab justify-center px-1 pt-0.5 active:cursor-grabbing"
-      draggable
-      onDragStart={(e) => {
-        e.dataTransfer.setData(MIXER_STRIP_DND_TYPE, stripId);
-        e.dataTransfer.effectAllowed = "move";
-        onDragStart(stripId);
-      }}
-      onDragEnd={onDragEnd}
-      title="Arrastar para reordenar as faixas"
-      aria-label="Arrastar para reordenar as faixas do mixer"
-    >
-      <div
-        className={`h-0.5 w-10 shrink-0 rounded-full sm:w-12 ${
-          draggingStripId === stripId ? "bg-zinc-400" : "bg-zinc-500/75"
-        }`}
-      />
-    </div>
-  );
-}
-
-type MixerStripDnDProps = {
-  mixerStripId: EchoLinkMixerStripId;
-  stripStackIndex: number;
-  draggingMixerStripId: EchoLinkMixerStripId | null;
-  onMixerStripDragStart: (id: EchoLinkMixerStripId) => void;
-  onMixerStripDragEnd: () => void;
-  onMixerStripDragOver: (e: DragEvent<HTMLDivElement>) => void;
-  onMixerStripDrop: (
-    e: DragEvent<HTMLDivElement>,
-    targetId: EchoLinkMixerStripId
-  ) => void;
-};
-
-type MixerConsoleInputChannelProps = {
-  channelId: 1 | 2 | 3;
-  activateOn: boolean;
-  onActivateToggle: () => void;
-  onEdit: () => void;
-  muted: boolean;
-  onMuteToggle: () => void;
-  deviceLabel: string;
-  vuLevel: number;
-  faderValue: number;
-  onFaderChange: (v: number) => void;
-  faderDisabled: boolean;
-  busy: boolean;
-} & MixerStripDnDProps;
-
-function MixerConsoleInputChannel({
-  channelId,
-  activateOn,
-  onActivateToggle,
-  onEdit,
-  muted,
-  onMuteToggle,
-  deviceLabel,
-  vuLevel,
-  faderValue,
-  onFaderChange,
-  faderDisabled,
-  busy,
-  mixerStripId,
-  stripStackIndex,
-  draggingMixerStripId,
-  onMixerStripDragStart,
-  onMixerStripDragEnd,
-  onMixerStripDragOver,
-  onMixerStripDrop,
-}: MixerConsoleInputChannelProps) {
-  const mixerIconHit =
-    "inline-flex w-full min-h-11 items-center justify-center rounded-md border-0 bg-transparent py-1.5 outline-none focus-visible:outline-none focus-visible:ring-0 disabled:cursor-not-allowed disabled:opacity-35 sm:min-h-12 sm:py-2";
-  const vuLevelShown =
-    activateOn && !muted && !faderDisabled ? vuLevel : 0;
-  const stripDim =
-    !activateOn ? "opacity-40" : muted ? "opacity-55" : "";
-  const faderZoneMutedVisual =
-    faderDisabled && activateOn ? "opacity-[0.55]" : "";
-  const chRole =
-    channelId === 1
-      ? "microfone"
-      : channelId === 2
-        ? "entrada teams"
-        : "entrada mídia";
-  const faderDomId = `echo-mixer-fader-ch${channelId}`;
-  const faderAria =
-    channelId === 1
-      ? "Ganho do microfone na mistura"
-      : channelId === 2
-        ? "Ganho da entrada Teams na mistura"
-        : "Ganho da entrada mídia na mistura";
-  const mixerFaderTitle =
-    channelId === 1 ? "Microfone" : channelId === 2 ? "Teams" : "MÍDIA";
-  return (
-    <div
-      className={`relative isolate box-border flex min-h-0 w-[11.5rem] shrink-0 flex-col overflow-hidden border-l-2 border-solid bg-linear-to-b from-zinc-800/30 via-zinc-950 to-[#050506] px-2.5 pb-0 pt-2 sm:w-[13.25rem] sm:px-3 ${mixerChannelStripBorderColorClass("input", activateOn, muted, faderDisabled)} ${draggingMixerStripId === mixerStripId ? "opacity-50" : ""}`}
-      style={{ zIndex: stripStackIndex + 1 }}
-      onDragOver={onMixerStripDragOver}
-      onDrop={(e) => onMixerStripDrop(e, mixerStripId)}
-    >
-      <MixerStripTopDragHandle
-        stripId={mixerStripId}
-        draggingStripId={draggingMixerStripId}
-        onDragStart={onMixerStripDragStart}
-        onDragEnd={onMixerStripDragEnd}
-      />
-      <p className="mb-1.5 shrink-0 border-0 bg-transparent px-2 text-center font-mono text-[10px] font-bold uppercase tracking-[0.2em] text-zinc-500 shadow-none ring-0 outline-none sm:text-[11px] sm:tracking-[0.22em]">
-        ENTRADA
-      </p>
-      <div className="mb-1.5 flex min-w-0 shrink-0 flex-col gap-2">
-        <button
-          type="button"
-          disabled={busy}
-          onClick={onActivateToggle}
-          title={activateOn ? "Desativar canal" : "Ativar canal"}
-          aria-label={
-            activateOn
-              ? `Desativar canal de ${chRole}`
-              : `Ativar canal de ${chRole}`
-          }
-          className={`${mixerIconHit} ${
-            activateOn
-              ? "text-emerald-400 drop-shadow-[0_0_14px_rgba(52,211,153,0.45)]"
-              : "text-zinc-100"
-          }`}
-        >
-          <IconMixerPower className={MIXER_TOOLBAR_ICON_CLASS} />
-        </button>
-        <button
-          type="button"
-          disabled={busy || !activateOn}
-          onClick={onEdit}
-          title="Editar dispositivo e tempos"
-          aria-label={`Editar definições do canal de ${chRole}`}
-          className={`${mixerIconHit} ${
-            activateOn ? "text-sky-400" : "text-zinc-600"
-          }`}
-        >
-          <IconMixerSettings className={MIXER_TOOLBAR_ICON_CLASS} />
-        </button>
-        <button
-          type="button"
-          disabled={busy || !activateOn}
-          onClick={onMuteToggle}
-          title={
-            muted && activateOn ? "Restaurar som do canal" : "Silenciar canal"
-          }
-          aria-label={
-            muted && activateOn
-              ? `Restaurar som do canal de ${chRole}`
-              : `Silenciar canal de ${chRole}`
-          }
-          className={`${mixerIconHit} ${
-            muted && activateOn
-              ? "text-red-500 drop-shadow-[0_0_12px_rgba(239,68,68,0.55)]"
-              : "text-zinc-500"
-          }`}
-        >
-          {muted && activateOn ? (
-            <IconMixerVolumeMuted className={MIXER_TOOLBAR_ICON_CLASS} />
-          ) : (
-            <IconMixerVolumeOn className={MIXER_TOOLBAR_ICON_CLASS} />
-          )}
-        </button>
-      </div>
-      <p className="mb-1 line-clamp-2 min-h-8 shrink-0 text-center text-[8px] leading-snug text-zinc-400 sm:text-[9px]">
-        {deviceLabel}
-      </p>
-      <div
-        className={`flex min-h-0 flex-1 flex-col bg-black pb-2 ${stripDim}`}
-      >
-        <div
-          className={`flex min-h-[11rem] min-w-0 flex-1 items-stretch gap-1.5 sm:min-h-[12rem] ${faderZoneMutedVisual}`}
-        >
-          <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-black">
-            <div className="echo-mixer-fader-slot relative isolate min-h-0 min-w-[5.25rem] flex-1 overflow-hidden bg-black sm:min-w-[6rem]">
-              <div
-                className="pointer-events-none absolute inset-0 z-0 shadow-[inset_0_0_20px_rgba(0,0,0,1)]"
-                aria-hidden
-              />
-              <input
-                id={faderDomId}
-                name={`echoMixerFaderCh${channelId}`}
-                type="range"
-                min={0}
-                max={MIX_FADER_MAX}
-                step={1}
-                disabled={busy}
-                value={faderValue}
-                onChange={(e) =>
-                  onFaderChange(Number.parseInt(e.target.value, 10))
-                }
-                className="echo-mixer-fader-input echo-console-fader"
-                aria-label={faderAria}
-              />
-            </div>
-          </div>
-          <div className="echo-mixer-fader-meter-column flex h-full min-h-0 shrink-0 flex-col">
-            <MixerFaderDbScale
-              level={vuLevelShown}
-              className="min-h-0 w-9 flex-1 sm:w-10"
-            />
-          </div>
-        </div>
-        <div className="pt-1 text-center font-mono text-[8px] tabular-nums text-zinc-500 sm:text-[9px]">
-          {formatMixFaderDbLabel(faderValue)} · {faderValue}%
-        </div>
-        <div className="border-t border-zinc-800/50 pt-1.5 text-center font-mono text-xs font-semibold tabular-nums text-zinc-100">
-          {channelId}
-        </div>
-      </div>
-      <div className="shrink-0 border-t border-white/10 pb-2 pt-2">
-        <p
-          className={`shrink-0 rounded-md px-2 py-1 text-center font-mono text-[12px] font-bold uppercase tracking-[0.2em] sm:text-[13px] sm:tracking-[0.22em] ${mixerChannelStripBadgeToneClassName("input", activateOn, muted, faderDisabled)}`}
-        >
-          {mixerFaderTitle}
-        </p>
-      </div>
-    </div>
-  );
-}
-
-type MixerConsoleOutputChannelProps = {
-  activateOn: boolean;
-  onActivateToggle: () => void;
-  onEdit: () => void;
-  muted: boolean;
-  onMuteToggle: () => void;
-  deviceLabel: string;
-  vuLevel: number;
-  faderValue: number;
-  onFaderChange: (v: number) => void;
-  faderDisabled: boolean;
-  busy: boolean;
-  activateDisabled: boolean;
-} & MixerStripDnDProps;
-
-function MixerConsoleOutputChannel({
-  activateOn,
-  onActivateToggle,
-  onEdit,
-  muted,
-  onMuteToggle,
-  deviceLabel,
-  vuLevel,
-  faderValue,
-  onFaderChange,
-  faderDisabled,
-  busy,
-  activateDisabled,
-  mixerStripId,
-  stripStackIndex,
-  draggingMixerStripId,
-  onMixerStripDragStart,
-  onMixerStripDragEnd,
-  onMixerStripDragOver,
-  onMixerStripDrop,
-}: MixerConsoleOutputChannelProps) {
-  const mixerIconHit =
-    "inline-flex w-full min-h-11 items-center justify-center rounded-md border-0 bg-transparent py-1.5 outline-none focus-visible:outline-none focus-visible:ring-0 disabled:cursor-not-allowed disabled:opacity-35 sm:min-h-12 sm:py-2";
-  const vuLevelShown =
-    activateOn && !muted && !faderDisabled ? vuLevel : 0;
-  const stripDim =
-    !activateOn ? "opacity-40" : muted ? "opacity-55" : "";
-  const faderZoneMutedVisual =
-    faderDisabled && activateOn ? "opacity-[0.55]" : "";
-  const faderDomId = "echo-mixer-fader-output";
-  return (
-    <div
-      className={`relative isolate box-border flex min-h-0 w-[11.5rem] shrink-0 flex-col overflow-hidden border-l-2 border-solid bg-linear-to-b from-zinc-800/30 via-zinc-950 to-[#050506] px-2.5 pb-0 pt-2 sm:w-[13.25rem] sm:px-3 ${mixerChannelStripBorderColorClass("output", activateOn, muted, faderDisabled)} ${draggingMixerStripId === mixerStripId ? "opacity-50" : ""}`}
-      style={{ zIndex: stripStackIndex + 1 }}
-      onDragOver={onMixerStripDragOver}
-      onDrop={(e) => onMixerStripDrop(e, mixerStripId)}
-    >
-      <MixerStripTopDragHandle
-        stripId={mixerStripId}
-        draggingStripId={draggingMixerStripId}
-        onDragStart={onMixerStripDragStart}
-        onDragEnd={onMixerStripDragEnd}
-      />
-      <p className="mb-1.5 shrink-0 border-0 bg-transparent px-2 text-center font-mono text-[10px] font-bold uppercase tracking-[0.2em] text-zinc-500 shadow-none ring-0 outline-none sm:text-[11px] sm:tracking-[0.22em]">
-        SAÍDA
-      </p>
-      <div className="mb-1.5 flex min-w-0 shrink-0 flex-col gap-2">
-        <button
-          type="button"
-          disabled={busy || activateDisabled}
-          onClick={onActivateToggle}
-          title={
-            activateOn
-              ? "Desativar monitor entrada → saída"
-              : "Ativar monitor entrada → saída"
-          }
-          aria-label={
-            activateOn
-              ? "Desativar monitor de saída (entrada para o dispositivo de áudio)"
-              : "Ativar monitor de saída (entrada para o dispositivo de áudio)"
-          }
-          className={`${mixerIconHit} ${
-            activateOn
-              ? "text-sky-400 drop-shadow-[0_0_14px_rgba(56,189,248,0.45)]"
-              : "text-zinc-100"
-          }`}
-        >
-          <IconMixerPower className={MIXER_TOOLBAR_ICON_CLASS} />
-        </button>
-        <button
-          type="button"
-          disabled={busy || !activateOn}
-          onClick={onEdit}
-          title="Editar saída de áudio"
-          aria-label="Editar definições de saída de áudio (dispositivo, monitor e tradução)"
-          className={`${mixerIconHit} ${
-            activateOn ? "text-sky-400" : "text-zinc-600"
-          }`}
-        >
-          <IconMixerSettings className={MIXER_TOOLBAR_ICON_CLASS} />
-        </button>
-        <button
-          type="button"
-          disabled={busy || !activateOn}
-          onClick={onMuteToggle}
-          title={
-            muted && activateOn
-              ? "Restaurar som na saída"
-              : "Silenciar saída do monitor"
-          }
-          aria-label={
-            muted && activateOn
-              ? "Restaurar som do monitor de saída"
-              : "Silenciar monitor de saída"
-          }
-          className={`${mixerIconHit} ${
-            muted && activateOn
-              ? "text-red-500 drop-shadow-[0_0_12px_rgba(239,68,68,0.55)]"
-              : "text-zinc-500"
-          }`}
-        >
-          {muted && activateOn ? (
-            <IconMixerVolumeMuted className={MIXER_TOOLBAR_ICON_CLASS} />
-          ) : (
-            <IconMixerVolumeOn className={MIXER_TOOLBAR_ICON_CLASS} />
-          )}
-        </button>
-      </div>
-      <p className="mb-1 line-clamp-2 min-h-8 shrink-0 text-center text-[8px] leading-snug text-zinc-400 sm:text-[9px]">
-        {deviceLabel}
-      </p>
-      <div
-        className={`flex min-h-0 flex-1 flex-col bg-black pb-2 ${stripDim}`}
-      >
-        <div
-          className={`flex min-h-[11rem] min-w-0 flex-1 items-stretch gap-1.5 sm:min-h-[12rem] ${faderZoneMutedVisual}`}
-        >
-          <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-black">
-            <div className="echo-mixer-fader-slot relative isolate min-h-0 min-w-[5.25rem] flex-1 overflow-hidden bg-black sm:min-w-[6rem]">
-              <div
-                className="pointer-events-none absolute inset-0 z-0 shadow-[inset_0_0_20px_rgba(0,0,0,1)]"
-                aria-hidden
-              />
-              <input
-                id={faderDomId}
-                name="echoMixerFaderOutput"
-                type="range"
-                min={0}
-                max={MIX_FADER_MAX}
-                step={1}
-                disabled={busy}
-                value={faderValue}
-                onChange={(e) =>
-                  onFaderChange(Number.parseInt(e.target.value, 10))
-                }
-                className="echo-mixer-fader-input echo-console-fader"
-                aria-label="Ganho da saída (monitor)"
-              />
-            </div>
-          </div>
-          <div className="echo-mixer-fader-meter-column flex h-full min-h-0 shrink-0 flex-col">
-            <MixerFaderDbScale
-              level={vuLevelShown}
-              className="min-h-0 w-9 flex-1 sm:w-10"
-            />
-          </div>
-        </div>
-        <div className="pt-1 text-center font-mono text-[8px] tabular-nums text-zinc-500 sm:text-[9px]">
-          {formatMixFaderDbLabel(faderValue)} · {faderValue}%
-        </div>
-        <div className="border-t border-zinc-800/50 pt-1.5 text-center font-mono text-xs font-semibold tabular-nums text-zinc-100">
-          4
-        </div>
-      </div>
-      <div className="shrink-0 border-t border-white/10 pb-2 pt-2">
-        <p
-          className={`shrink-0 rounded-md px-2 py-1 text-center font-mono text-[12px] font-bold uppercase tracking-[0.2em] sm:text-[13px] sm:tracking-[0.22em] ${mixerChannelStripBadgeToneClassName("output", activateOn, muted, faderDisabled)}`}
-        >
-          Master
-        </p>
-      </div>
-    </div>
-  );
-}
 
 type TranscriptLineEntry = {
   id: number;
@@ -862,61 +293,6 @@ function serializeChatLinesForService(
   });
 }
 
-function createTestBeepWavUrl(
-  frequencyHz: number,
-  durationSec: number,
-  sampleRate: number
-): string {
-  const numSamples = Math.floor(sampleRate * durationSec);
-  const dataBytes = numSamples * 2;
-  const buffer = new ArrayBuffer(44 + dataBytes);
-  const v = new DataView(buffer);
-  const w = (o: number, s: string) => {
-    for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i));
-  };
-  w(0, "RIFF");
-  v.setUint32(4, 36 + dataBytes, true);
-  w(8, "WAVE");
-  w(12, "fmt ");
-  v.setUint32(16, 16, true);
-  v.setUint16(20, 1, true);
-  v.setUint16(22, 1, true);
-  v.setUint32(24, sampleRate, true);
-  v.setUint32(28, sampleRate * 2, true);
-  v.setUint16(32, 2, true);
-  v.setUint16(34, 16, true);
-  w(36, "data");
-  v.setUint32(40, dataBytes, true);
-  let o = 44;
-  const amp = 7200;
-  for (let i = 0; i < numSamples; i++) {
-    const s = Math.sin((2 * Math.PI * frequencyHz * i) / sampleRate) * amp;
-    v.setInt16(o, s, true);
-    o += 2;
-  }
-  return URL.createObjectURL(new Blob([buffer], { type: "audio/wav" }));
-}
-
-async function playTestBeep(outputDeviceId: string): Promise<void> {
-  const sampleRate = 44100;
-  const durationSec = 0.35;
-  const url = createTestBeepWavUrl(440, durationSec, sampleRate);
-  try {
-    const audio = new Audio(url);
-    audio.volume = 0.45;
-    const media = audio as HTMLAudioElement & {
-      setSinkId?: (sinkId: string) => Promise<void>;
-    };
-    if (outputDeviceId.trim() && typeof media.setSinkId === "function") {
-      await media.setSinkId(outputDeviceId);
-    }
-    await audio.play();
-    await new Promise((r) => setTimeout(r, durationSec * 1000 + 120));
-  } finally {
-    URL.revokeObjectURL(url);
-  }
-}
-
 export type MicCaptureProps = {
   audioPipelineInject?: AudioPipelineInject;
 };
@@ -958,9 +334,6 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
   const lineVuSmoothRef = useRef(0);
   const mediaVuSmoothRef = useRef(0);
   const serviceSttCleanupRef = useRef<(() => void) | null>(null);
-  const phraseSilenceCutMsRef = useRef(
-    ECHO_LINK_SETTINGS_PLACEHOLDER.phraseSilenceCutMs
-  );
   const inputSensitivityRef = useRef(
     ECHO_LINK_SETTINGS_PLACEHOLDER.inputSensitivity
   );
@@ -969,8 +342,25 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
   );
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
   const handleSttFinalRef = useRef<(text: string) => void>(() => {});
-  const selectedOutputIdRef = useRef("");
+  const selectedMonitorOutputIdRef = useRef("");
   const voicePlayChainRef = useRef(Promise.resolve());
+  const translationTtsPlayedLineIdsRef = useRef<Set<number>>(new Set());
+  const lastSttFinalDedupRef = useRef<{ text: string; at: number } | null>(
+    null
+  );
+  const masterOutputEffectiveIdRef = useRef("");
+  const pipelineMasterOutputEnabledRef = useRef(
+    ECHO_LINK_SETTINGS_PLACEHOLDER.pipelineMasterOutputEnabled
+  );
+  const mixerOutputMuteRef = useRef(false);
+  const pipelineMonitorEnabledRef = useRef(false);
+  const mixerMonitorMuteRef = useRef(false);
+  const pipelinePlaybackOutputIdRef = useRef("");
+  const playMp3OnSinkWithMasterGateRef = useRef<
+    (arrayBuffer: ArrayBuffer, sinkId: string) => Promise<void>
+  >(async (arrayBuffer, sinkId) => {
+    await playMp3OnDeviceSink(arrayBuffer, sinkId);
+  });
 
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -996,14 +386,29 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
     useState<string>(
       () => ECHO_LINK_SETTINGS_PLACEHOLDER.selectedTertiaryInputDeviceId
     );
-  const [selectedOutputId, setSelectedOutputId] = useState<string>(
-    () => ECHO_LINK_SETTINGS_PLACEHOLDER.selectedOutputDeviceId
+  const [selectedMasterOutputId, setSelectedMasterOutputId] = useState<string>(
+    () => ECHO_LINK_SETTINGS_PLACEHOLDER.selectedMasterOutputDeviceId
+  );
+  const [selectedMonitorOutputId, setSelectedMonitorOutputId] = useState<string>(
+    () => ECHO_LINK_SETTINGS_PLACEHOLDER.selectedPipelineMonitorOutputDeviceId
   );
   const [micTesting, setMicTesting] = useState(false);
   const [outputTesting, setOutputTesting] = useState(false);
   const [transcriptLines, setTranscriptLines] = useState<TranscriptLineEntry[]>(
     []
   );
+  const lastSelfPhraseMonitor = useMemo(() => {
+    for (let i = transcriptLines.length - 1; i >= 0; i--) {
+      const line = transcriptLines[i];
+      if (line.chatSpeaker === "self" && line.pt.trim().length > 0) {
+        return {
+          pt: line.pt.trim(),
+          en: line.en?.trim(),
+        };
+      }
+    }
+    return null;
+  }, [transcriptLines]);
   const transcriptLinesRef = useRef<TranscriptLineEntry[]>([]);
   const transcriptLineIdRef = useRef(0);
   const captureChatSessionIdRef = useRef<string | null>(null);
@@ -1080,10 +485,16 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
       ? ECHO_LINK_SETTINGS_PLACEHOLDER.mixerOutputMuted
       : loadEchoLinkSettingsFromLocalStorage().mixerOutputMuted
   );
+  const [mixerMonitorMute, setMixerMonitorMute] = useState(() =>
+    typeof window === "undefined"
+      ? ECHO_LINK_SETTINGS_PLACEHOLDER.mixerMonitorMuted
+      : loadEchoLinkSettingsFromLocalStorage().mixerMonitorMuted
+  );
   const [draggingMixerStripId, setDraggingMixerStripId] =
     useState<EchoLinkMixerStripId | null>(null);
   const [mixerSideEditor, setMixerSideEditor] =
     useState<MixerSideEditorTab | null>(null);
+  const [micSpeechTabRequestSeq, setMicSpeechTabRequestSeq] = useState(0);
   const [vocabularyRows, setVocabularyRows] = useState<TranscriptJournalRow[]>(
     []
   );
@@ -1106,6 +517,10 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
     useState<EchoLinkChatSessionDetail | null>(null);
   const [chatHistoryDetailLoading, setChatHistoryDetailLoading] =
     useState(false);
+  const [pipelineMasterOutputEnabled, setPipelineMasterOutputEnabled] =
+    useState(
+      () => ECHO_LINK_SETTINGS_PLACEHOLDER.pipelineMasterOutputEnabled
+    );
   const [pipelineMonitorEnabled, setPipelineMonitorEnabled] = useState(
     () => ECHO_LINK_SETTINGS_PLACEHOLDER.pipelineMonitorEnabled
   );
@@ -1122,6 +537,18 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
       )
     )
   );
+  useEffect(() => {
+    pipelineMasterOutputEnabledRef.current = pipelineMasterOutputEnabled;
+  }, [pipelineMasterOutputEnabled]);
+  useEffect(() => {
+    mixerOutputMuteRef.current = mixerOutputMute;
+  }, [mixerOutputMute]);
+  useEffect(() => {
+    pipelineMonitorEnabledRef.current = pipelineMonitorEnabled;
+  }, [pipelineMonitorEnabled]);
+  useEffect(() => {
+    mixerMonitorMuteRef.current = mixerMonitorMute;
+  }, [mixerMonitorMute]);
   const [pipelineOutVu, setPipelineOutVu] = useState(0);
   const [voiceTranslationEnabled, setVoiceTranslationEnabled] = useState(
     () => ECHO_LINK_SETTINGS_PLACEHOLDER.voiceTranslationEnabled
@@ -1147,12 +574,23 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
   const [serviceChunksBaseline, setServiceChunksBaseline] = useState(0);
   const [pipelineUtteranceVersion, setPipelineUtteranceVersion] = useState(0);
   const [pipelineVisibleDoneCount, setPipelineVisibleDoneCount] = useState(0);
+  const [echoLinkRuntimeSnapshot, setEchoLinkRuntimeSnapshot] =
+    useState<EchoLinkRuntimeSnapshot | null>(null);
   const serviceChunksRef = useRef(0);
   const bumpPipelineUtteranceRef = useRef<() => void>(() => undefined);
 
   useEffect(() => {
     pipelineInjectRef.current = audioPipelineInject;
   }, [audioPipelineInject]);
+
+  useEffect(() => {
+    const tick = () => {
+      void fetchEchoLinkRuntimeSnapshot().then(setEchoLinkRuntimeSnapshot);
+    };
+    tick();
+    const id = window.setInterval(tick, 2500);
+    return () => window.clearInterval(id);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -1219,8 +657,10 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
     setSelectedInputId(s.selectedInputDeviceId);
     setSelectedSecondaryInputId(s.selectedSecondaryInputDeviceId);
     setSelectedTertiaryInputId(s.selectedTertiaryInputDeviceId);
-    setSelectedOutputId(s.selectedOutputDeviceId);
+    setSelectedMasterOutputId(s.selectedMasterOutputDeviceId);
+    setSelectedMonitorOutputId(s.selectedPipelineMonitorOutputDeviceId);
     setVoiceTranslationEnabled(s.voiceTranslationEnabled);
+    setPipelineMasterOutputEnabled(s.pipelineMasterOutputEnabled);
     setPipelineMonitorEnabled(s.pipelineMonitorEnabled);
     const g = Math.min(
       1,
@@ -1238,6 +678,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
     setMixerMute2(s.mixerChannel2Muted);
     setMixerMute3(s.mixerChannel3Muted);
     setMixerOutputMute(s.mixerOutputMuted);
+    setMixerMonitorMute(s.mixerMonitorMuted);
   }, []);
 
   useEffect(() => {
@@ -1261,10 +702,6 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
       }
     })();
   }, [applyUiFromEchoLinkSettings]);
-
-  useEffect(() => {
-    phraseSilenceCutMsRef.current = settings.phraseSilenceCutMs;
-  }, [settings.phraseSilenceCutMs]);
 
   useEffect(() => {
     inputSensitivityRef.current = settings.inputSensitivity;
@@ -1321,6 +758,34 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
     []
   );
 
+  const onMixerFaderChange1 = useCallback(
+    (v: number) => setMixerChannelMixGainPercent(1, v),
+    [setMixerChannelMixGainPercent]
+  );
+  const onMixerFaderChange2 = useCallback(
+    (v: number) => setMixerChannelMixGainPercent(2, v),
+    [setMixerChannelMixGainPercent]
+  );
+  const onMixerFaderChange3 = useCallback(
+    (v: number) => setMixerChannelMixGainPercent(3, v),
+    [setMixerChannelMixGainPercent]
+  );
+  const onMixerFaderChange4 = useCallback(
+    (v: number) => setMixerChannelMixGainPercent(4, v),
+    [setMixerChannelMixGainPercent]
+  );
+
+  const onMixerPipelineMonitorFaderChange = useCallback((v: number) => {
+    const rounded = Math.max(1, Math.min(100, v));
+    const gain = Math.max(0.01, rounded / 100);
+    setPipelineMonitorGain(gain);
+    setSettings((prev) => ({
+      ...prev,
+      pipelineMonitorGainPercent: rounded,
+    }));
+    saveEchoLinkSettingsToStorage({ pipelineMonitorGainPercent: rounded });
+  }, []);
+
   const handleMixerStripDragOver = useCallback(
     (e: DragEvent<HTMLDivElement>) => {
       e.preventDefault();
@@ -1345,7 +810,8 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
         raw !== "ch1" &&
         raw !== "ch2" &&
         raw !== "ch3" &&
-        raw !== "output"
+        raw !== "output" &&
+        raw !== "monitor"
       ) {
         setDraggingMixerStripId(null);
         return;
@@ -1408,13 +874,18 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
   }, [bumpPipelineUtterance]);
 
   useEffect(() => {
-    selectedOutputIdRef.current = selectedOutputId;
-  }, [selectedOutputId]);
+    selectedMonitorOutputIdRef.current = selectedMonitorOutputId;
+  }, [selectedMonitorOutputId]);
 
   const queueTranslationReplay = useCallback((audio: ArrayBuffer) => {
     const buf = audio.slice(0);
     voicePlayChainRef.current = voicePlayChainRef.current
-      .then(() => playMp3OnDeviceSink(buf, selectedOutputIdRef.current))
+      .then(() =>
+        playMp3OnSinkWithMasterGateRef.current(
+          buf,
+          selectedMonitorOutputIdRef.current
+        )
+      )
       .catch((e) => {
         setError(e instanceof Error ? e.message : "Reprodução da tradução falhou");
       });
@@ -1560,7 +1031,10 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
           r.journalKey === row.journalKey ? { ...r, selected: nextSel } : r
         );
       });
-      void playMp3OnDeviceSink(buf, selectedOutputIdRef.current);
+      void playMp3OnSinkWithMasterGateRef.current(
+        buf,
+        selectedMonitorOutputIdRef.current
+      );
     } catch {
       setError("Não foi possível reproduzir o áudio.");
     }
@@ -1588,6 +1062,9 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
     (lineId: number, pt: string, journalKey: string) => {
       voicePlayChainRef.current = voicePlayChainRef.current.then(async () => {
         try {
+          if (translationTtsPlayedLineIdsRef.current.has(lineId)) {
+            return;
+          }
           const sel = selectedElevenLabsVoiceIdRef.current.trim();
           const st = voiceTranslationBackendStatusRef.current;
           const srv = (st?.elevenLabsVoiceId ?? "").trim();
@@ -1598,6 +1075,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
               elevenLabsVoiceId: apiVoiceId,
               cacheVoiceId,
             });
+          translationTtsPlayedLineIdsRef.current.add(lineId);
           const audioCopy = audio.slice(0);
           const b64 = arrayBufferToBase64Mp3(audioCopy);
           const date = new Date().toISOString();
@@ -1647,8 +1125,12 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                 : line
             )
           );
-          await playMp3OnDeviceSink(audioCopy, selectedOutputIdRef.current);
+          await playMp3OnSinkWithMasterGateRef.current(
+            audioCopy,
+            selectedMonitorOutputIdRef.current
+          );
         } catch (e) {
+          translationTtsPlayedLineIdsRef.current.delete(lineId);
           setError(e instanceof Error ? e.message : "Tradução com voz falhou");
         }
       });
@@ -1662,17 +1144,26 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
         setInterimTranscript("");
         return;
       }
-      bumpPipelineUtteranceRef.current();
-      setInterimTranscript("");
-      const id = (transcriptLineIdRef.current += 1);
-      const journalKey = createTranscriptJournalKey();
-      setTranscriptLines((prev) => [
-        ...prev,
-        { id, journalKey, chatSpeaker: "self", pt: text },
-      ]);
-      if (voiceTranslationEnabled && text.trim()) {
-        runVoiceTranslationPlayback(id, text.trim(), journalKey);
+      const t = text.trim();
+      const now = Date.now();
+      const prev = lastSttFinalDedupRef.current;
+      if (prev && prev.text === t && now - prev.at < 2000) {
+        setInterimTranscript("");
+        return;
       }
+      lastSttFinalDedupRef.current = { text: t, at: now };
+      setInterimTranscript("");
+      setTranscriptLines((prev) => {
+        bumpPipelineUtteranceRef.current();
+        const id = (transcriptLineIdRef.current += 1);
+        const journalKey = createTranscriptJournalKey();
+        queueMicrotask(() => {
+          if (voiceTranslationEnabled && t) {
+            runVoiceTranslationPlayback(id, t, journalKey);
+          }
+        });
+        return [...prev, { id, journalKey, chatSpeaker: "self", pt: t }];
+      });
     };
   }, [voiceTranslationEnabled, runVoiceTranslationPlayback]);
 
@@ -1838,12 +1329,120 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
 
   useEffect(() => {
     if (
-      selectedOutputId &&
-      !audioOutputs.some((d) => d.deviceId === selectedOutputId)
+      selectedMonitorOutputId &&
+      !audioOutputs.some((d) => d.deviceId === selectedMonitorOutputId)
     ) {
-      setSelectedOutputId("");
+      setSelectedMonitorOutputId("");
     }
-  }, [audioOutputs, selectedOutputId]);
+  }, [audioOutputs, selectedMonitorOutputId]);
+
+  useEffect(() => {
+    if (
+      selectedMasterOutputId &&
+      !audioOutputs.some((d) => d.deviceId === selectedMasterOutputId)
+    ) {
+      setSelectedMasterOutputId("");
+    }
+  }, [audioOutputs, selectedMasterOutputId]);
+
+  const pipelinePlaybackOutputId = useMemo(() => {
+    const picked = selectedMonitorOutputId.trim();
+    if (picked) {
+      return picked;
+    }
+    const echo = findEchoLinkVirtualOutputDeviceId(audioOutputs);
+    return echo ?? "";
+  }, [audioOutputs, selectedMonitorOutputId]);
+
+  useEffect(() => {
+    pipelinePlaybackOutputIdRef.current = pipelinePlaybackOutputId;
+  }, [pipelinePlaybackOutputId]);
+
+  const pipelinePlaybackOutputLabel = useMemo(() => {
+    if (!pipelinePlaybackOutputId) {
+      return "";
+    }
+    const d = audioOutputs.find((x) => x.deviceId === pipelinePlaybackOutputId);
+    return d
+      ? formatMediaDeviceOptionLabel(
+          d,
+          "output",
+          settings.outputDeviceAliases[d.deviceId]
+        )
+      : "";
+  }, [
+    audioOutputs,
+    pipelinePlaybackOutputId,
+    settings.outputDeviceAliases,
+  ]);
+
+  const masterOutputEffectiveId = useMemo(() => {
+    const m = selectedMasterOutputId.trim();
+    if (m && audioOutputs.some((d) => d.deviceId === m)) {
+      return m;
+    }
+    return findEchoLinkVirtualOutputDeviceId(audioOutputs) ?? "";
+  }, [audioOutputs, selectedMasterOutputId]);
+
+  const masterOutputEffectiveLabel = useMemo(() => {
+    if (!masterOutputEffectiveId) {
+      return "";
+    }
+    const d = audioOutputs.find((x) => x.deviceId === masterOutputEffectiveId);
+    return d
+      ? formatMediaDeviceOptionLabel(
+          d,
+          "output",
+          settings.outputDeviceAliases[d.deviceId]
+        )
+      : "";
+  }, [
+    audioOutputs,
+    masterOutputEffectiveId,
+    settings.outputDeviceAliases,
+  ]);
+
+  useEffect(() => {
+    masterOutputEffectiveIdRef.current = masterOutputEffectiveId;
+  }, [masterOutputEffectiveId]);
+
+  useEffect(() => {
+    playMp3OnSinkWithMasterGateRef.current = async (
+      arrayBuffer: ArrayBuffer,
+      sinkId: string
+    ) => {
+      const resolved =
+        sinkId.trim() || pipelinePlaybackOutputIdRef.current.trim();
+      if (resolved) {
+        const master = masterOutputEffectiveIdRef.current.trim();
+        const monitorTgt = pipelinePlaybackOutputIdRef.current.trim();
+        if (master && resolved === master) {
+          if (
+            !pipelineMasterOutputEnabledRef.current ||
+            mixerOutputMuteRef.current
+          ) {
+            return;
+          }
+        }
+        if (monitorTgt && resolved === monitorTgt) {
+          if (
+            !pipelineMonitorEnabledRef.current ||
+            mixerMonitorMuteRef.current
+          ) {
+            return;
+          }
+        }
+      } else {
+        if (
+          !pipelineMonitorEnabledRef.current ||
+          mixerMonitorMuteRef.current
+        ) {
+          return;
+        }
+      }
+      await playMp3OnDeviceSink(arrayBuffer, sinkId);
+    };
+  }, []);
 
   const unlockMediaLabels = async () => {
     setError(null);
@@ -1915,6 +1514,8 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
     captureChatSessionIdRef.current = null;
     setCaptureChatSessionId(null);
     voicePlayChainRef.current = Promise.resolve();
+    translationTtsPlayedLineIdsRef.current.clear();
+    lastSttFinalDedupRef.current = null;
     stopServiceStt();
     mediaRecorderRef.current?.stop();
     mediaRecorderRef.current = null;
@@ -2154,14 +1755,41 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
     }
   };
 
-  const testOutput = async () => {
+  const testMonitorOutput = async () => {
     if (running || outputTesting || micTesting) return;
+    if (!pipelineMonitorEnabled || mixerMonitorMute) {
+      return;
+    }
     setError(null);
     setOutputTesting(true);
     try {
-      await playTestBeep(selectedOutputId);
+      await playTestBeepOnSink(
+        pipelinePlaybackOutputId || selectedMonitorOutputId
+      );
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Teste de saída falhou";
+      setError(msg);
+    } finally {
+      setOutputTesting(false);
+    }
+  };
+
+  const testMasterOutput = async () => {
+    if (running || outputTesting || micTesting) return;
+    if (
+      !masterOutputEffectiveId ||
+      !pipelineMasterOutputEnabled ||
+      mixerOutputMute
+    ) {
+      return;
+    }
+    setError(null);
+    setOutputTesting(true);
+    try {
+      await playTestBeepOnSink(masterOutputEffectiveId);
+    } catch (e) {
+      const msg =
+        e instanceof Error ? e.message : "Teste da saída Master falhou";
       setError(msg);
     } finally {
       setOutputTesting(false);
@@ -2178,6 +1806,8 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
     setServiceChunksBaseline(0);
     setTranscriptLines([]);
     transcriptLineIdRef.current = 0;
+    translationTtsPlayedLineIdsRef.current.clear();
+    lastSttFinalDedupRef.current = null;
     setInterimTranscript("");
     setServiceSttReady(false);
     setServiceSttFailed(false);
@@ -2224,8 +1854,6 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
         0,
         Math.min(2, settings.tertiaryChannelMixGainPercent / 100)
       );
-      const monitorExcludePrimary = voiceTranslationEnabledRef.current;
-      let pipelineStreamForMeter: MediaStream | undefined;
       captureGainControlsRef.current = null;
       mixPrimaryAnalyserRef.current = null;
       mixSecondaryAnalyserRef.current = null;
@@ -2243,7 +1871,6 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
         });
         const {
           mixedStream,
-          monitorStream,
           dispose,
           controls,
           primaryAnalyser,
@@ -2257,7 +1884,19 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
             primaryLinear: pLin,
             secondaryLinear: sLin,
             tertiaryLinear: tLin,
-            monitorExcludePrimary: monitorExcludePrimary,
+            primaryExcludeFromProgramBus: voiceTranslationEnabledRef.current,
+            primaryRoute: {
+              master: settings.mixerChannel1RouteMaster,
+              monitor: settings.mixerChannel1RouteMonitor,
+            },
+            secondaryRoute: {
+              master: settings.mixerChannel2RouteMaster,
+              monitor: settings.mixerChannel2RouteMonitor,
+            },
+            tertiaryRoute: {
+              master: settings.mixerChannel3RouteMaster,
+              monitor: settings.mixerChannel3RouteMonitor,
+            },
           }
         );
         mixDisposeRef.current = dispose;
@@ -2269,13 +1908,19 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
           setPrimaryLinear: controls.setPrimaryLinear,
           setSecondaryLinear: controls.setSecondaryLinear,
           setTertiaryLinear: controls.setTertiaryLinear,
+          setPrimaryRouteMaster: controls.setPrimaryRouteMaster,
+          setPrimaryRouteMonitor: controls.setPrimaryRouteMonitor,
+          setSecondaryRouteMaster: controls.setSecondaryRouteMaster,
+          setSecondaryRouteMonitor: controls.setSecondaryRouteMonitor,
+          setTertiaryRouteMaster: controls.setTertiaryRouteMaster,
+          setTertiaryRouteMonitor: controls.setTertiaryRouteMonitor,
+          setPrimaryExcludeFromProgramBus:
+            controls.setPrimaryExcludeFromProgramBus,
         };
         primaryForCleanup = null;
         secondaryForCleanup = null;
         tertiaryForCleanup = null;
         captureStream = mixedStream;
-        pipelineStreamForMeter =
-          monitorStream !== mixedStream ? monitorStream : undefined;
       } else if (secondaryId) {
         const secondaryConstraints: MediaTrackConstraints = { ...baseAudio };
         secondaryConstraints.deviceId = { exact: secondaryId };
@@ -2284,7 +1929,6 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
         });
         const {
           mixedStream,
-          monitorStream,
           dispose,
           controls,
           primaryAnalyser,
@@ -2292,7 +1936,15 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
         } = await mixCaptureAudioStreams(primaryForCleanup, secondaryForCleanup, {
           primaryLinear: pLin,
           secondaryLinear: sLin,
-          monitorExcludePrimary: monitorExcludePrimary,
+          primaryExcludeFromProgramBus: voiceTranslationEnabledRef.current,
+          primaryRoute: {
+            master: settings.mixerChannel1RouteMaster,
+            monitor: settings.mixerChannel1RouteMonitor,
+          },
+          secondaryRoute: {
+            master: settings.mixerChannel2RouteMaster,
+            monitor: settings.mixerChannel2RouteMonitor,
+          },
         });
         mixDisposeRef.current = dispose;
         mixPrimaryAnalyserRef.current = primaryAnalyser;
@@ -2302,12 +1954,16 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
           mode: "dual",
           setPrimaryLinear: controls.setPrimaryLinear,
           setSecondaryLinear: controls.setSecondaryLinear,
+          setPrimaryRouteMaster: controls.setPrimaryRouteMaster,
+          setPrimaryRouteMonitor: controls.setPrimaryRouteMonitor,
+          setSecondaryRouteMaster: controls.setSecondaryRouteMaster,
+          setSecondaryRouteMonitor: controls.setSecondaryRouteMonitor,
+          setPrimaryExcludeFromProgramBus:
+            controls.setPrimaryExcludeFromProgramBus,
         };
         primaryForCleanup = null;
         secondaryForCleanup = null;
         captureStream = mixedStream;
-        pipelineStreamForMeter =
-          monitorStream !== mixedStream ? monitorStream : undefined;
       } else if (tertiaryId) {
         const tertiaryConstraints: MediaTrackConstraints = { ...baseAudio };
         tertiaryConstraints.deviceId = { exact: tertiaryId };
@@ -2316,7 +1972,6 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
         });
         const {
           mixedStream,
-          monitorStream,
           dispose,
           controls,
           primaryAnalyser,
@@ -2324,7 +1979,15 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
         } = await mixCaptureAudioStreams(primaryForCleanup, tertiaryForCleanup, {
           primaryLinear: pLin,
           secondaryLinear: tLin,
-          monitorExcludePrimary: monitorExcludePrimary,
+          primaryExcludeFromProgramBus: voiceTranslationEnabledRef.current,
+          primaryRoute: {
+            master: settings.mixerChannel1RouteMaster,
+            monitor: settings.mixerChannel1RouteMonitor,
+          },
+          secondaryRoute: {
+            master: settings.mixerChannel3RouteMaster,
+            monitor: settings.mixerChannel3RouteMonitor,
+          },
         });
         mixDisposeRef.current = dispose;
         mixPrimaryAnalyserRef.current = primaryAnalyser;
@@ -2334,15 +1997,23 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
           mode: "dual",
           setPrimaryLinear: controls.setPrimaryLinear,
           setSecondaryLinear: controls.setSecondaryLinear,
+          setPrimaryRouteMaster: controls.setPrimaryRouteMaster,
+          setPrimaryRouteMonitor: controls.setPrimaryRouteMonitor,
+          setSecondaryRouteMaster: controls.setSecondaryRouteMaster,
+          setSecondaryRouteMonitor: controls.setSecondaryRouteMonitor,
+          setPrimaryExcludeFromProgramBus:
+            controls.setPrimaryExcludeFromProgramBus,
         };
         primaryForCleanup = null;
         tertiaryForCleanup = null;
         captureStream = mixedStream;
-        pipelineStreamForMeter =
-          monitorStream !== mixedStream ? monitorStream : undefined;
       } else {
         const pt = await passThroughCaptureWithGain(primaryForCleanup, pLin, {
-          monitorExcludePrimary: monitorExcludePrimary,
+          primaryExcludeFromProgramBus: voiceTranslationEnabledRef.current,
+          route: {
+            master: settings.mixerChannel1RouteMaster,
+            monitor: settings.mixerChannel1RouteMonitor,
+          },
         });
         mixDisposeRef.current = pt.dispose;
         mixPrimaryAnalyserRef.current = pt.primaryAnalyser;
@@ -2351,14 +2022,16 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
         captureGainControlsRef.current = {
           mode: "single",
           setPrimaryLinear: pt.setGainLinear,
+          setPrimaryRouteMaster: pt.setRouteMaster,
+          setPrimaryRouteMonitor: pt.setRouteMonitor,
+          setPrimaryExcludeFromProgramBus: pt.setPrimaryExcludeFromProgramBus,
         };
         primaryForCleanup = null;
         captureStream = pt.stream;
-        pipelineStreamForMeter =
-          pt.monitorStream !== pt.stream ? pt.monitorStream : undefined;
       }
       streamRef.current = captureStream;
-      await startMeter(captureStream, true, pipelineStreamForMeter);
+      stopServiceStt();
+      await startMeter(captureStream, true, undefined);
 
       const ws = openEchoLinkServiceWebSocket("/ws/mic");
       ws.binaryType = "arraybuffer";
@@ -2372,6 +2045,13 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
         ws.onerror = () =>
           reject(new Error("Falha na conexão WebSocket com o serviço."));
       });
+
+      const runtimeRegistered = await postEchoLinkRuntimeCapture(true);
+      if (!runtimeRegistered) {
+        throw new Error(
+          "Serviço local não registrou a sessão de captura. Confirme se a API está em execução."
+        );
+      }
 
       ws.onmessage = (ev) => {
         try {
@@ -2410,7 +2090,6 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
       captureChatSessionIdRef.current = newChatId;
       setCaptureChatSessionId(newChatId);
       setRunning(true);
-      void postEchoLinkRuntimeCapture(true);
       if (settings.transcriptionStartDelayMs > 0) {
         await new Promise<void>((resolve) => {
           setTimeout(resolve, settings.transcriptionStartDelayMs);
@@ -2426,17 +2105,27 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
           setError(msg);
         } else {
           try {
-            const cleanup = await startServiceSttSession(ctx, src, (ev) => {
-              if (ev.kind === "partial") {
-                setInterimTranscript(ev.text);
+            const cleanup = await startServiceSttSession(
+              ctx,
+              src,
+              (ev) => {
+                if (ev.kind === "partial") {
+                  setInterimTranscript(
+                    sttPartialWorthSending(ev.text) ? ev.text : ""
+                  );
+                }
+                if (ev.kind === "final") {
+                  handleSttFinalRef.current(ev.text);
+                }
+                if (ev.kind === "error") {
+                  setError(ev.message);
+                }
+              },
+              {
+                phraseSilenceCutMs: settings.phraseSilenceCutMs,
+                inputSensitivityPercent: settings.inputSensitivity,
               }
-              if (ev.kind === "final") {
-                handleSttFinalRef.current(ev.text);
-              }
-              if (ev.kind === "error") {
-                setError(ev.message);
-              }
-            });
+            );
             serviceSttCleanupRef.current = cleanup;
             setServiceSttReady(true);
             setServiceSttFailed(false);
@@ -2475,18 +2164,15 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
     const g =
       pipelineGainNodeRef.current ?? idlePreviewMonitorGainRef.current;
     if (g) {
-      const outLin = Math.max(
-        0,
-        Math.min(2, settings.outputChannelMixGainPercent / 100)
-      );
-      const m = mixerOutputMute ? 0 : 1;
-      g.gain.value = pipelineMonitorGain * outLin * m;
+      const allow =
+        pipelineMonitorEnabled && !mixerMonitorMute;
+      g.gain.value = allow ? pipelineMonitorGain : 0;
     }
   }, [
     pipelineMonitorGain,
-    settings.outputChannelMixGainPercent,
-    mixerOutputMute,
     pipelineBranchLive,
+    pipelineMonitorEnabled,
+    mixerMonitorMute,
   ]);
 
   useEffect(() => {
@@ -2604,6 +2290,54 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
   ]);
 
   useEffect(() => {
+    if (!running) return;
+    const c = captureGainControlsRef.current;
+    if (!c) return;
+    const ch2Ok =
+      Boolean(selectedSecondaryInputId) &&
+      selectedSecondaryInputId !== selectedInputId;
+    const ch3Ok =
+      Boolean(selectedTertiaryInputId) &&
+      selectedTertiaryInputId !== selectedInputId &&
+      selectedTertiaryInputId !== selectedSecondaryInputId;
+    c.setPrimaryRouteMaster(settings.mixerChannel1RouteMaster);
+    c.setPrimaryRouteMonitor(settings.mixerChannel1RouteMonitor);
+    if (c.mode === "dual") {
+      if (ch2Ok) {
+        c.setSecondaryRouteMaster(settings.mixerChannel2RouteMaster);
+        c.setSecondaryRouteMonitor(settings.mixerChannel2RouteMonitor);
+      } else if (ch3Ok) {
+        c.setSecondaryRouteMaster(settings.mixerChannel3RouteMaster);
+        c.setSecondaryRouteMonitor(settings.mixerChannel3RouteMonitor);
+      }
+    }
+    if (c.mode === "triple") {
+      c.setSecondaryRouteMaster(settings.mixerChannel2RouteMaster);
+      c.setSecondaryRouteMonitor(settings.mixerChannel2RouteMonitor);
+      c.setTertiaryRouteMaster(settings.mixerChannel3RouteMaster);
+      c.setTertiaryRouteMonitor(settings.mixerChannel3RouteMonitor);
+    }
+  }, [
+    running,
+    settings.mixerChannel1RouteMaster,
+    settings.mixerChannel1RouteMonitor,
+    settings.mixerChannel2RouteMaster,
+    settings.mixerChannel2RouteMonitor,
+    settings.mixerChannel3RouteMaster,
+    settings.mixerChannel3RouteMonitor,
+    selectedSecondaryInputId,
+    selectedTertiaryInputId,
+    selectedInputId,
+  ]);
+
+  useEffect(() => {
+    if (!running) return;
+    const c = captureGainControlsRef.current;
+    if (!c) return;
+    c.setPrimaryExcludeFromProgramBus(voiceTranslationEnabled);
+  }, [running, voiceTranslationEnabled]);
+
+  useEffect(() => {
     if (!mixerActivate1) {
       setMixerMute1((prev) => {
         if (prev) {
@@ -2658,11 +2392,11 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
       pipelineOutputAnalyserRef.current = null;
       pipelineOutSmoothRef.current = 0;
       setPipelineOutVu(0);
-      if (!pipelineMonitorEnabled) return;
+      if (!pipelineMonitorEnabled || mixerMonitorMute) return;
       try {
         const branch = await connectMonitorBranch(ctx, source, {
           monitorGain: pipelineMonitorGainRef.current,
-          outputDeviceId: selectedOutputId || undefined,
+          outputDeviceId: pipelinePlaybackOutputId || undefined,
           inject: pipelineInjectRef.current,
         });
         if (cancelled) {
@@ -2688,7 +2422,8 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
   }, [
     running,
     pipelineMonitorEnabled,
-    selectedOutputId,
+    pipelinePlaybackOutputId,
+    mixerMonitorMute,
     startPipelineOutLevelLoop,
   ]);
 
@@ -3002,6 +2737,9 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
             idlePreviewTertGainRef.current = gT;
           }
           idlePreviewMixStreamRef.current = previewMixDest.stream;
+          audioContextRef.current = ctx;
+          mediaStreamSourceRef.current =
+            want1 && ms1Node ? ms1Node : null;
           setIdleInputGraphSeq((n) => n + 1);
         }
       } catch {
@@ -3023,6 +2761,9 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
       idlePreviewPrimGainRef.current = null;
       idlePreviewSecGainRef.current = null;
       idlePreviewTertGainRef.current = null;
+      stopServiceStt();
+      audioContextRef.current = null;
+      mediaStreamSourceRef.current = null;
       setIdleInputGraphSeq((n) => n + 1);
       if (rafId) {
         cancelAnimationFrame(rafId);
@@ -3037,14 +2778,90 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
       mediaVuSmoothRef.current = 0;
       setMeterSampleRate(0);
     };
-  }, [idleInputGraphDepKey]);
+  }, [idleInputGraphDepKey, stopServiceStt]);
+
+  useEffect(() => {
+    if (running || captureStarting) {
+      return;
+    }
+    if (!settings.speechLanguagesEnabled) {
+      stopServiceStt();
+      return;
+    }
+    const ctx = audioContextRef.current;
+    const src = mediaStreamSourceRef.current;
+    if (!ctx || !src || meterSampleRate <= 0) {
+      stopServiceStt();
+      return;
+    }
+    let cancelled = false;
+    stopServiceStt();
+    void (async () => {
+      try {
+        const cleanup = await startServiceSttSession(
+          ctx,
+          src,
+          (ev) => {
+            if (ev.kind === "partial") {
+              setInterimTranscript(
+                sttPartialWorthSending(ev.text) ? ev.text : ""
+              );
+            }
+            if (ev.kind === "final") {
+              handleSttFinalRef.current(ev.text);
+            }
+            if (ev.kind === "error") {
+              setError(ev.message);
+            }
+          },
+          {
+            phraseSilenceCutMs: settings.phraseSilenceCutMs,
+            inputSensitivityPercent: settings.inputSensitivity,
+          }
+        );
+        if (cancelled) {
+          cleanup();
+          return;
+        }
+        serviceSttCleanupRef.current = cleanup;
+        setServiceSttReady(true);
+        setServiceSttFailed(false);
+        setServiceSttBootstrapError(null);
+      } catch (sttErr) {
+        if (cancelled) {
+          return;
+        }
+        setServiceSttFailed(true);
+        setServiceSttReady(false);
+        const msg =
+          sttErr instanceof Error
+            ? sttErr.message
+            : "STT: falha ao iniciar sessão com o serviço Python.";
+        setServiceSttBootstrapError(msg);
+        setError(msg);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    running,
+    captureStarting,
+    settings.speechLanguagesEnabled,
+    settings.phraseSilenceCutMs,
+    settings.inputSensitivity,
+    idleInputGraphSeq,
+    meterSampleRate,
+    stopServiceStt,
+  ]);
 
   const idleMonitorEffectKey = useMemo(
     () =>
       [
         idleInputGraphSeq,
         pipelineMonitorEnabled,
-        selectedOutputId,
+        pipelinePlaybackOutputId,
+        mixerMonitorMute,
         running,
         micTesting,
         outputTesting,
@@ -3053,7 +2870,8 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
     [
       idleInputGraphSeq,
       pipelineMonitorEnabled,
-      selectedOutputId,
+      pipelinePlaybackOutputId,
+      mixerMonitorMute,
       running,
       micTesting,
       outputTesting,
@@ -3082,7 +2900,8 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
       const mixStream = idlePreviewMixStreamRef.current;
       if (
         !pipelineMonitorEnabled ||
-        !selectedOutputId.trim() ||
+        mixerMonitorMute ||
+        !pipelinePlaybackOutputId ||
         !mixStream
       ) {
         return;
@@ -3103,7 +2922,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
           prevSrc,
           {
             monitorGain: pipelineMonitorGainRef.current,
-            outputDeviceId: selectedOutputId.trim(),
+            outputDeviceId: pipelinePlaybackOutputId,
             inject: pipelineInjectRef.current,
           }
         );
@@ -3292,10 +3111,10 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
     { id: "info", label: "Informações" },
   ];
 
-  const selectedOutputLabel =
-    selectedOutputId &&
+  const selectedMonitorOutputLabel =
+    selectedMonitorOutputId &&
     (() => {
-      const d = audioOutputs.find((x) => x.deviceId === selectedOutputId);
+      const d = audioOutputs.find((x) => x.deviceId === selectedMonitorOutputId);
       return d
         ? formatMediaDeviceOptionLabel(
             d,
@@ -3320,20 +3139,39 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
     []
   );
 
+  const pipelineTimelineActive = useMemo(
+    () =>
+      running ||
+      (settings.speechLanguagesEnabled &&
+        serviceSttReady &&
+        !serviceSttFailed &&
+        meterSampleRate > 0),
+    [
+      running,
+      settings.speechLanguagesEnabled,
+      serviceSttReady,
+      serviceSttFailed,
+      meterSampleRate,
+    ]
+  );
+
   const pipelineFirstIncompleteIndex = useMemo(() => {
-    if (!running) return -1;
+    if (!pipelineTimelineActive) return -1;
     const hasText = interimTranscript.trim().length > 0;
     const wsReadyForUtterance =
       serviceChunks > serviceChunksBaseline || hasText;
     const sttSkipped =
       !settings.speechLanguagesEnabled || serviceSttFailed;
     if (meterSampleRate <= 0) return 1;
-    if (!connected) return 2;
-    if (!wsReadyForUtterance) return 2;
+    if (running) {
+      if (!connected) return 2;
+      if (!wsReadyForUtterance) return 2;
+    }
     if (!sttSkipped && !hasText) return 3;
     if (pipelineMonitorEnabled && !pipelineBranchLive) return 4;
     return 5;
   }, [
+    pipelineTimelineActive,
     running,
     meterSampleRate,
     connected,
@@ -3347,7 +3185,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
   ]);
 
   useEffect(() => {
-    if (!running) {
+    if (!pipelineTimelineActive) {
       setPipelineVisibleDoneCount(0);
       return;
     }
@@ -3359,7 +3197,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
     }, 90);
     return () => window.clearTimeout(id);
   }, [
-    running,
+    pipelineTimelineActive,
     pipelineFirstIncompleteIndex,
     pipelineVisibleDoneCount,
     pipelineUtteranceVersion,
@@ -3391,7 +3229,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
       settings.speechLanguagesEnabled &&
       serviceSttReady &&
       !serviceSttFailed;
-    if (!running || !sttMeter) {
+    if (!sttMeter) {
       return combined;
     }
     const aligned =
@@ -3400,7 +3238,6 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
       combined >= METER_LOG_ALIGN_MIN;
     return aligned ? combined : combined * METER_LOG_IDLE_SCALE;
   }, [
-    running,
     settings.speechLanguagesEnabled,
     serviceSttReady,
     serviceSttFailed,
@@ -3411,7 +3248,99 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
     transcriptLines,
   ]);
 
-  const audioOutDetailSections = (
+  const audioOutMasterDetailSections = (
+                  <div className="grid grid-cols-1 gap-0 divide-y divide-zinc-600/35">
+                    <section className="bg-zinc-900/50 p-3 sm:p-4">
+                      <p className="mb-2 text-[10px] font-bold uppercase tracking-[0.18em] text-violet-300">
+                        Saída Master · programa
+                      </p>
+                      <p className="mb-3 text-[9px] leading-snug text-zinc-500">
+                        Captura e STT para a cadeia EchoLink. Vazio usa o
+                        dispositivo virtual EchoLink quando existir.
+                      </p>
+                      <label
+                        htmlFor="echo-master-output-device"
+                        className="mb-1.5 block text-[9px] uppercase tracking-[0.18em] text-zinc-400"
+                      >
+                        Dispositivo
+                      </label>
+                      <select
+                        id="echo-master-output-device"
+                        className={selectClass}
+                        disabled={busy}
+                        value={selectedMasterOutputId}
+                        onChange={(e) => {
+                          const v = e.target.value;
+                          setSelectedMasterOutputId(v);
+                          setSettings((prev) => ({
+                            ...prev,
+                            selectedMasterOutputDeviceId: v,
+                          }));
+                          saveEchoLinkSettingsToStorage({
+                            selectedMasterOutputDeviceId: v,
+                          });
+                        }}
+                      >
+                        <option value="">Automático (EchoLink Virtual)</option>
+                        {audioOutputs.map((d) => (
+                          <option key={d.deviceId} value={d.deviceId}>
+                            {formatMediaDeviceOptionLabel(
+                              d,
+                              "output",
+                              settings.outputDeviceAliases[d.deviceId]
+                            )}
+                          </option>
+                        ))}
+                      </select>
+                      <div className="mt-2 space-y-1 rounded-md border border-zinc-700/40 bg-zinc-950/35 px-2.5 py-2">
+                        <div className="flex flex-wrap justify-between gap-x-2 gap-y-0.5 text-[9px]">
+                          <span className="min-w-0 shrink text-zinc-500">
+                            Saída efectiva
+                          </span>
+                          <span className="max-w-[58%] truncate text-right text-zinc-300">
+                            {masterOutputEffectiveId
+                              ? masterOutputEffectiveLabel ||
+                                `${masterOutputEffectiveId.slice(0, 12)}…`
+                              : "Indisponível"}
+                          </span>
+                        </div>
+                      </div>
+                      <div className="mt-3 flex flex-wrap gap-2 sm:gap-1.5">
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() => void refreshMediaDevices()}
+                          className={btnSecondary}
+                        >
+                          Atualizar
+                        </button>
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() => void unlockMediaLabels()}
+                          className={btnSecondary}
+                        >
+                          Nomes
+                        </button>
+                        <button
+                          type="button"
+                          disabled={
+                            busy ||
+                            !masterOutputEffectiveId ||
+                            !pipelineMasterOutputEnabled ||
+                            mixerOutputMute
+                          }
+                          onClick={() => void testMasterOutput()}
+                          className={btnSky}
+                        >
+                          {outputTesting ? "…" : "Testar Master"}
+                        </button>
+                      </div>
+                    </section>
+                  </div>
+  );
+
+  const audioOutMonitorDetailSections = (
                   <div className="grid grid-cols-1 gap-0 divide-y divide-zinc-600/35">
                     <section className="bg-zinc-900/50 p-3 sm:p-4">
                       <div className="mb-2.5 flex items-center gap-2 rounded-md bg-sky-950/25 px-2 py-1.5 ring-1 ring-sky-700/35">
@@ -3432,15 +3361,17 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                         id="echo-output-device"
                         className={selectClass}
                         disabled={busy}
-                        value={selectedOutputId}
+                        value={selectedMonitorOutputId}
                         onChange={(e) => {
                           const v = e.target.value;
-                          setSelectedOutputId(v);
+                          setSelectedMonitorOutputId(v);
                           setSettings((prev) => ({
                             ...prev,
+                            selectedPipelineMonitorOutputDeviceId: v,
                             selectedOutputDeviceId: v,
                           }));
                           saveEchoLinkSettingsToStorage({
+                            selectedPipelineMonitorOutputDeviceId: v,
                             selectedOutputDeviceId: v,
                           });
                         }}
@@ -3477,9 +3408,9 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                             Saída alvo
                           </span>
                           <span className="max-w-[58%] truncate text-right text-zinc-300">
-                            {selectedOutputId
-                              ? selectedOutputLabel ||
-                                `${selectedOutputId.slice(0, 12)}…`
+                            {selectedMonitorOutputId
+                              ? selectedMonitorOutputLabel ||
+                                `${selectedMonitorOutputId.slice(0, 12)}…`
                               : "Padrão do sistema"}
                           </span>
                         </div>
@@ -3503,8 +3434,12 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                         </button>
                         <button
                           type="button"
-                          disabled={busy}
-                          onClick={() => void testOutput()}
+                          disabled={
+                            busy ||
+                            !pipelineMonitorEnabled ||
+                            mixerMonitorMute
+                          }
+                          onClick={() => void testMonitorOutput()}
                           className={btnSky}
                         >
                           {outputTesting ? "…" : "Testar saída"}
@@ -3528,9 +3463,9 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                         <div className="flex justify-between gap-2">
                           <dt>Saída alvo</dt>
                           <dd className="max-w-[65%] truncate text-right text-zinc-300">
-                            {selectedOutputId
-                              ? selectedOutputLabel ||
-                                selectedOutputId.slice(0, 14) + "…"
+                            {selectedMonitorOutputId
+                              ? selectedMonitorOutputLabel ||
+                                selectedMonitorOutputId.slice(0, 14) + "…"
                               : "Padrão do sistema"}
                           </dd>
                         </div>
@@ -3562,7 +3497,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                               ? "Ativo no fluxo atual"
                               : "Desligado"
                             : pipelineMonitorEnabled
-                              ? !selectedOutputId.trim()
+                              ? !pipelinePlaybackOutputId
                                 ? "Escolha saída de áudio (fones)"
                                 : pipelineBranchLive
                                   ? "Ativo sem captura"
@@ -3619,764 +3554,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                   </div>
   );
 
-  return (
-    <div className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-zinc-900 font-mono">
-        <header className="shrink-0 border-b border-zinc-800 bg-zinc-900">
-          <div className="flex flex-col gap-3 px-3 py-3 sm:px-4 lg:flex-row lg:items-center lg:justify-between lg:gap-4">
-            <div className="flex min-w-0 items-center gap-2 sm:gap-3">
-              <div
-                className="flex h-8 w-8 shrink-0 items-center justify-center rounded border border-amber-500/45 bg-zinc-800 text-[9px] font-bold text-amber-300 shadow-inner sm:h-9 sm:w-9 sm:text-[10px]"
-                aria-hidden
-              >
-                EL
-              </div>
-              <div className="min-w-0">
-                <p className="truncate font-mono text-[10px] font-semibold uppercase tracking-[0.18em] text-amber-400 sm:text-[11px] sm:tracking-[0.2em]">
-                  EchoLink
-                </p>
-                <p className="truncate font-mono text-[9px] text-zinc-500 sm:text-[10px]">
-                  Painel · E/S local · WebSocket
-                </p>
-              </div>
-            </div>
-            <div className="flex flex-wrap items-center justify-end gap-2 sm:gap-3 lg:ml-auto">
-              <code className="max-w-[min(100%,14rem)] truncate rounded-md bg-zinc-800 px-2 py-1 text-[9px] text-emerald-300 shadow-inner ring-1 ring-zinc-600/40 sm:text-[10px]">
-                {echoLinkServiceOriginForDisplay()}
-              </code>
-              {!running ? (
-                <button
-                  type="button"
-                  disabled={busy}
-                  onClick={() => {
-                    setSidebarSection("monitor");
-                    saveEchoLinkSettingsToStorage({ sidebarSection: "monitor" });
-                    void start();
-                  }}
-                  className="panel-bezel inline-flex h-10 min-w-32 shrink-0 items-center justify-center rounded-full bg-linear-to-b from-emerald-600 to-emerald-800 px-5 text-[11px] font-bold uppercase tracking-[0.18em] text-white shadow-[0_3px_0_rgba(6,78,59,0.85)] ring-1 ring-emerald-500/35 transition hover:brightness-110 active:translate-y-px active:shadow-none disabled:opacity-45 sm:h-11 sm:min-w-36 sm:px-6 sm:text-xs"
-                >
-                  Iniciar
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  onClick={stopAll}
-                  className="panel-bezel inline-flex h-10 min-w-32 shrink-0 items-center justify-center rounded-full bg-linear-to-b from-zinc-700 to-zinc-800 px-5 text-[11px] font-bold uppercase tracking-[0.18em] text-red-200 shadow-[0_3px_0_rgba(0,0,0,0.45)] ring-1 ring-red-900/45 transition hover:brightness-110 active:translate-y-px sm:h-11 sm:min-w-36 sm:px-6 sm:text-xs"
-                >
-                  Parar
-                </button>
-              )}
-            </div>
-          </div>
-        </header>
-
-        <div className="relative isolate flex min-h-0 flex-1 flex-col bg-zinc-900 lg:flex-row lg:items-stretch">
-            <nav
-              className="app-region-no-drag pointer-events-auto relative z-50 flex shrink-0 flex-row gap-1 overflow-x-auto border-b border-zinc-800 bg-zinc-900 p-2 lg:h-full lg:min-h-0 lg:w-52 lg:max-w-52 lg:flex-col lg:justify-start lg:gap-0 lg:overflow-x-hidden lg:overflow-y-auto lg:self-stretch lg:border-b-0 lg:border-r lg:bg-zinc-950/40 lg:p-0 lg:py-2"
-              aria-label="Navegação do painel"
-            >
-              {navEntries.map((item) => (
-                <button
-                  key={item.id}
-                  type="button"
-                  onClick={() => {
-                    setSidebarSection(item.id);
-                    saveEchoLinkSettingsToStorage({
-                      sidebarSection: item.id,
-                    });
-                  }}
-                  className={`app-region-no-drag ${navItemBase} min-w-30 touch-manipulation lg:min-w-0 lg:w-full ${sidebarSection === item.id ? navItemActive : navItemIdle}`}
-                >
-                  {item.label}
-                </button>
-              ))}
-            </nav>
-
-            <div className="relative z-0 flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto bg-zinc-900">
-              {sidebarSection === "audioIn" ? (
-                audioInLayoutMode === "mixer" ? (
-                  <div className="flex min-h-0 min-w-0 flex-1 flex-col divide-y divide-zinc-600/35">
-                    <div className="shrink-0 border-b border-zinc-600/35 bg-zinc-900/60 px-3 py-2 sm:px-4">
-                      <p className="text-[10px] font-bold uppercase tracking-[0.22em] text-zinc-200">
-                        Canais de entrada
-                      </p>
-                      <p className="mt-0.5 text-[10px] text-zinc-400">
-                        Mesa de som · faders e VU. O traço no topo de cada faixa
-                        serve para arrastar e mudar a ordem (fica gravado nas
-                        definições). Em cada canal, Editar abre dispositivos,
-                        tempos de captura e teste do microfone.
-                      </p>
-                    </div>
-                    <div className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-linear-to-b from-[#0c0c0e] via-[#080809] to-black">
-                      <div
-                        className={`flex min-h-0 min-w-0 flex-1 flex-row ${mixerSideEditor ? "pointer-events-none invisible" : ""}`}
-                        aria-hidden={mixerSideEditor ? true : undefined}
-                      >
-                        <div className="flex min-h-0 shrink-0 flex-col px-3 py-3 sm:px-4 sm:py-4">
-                          <div className="flex min-h-0 min-w-0 flex-1 items-stretch justify-start gap-3 overflow-x-auto pb-1 sm:gap-5">
-                            {mixerStripOrderForUi.map(
-                              (stripSlot, stackIndex) => {
-                                const stripDnD: MixerStripDnDProps = {
-                                  mixerStripId: stripSlot,
-                                  stripStackIndex: stackIndex,
-                                  draggingMixerStripId,
-                                  onMixerStripDragStart:
-                                    handleMixerStripDragStart,
-                                  onMixerStripDragEnd: handleMixerStripDragEnd,
-                                  onMixerStripDragOver:
-                                    handleMixerStripDragOver,
-                                  onMixerStripDrop: handleMixerStripDrop,
-                                };
-                                if (stripSlot === "ch1") {
-                                  return (
-                                    <MixerConsoleInputChannel
-                                      key={stripSlot}
-                                      channelId={1}
-                                      activateOn={mixerActivate1}
-                                      onActivateToggle={() => {
-                                        setMixerActivate1((v) => {
-                                          const next = !v;
-                                          if (!next) {
-                                            setMixerMute1(true);
-                                            saveEchoLinkSettingsToStorage({
-                                              mixerChannel1Active: next,
-                                              mixerChannel1Muted: true,
-                                            });
-                                          } else {
-                                            saveEchoLinkSettingsToStorage({
-                                              mixerChannel1Active: next,
-                                            });
-                                          }
-                                          return next;
-                                        });
-                                      }}
-                                      onEdit={() => {
-                                        setMixerSideEditor("microphone");
-                                        setAudioInDetailScope("microphone");
-                                        setAudioInChannelTab("microphone");
-                                        saveEchoLinkSettingsToStorage({
-                                          audioInDetailScope: "microphone",
-                                          audioInChannelTab: "microphone",
-                                        });
-                                      }}
-                                      muted={mixerMute1}
-                                      onMuteToggle={() => {
-                                        setMixerMute1((v) => {
-                                          const next = !v;
-                                          saveEchoLinkSettingsToStorage({
-                                            mixerChannel1Muted: next,
-                                          });
-                                          return next;
-                                        });
-                                      }}
-                                      deviceLabel={
-                                        selectedInputId
-                                          ? (() => {
-                                              const d = audioInputs.find(
-                                                (x) =>
-                                                  x.deviceId ===
-                                                  selectedInputId
-                                              );
-                                              return d
-                                                ? formatMediaDeviceOptionLabel(
-                                                    d,
-                                                    "input",
-                                                    settings
-                                                      .inputDeviceAliases[
-                                                      d.deviceId
-                                                    ]
-                                                  )
-                                                : "…";
-                                            })()
-                                          : "Mic · padrão"
-                                      }
-                                      vuLevel={micVu}
-                                      faderValue={
-                                        settings.primaryChannelMixGainPercent
-                                      }
-                                      onFaderChange={(v) =>
-                                        setMixerChannelMixGainPercent(1, v)
-                                      }
-                                      faderDisabled={false}
-                                      busy={busy}
-                                      {...stripDnD}
-                                    />
-                                  );
-                                }
-                                if (stripSlot === "ch2") {
-                                  return (
-                                    <MixerConsoleInputChannel
-                                      key={stripSlot}
-                                      channelId={2}
-                                      activateOn={mixerActivate2}
-                                      onActivateToggle={() => {
-                                        setMixerActivate2((v) => {
-                                          const next = !v;
-                                          if (!next) {
-                                            setMixerMute2(true);
-                                            saveEchoLinkSettingsToStorage({
-                                              mixerChannel2Active: next,
-                                              mixerChannel2Muted: true,
-                                            });
-                                          } else {
-                                            saveEchoLinkSettingsToStorage({
-                                              mixerChannel2Active: next,
-                                            });
-                                          }
-                                          return next;
-                                        });
-                                      }}
-                                      onEdit={() => {
-                                        setMixerSideEditor("systemAudio");
-                                        setAudioInDetailScope("systemAudio");
-                                        setAudioInChannelTab("systemAudio");
-                                        saveEchoLinkSettingsToStorage({
-                                          audioInDetailScope: "systemAudio",
-                                          audioInChannelTab: "systemAudio",
-                                        });
-                                      }}
-                                      muted={mixerMute2}
-                                      onMuteToggle={() => {
-                                        setMixerMute2((v) => {
-                                          const next = !v;
-                                          saveEchoLinkSettingsToStorage({
-                                            mixerChannel2Muted: next,
-                                          });
-                                          return next;
-                                        });
-                                      }}
-                                      deviceLabel={
-                                        selectedSecondaryInputId &&
-                                        selectedSecondaryInputId !==
-                                          selectedInputId
-                                          ? (() => {
-                                              const d = audioInputs.find(
-                                                (x) =>
-                                                  x.deviceId ===
-                                                  selectedSecondaryInputId
-                                              );
-                                              return d
-                                                ? formatMediaDeviceOptionLabel(
-                                                    d,
-                                                    "input",
-                                                    settings
-                                                      .inputDeviceAliases[
-                                                      d.deviceId
-                                                    ]
-                                                  )
-                                                : "…";
-                                            })()
-                                          : "Teams · off"
-                                      }
-                                      vuLevel={lineVu}
-                                      faderValue={
-                                        settings.secondaryChannelMixGainPercent
-                                      }
-                                      onFaderChange={(v) =>
-                                        setMixerChannelMixGainPercent(2, v)
-                                      }
-                                      faderDisabled={
-                                        !selectedSecondaryInputId ||
-                                        selectedSecondaryInputId ===
-                                          selectedInputId
-                                      }
-                                      busy={busy}
-                                      {...stripDnD}
-                                    />
-                                  );
-                                }
-                                if (stripSlot === "ch3") {
-                                  return (
-                                    <MixerConsoleInputChannel
-                                      key={stripSlot}
-                                      channelId={3}
-                                      activateOn={mixerActivate3}
-                                      onActivateToggle={() => {
-                                        setMixerActivate3((v) => {
-                                          const next = !v;
-                                          if (!next) {
-                                            setMixerMute3(true);
-                                            saveEchoLinkSettingsToStorage({
-                                              mixerChannel3Active: next,
-                                              mixerChannel3Muted: true,
-                                            });
-                                          } else {
-                                            saveEchoLinkSettingsToStorage({
-                                              mixerChannel3Active: next,
-                                            });
-                                          }
-                                          return next;
-                                        });
-                                      }}
-                                      onEdit={() => {
-                                        setMixerSideEditor("media");
-                                        setAudioInDetailScope("media");
-                                        setAudioInChannelTab("media");
-                                        saveEchoLinkSettingsToStorage({
-                                          audioInDetailScope: "media",
-                                          audioInChannelTab: "media",
-                                        });
-                                      }}
-                                      muted={mixerMute3}
-                                      onMuteToggle={() => {
-                                        setMixerMute3((v) => {
-                                          const next = !v;
-                                          saveEchoLinkSettingsToStorage({
-                                            mixerChannel3Muted: next,
-                                          });
-                                          return next;
-                                        });
-                                      }}
-                                      deviceLabel={
-                                        selectedTertiaryInputId &&
-                                        selectedTertiaryInputId !==
-                                          selectedInputId &&
-                                        selectedTertiaryInputId !==
-                                          selectedSecondaryInputId
-                                          ? (() => {
-                                              const d = audioInputs.find(
-                                                (x) =>
-                                                  x.deviceId ===
-                                                  selectedTertiaryInputId
-                                              );
-                                              return d
-                                                ? formatMediaDeviceOptionLabel(
-                                                    d,
-                                                    "input",
-                                                    settings
-                                                      .inputDeviceAliases[
-                                                      d.deviceId
-                                                    ]
-                                                  )
-                                                : "…";
-                                            })()
-                                          : "MÍDIA · off"
-                                      }
-                                      vuLevel={mediaVu}
-                                      faderValue={
-                                        settings.tertiaryChannelMixGainPercent
-                                      }
-                                      onFaderChange={(v) =>
-                                        setMixerChannelMixGainPercent(3, v)
-                                      }
-                                      faderDisabled={
-                                        !selectedTertiaryInputId ||
-                                        selectedTertiaryInputId ===
-                                          selectedInputId ||
-                                        selectedTertiaryInputId ===
-                                          selectedSecondaryInputId
-                                      }
-                                      busy={busy}
-                                      {...stripDnD}
-                                    />
-                                  );
-                                }
-                                return (
-                                  <MixerConsoleOutputChannel
-                                    key={stripSlot}
-                                    activateOn={pipelineMonitorEnabled}
-                                    onActivateToggle={() => {
-                                      setPipelineMonitorEnabled((prev) => {
-                                        const next = !prev;
-                                        setSettings((p) => ({
-                                          ...p,
-                                          pipelineMonitorEnabled: next,
-                                        }));
-                                        saveEchoLinkSettingsToStorage({
-                                          pipelineMonitorEnabled: next,
-                                        });
-                                        return next;
-                                      });
-                                    }}
-                                    onEdit={() => {
-                                      setMixerSideEditor("output");
-                                    }}
-                                    muted={mixerOutputMute}
-                                    onMuteToggle={() => {
-                                      setMixerOutputMute((v) => {
-                                        const next = !v;
-                                        saveEchoLinkSettingsToStorage({
-                                          mixerOutputMuted: next,
-                                        });
-                                        return next;
-                                      });
-                                    }}
-                                    deviceLabel={
-                                      selectedOutputId.trim()
-                                        ? selectedOutputLabel ||
-                                          `${selectedOutputId.slice(0, 14)}…`
-                                        : "Saída · padrão"
-                                    }
-                                    vuLevel={pipelineOutVu}
-                                    faderValue={
-                                      settings.outputChannelMixGainPercent
-                                    }
-                                    onFaderChange={(v) =>
-                                      setMixerChannelMixGainPercent(4, v)
-                                    }
-                                    faderDisabled={!selectedOutputId.trim()}
-                                    busy={busy}
-                                    activateDisabled={busy && !running}
-                                    {...stripDnD}
-                                  />
-                                );
-                              }
-                            )}
-                          </div>
-                        </div>
-                        <div
-                          className="min-h-0 min-w-0 flex-1 bg-black"
-                          aria-hidden
-                        />
-                      </div>
-                      {mixerSideEditor ? (
-                        <div className="absolute inset-0 z-10 flex min-h-0 min-w-0 flex-col bg-zinc-950/98 ring-1 ring-zinc-700/60">
-                          <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-zinc-700/50 bg-zinc-950/90 px-3 py-2 sm:px-4">
-                            <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-zinc-300 sm:text-[11px]">
-                              {mixerSideEditor === "microphone"
-                                ? "Canal 1 · microfone"
-                                : mixerSideEditor === "systemAudio"
-                                  ? "Canal 2 · linha"
-                                  : mixerSideEditor === "media"
-                                    ? "Canal 3 · mídia"
-                                    : "Saída de áudio"}
-                            </p>
-                            <div className="flex flex-wrap items-center justify-end gap-2">
-                              <button
-                                type="button"
-                                disabled={busy}
-                                onClick={() => void refreshMediaDevices()}
-                                className={btnSecondary}
-                              >
-                                Atualizar
-                              </button>
-                              <button
-                                type="button"
-                                disabled={busy}
-                                onClick={() => void unlockMediaLabels()}
-                                className={btnSecondary}
-                              >
-                                Nomes
-                              </button>
-                              <button
-                                type="button"
-                                disabled={busy}
-                                onClick={() => setMixerSideEditor(null)}
-                                className="panel-bezel inline-flex min-h-9 items-center justify-center rounded-md bg-zinc-800 px-3 font-mono text-[10px] font-bold uppercase tracking-wide text-zinc-200 ring-1 ring-zinc-600/50 transition hover:bg-zinc-700 sm:min-h-8 sm:text-[11px]"
-                              >
-                                Fechar
-                              </button>
-                            </div>
-                          </div>
-                          <div className="min-h-0 flex-1 overflow-y-auto">
-                            {mixerSideEditor === "microphone" ? (
-                              <AudioInMicInputDetailPanel
-                                embedded
-                                audioInDetailScope="microphone"
-                                settings={settings}
-                                setSettings={setSettings}
-                                selectedInputId={selectedInputId}
-                                setSelectedInputId={setSelectedInputId}
-                                selectedSecondaryInputId={
-                                  selectedSecondaryInputId
-                                }
-                                selectedTertiaryInputId={selectedTertiaryInputId}
-                                setSelectedSecondaryInputId={
-                                  setSelectedSecondaryInputId
-                                }
-                                setSelectedTertiaryInputId={
-                                  setSelectedTertiaryInputId
-                                }
-                                audioInputs={audioInputs}
-                                busy={busy}
-                                micTesting={micTesting}
-                                outputTesting={outputTesting}
-                                meterSampleRate={meterSampleRate}
-                                selectClass={selectClass}
-                                btnSky={btnSky}
-                                setSettingsField={setSettingsField}
-                                testMicrophone={testMicrophone}
-                                elevenLabsVoiceSelectOptions={
-                                  elevenLabsVoiceSelectOptions
-                                }
-                                elevenLabsVoiceSelectUiValue={
-                                  elevenLabsVoiceSelectUiValue
-                                }
-                                elevenLabsVoicesLoading={
-                                  elevenLabsVoicesLoading
-                                }
-                                voiceTranslationEnabled={
-                                  voiceTranslationEnabled
-                                }
-                                setVoiceTranslationEnabled={
-                                  setVoiceTranslationEnabled
-                                }
-                                voiceTranslationBackendStatus={
-                                  voiceTranslationBackendStatus
-                                }
-                              />
-                            ) : mixerSideEditor === "systemAudio" ? (
-                              <AudioInLineInputDetailPanel
-                                embedded
-                                audioInDetailScope="systemAudio"
-                                settings={settings}
-                                setSettings={setSettings}
-                                selectedInputId={selectedInputId}
-                                selectedSecondaryInputId={
-                                  selectedSecondaryInputId
-                                }
-                                selectedTertiaryInputId={selectedTertiaryInputId}
-                                setSelectedSecondaryInputId={
-                                  setSelectedSecondaryInputId
-                                }
-                                setSelectedTertiaryInputId={
-                                  setSelectedTertiaryInputId
-                                }
-                                audioInputs={audioInputs}
-                                busy={busy}
-                                selectClass={selectClass}
-                                previewVuLevel={lineVu}
-                              />
-                            ) : mixerSideEditor === "media" ? (
-                              <AudioInMediaInputDetailPanel
-                                embedded
-                                audioInDetailScope="media"
-                                settings={settings}
-                                setSettings={setSettings}
-                                selectedInputId={selectedInputId}
-                                selectedSecondaryInputId={
-                                  selectedSecondaryInputId
-                                }
-                                selectedTertiaryInputId={selectedTertiaryInputId}
-                                setSelectedTertiaryInputId={
-                                  setSelectedTertiaryInputId
-                                }
-                                audioInputs={audioInputs}
-                                busy={busy}
-                                selectClass={selectClass}
-                                previewVuLevel={mediaVu}
-                              />
-                            ) : (
-                              audioOutDetailSections
-                            )}
-                          </div>
-                        </div>
-                      ) : null}
-                    </div>
-                  </div>
-                ) : (
-                  <div className="divide-y divide-zinc-600/35">
-                    <div className="flex flex-wrap items-center gap-2 border-b border-zinc-600/35 bg-zinc-950/60 px-3 py-2 sm:px-4">
-                      <button
-                        type="button"
-                        disabled={busy}
-                        onClick={() => {
-                          setAudioInLayoutMode("mixer");
-                          setAudioInDetailScope("both");
-                          setMixerSideEditor(null);
-                          saveEchoLinkSettingsToStorage({
-                            audioInLayoutMode: "mixer",
-                            audioInDetailScope: "both",
-                          });
-                        }}
-                        className="panel-bezel inline-flex min-h-9 items-center justify-center rounded-md bg-zinc-800 px-3 font-mono text-[10px] font-bold uppercase tracking-wide text-zinc-200 ring-1 ring-zinc-600/50 transition hover:bg-zinc-700 sm:min-h-8 sm:text-[11px]"
-                      >
-                        Voltar à mesa
-                      </button>
-                    </div>
-                    <div className="border-b border-zinc-600/35 bg-zinc-900/60 px-3 py-2 sm:px-4">
-                      <p className="text-[10px] font-bold uppercase tracking-[0.22em] text-zinc-200">
-                        Canais de entrada
-                      </p>
-                      {audioInDetailScope === "both" ? (
-                        <p className="mt-0.5 text-[10px] text-zinc-400">
-                          Cada separador é um canal de entrada. O medidor VU, os
-                          tempos de bloco, idioma/tradução e voz ElevenLabs
-                          (nuvem) ficam no canal 1 (microfone). Os canais ativos
-                          (até três entradas) são misturados antes do STT e do
-                          envio ao serviço.
-                        </p>
-                      ) : audioInDetailScope === "microphone" ? (
-                        <p className="mt-0.5 text-[10px] text-zinc-400">
-                          Definições só do microfone (canal 1): dispositivo, nível
-                          na mesa, VU, tempos de captura, idioma/tradução, voz
-                          ElevenLabs (nuvem) e teste do mic.
-                        </p>
-                      ) : audioInDetailScope === "systemAudio" ? (
-                        <p className="mt-0.5 text-[10px] text-zinc-400">
-                          Definições da entrada adicional (canal 2): dispositivo,
-                          medidor em tempo real e nível na mesa. Tempos de bloco
-                          seguem o canal 1.
-                        </p>
-                      ) : (
-                        <p className="mt-0.5 text-[10px] text-zinc-400">
-                          Definições da entrada mídia (canal 3): dispositivo,
-                          medidor em tempo real e nível na mesa. Tempos de bloco
-                          seguem o canal 1.
-                        </p>
-                      )}
-                      <p className="mt-2 text-[9px] leading-snug text-zinc-500">
-                        Os nomes vêm do navegador e podem diferir do sistema. O
-                        sufixo após “·” identifica o dispositivo na Web.
-                      </p>
-                    </div>
-                    <div className="flex flex-wrap gap-2 border-b border-zinc-600/35 bg-zinc-900/40 px-3 py-2 sm:px-4">
-                      <button
-                        type="button"
-                        disabled={busy}
-                        onClick={() => void refreshMediaDevices()}
-                        className={btnSecondary}
-                      >
-                        Atualizar
-                      </button>
-                      <button
-                        type="button"
-                        disabled={busy}
-                        onClick={() => void unlockMediaLabels()}
-                        className={btnSecondary}
-                      >
-                        Nomes
-                      </button>
-                    </div>
-                  {audioInDetailScope === "both" ? (
-                    <div
-                      className="border-b border-zinc-600/35 bg-zinc-950/30 px-3 py-2 sm:px-4"
-                      role="tablist"
-                      aria-label="Canais de entrada"
-                    >
-                      <div className="flex flex-wrap gap-1">
-                        <button
-                          type="button"
-                          role="tab"
-                          aria-selected={audioInChannelTab === "microphone"}
-                          id="audio-in-tab-mic"
-                          className={`panel-bezel rounded-md px-3 py-2 text-left text-[10px] font-bold uppercase tracking-[0.12em] transition sm:text-[11px] ${
-                            audioInChannelTab === "microphone"
-                              ? "bg-zinc-800 text-amber-400 ring-1 ring-amber-600/35"
-                              : "text-zinc-500 ring-1 ring-transparent hover:bg-zinc-800/50 hover:text-zinc-300"
-                          }`}
-                          onClick={() => {
-                            setAudioInChannelTab("microphone");
-                            saveEchoLinkSettingsToStorage({
-                              audioInChannelTab: "microphone",
-                            });
-                          }}
-                        >
-                          Canal 1 · microfone
-                        </button>
-                        <button
-                          type="button"
-                          role="tab"
-                          aria-selected={audioInChannelTab === "systemAudio"}
-                          id="audio-in-tab-audio"
-                          className={`panel-bezel rounded-md px-3 py-2 text-left text-[10px] font-bold uppercase tracking-[0.12em] transition sm:text-[11px] ${
-                            audioInChannelTab === "systemAudio"
-                              ? "bg-zinc-800 text-amber-400 ring-1 ring-amber-600/35"
-                              : "text-zinc-500 ring-1 ring-transparent hover:bg-zinc-800/50 hover:text-zinc-300"
-                          }`}
-                          onClick={() => {
-                            setAudioInChannelTab("systemAudio");
-                            saveEchoLinkSettingsToStorage({
-                              audioInChannelTab: "systemAudio",
-                            });
-                          }}
-                        >
-                          Canal 2 · áudio
-                        </button>
-                        <button
-                          type="button"
-                          role="tab"
-                          aria-selected={audioInChannelTab === "media"}
-                          id="audio-in-tab-media"
-                          className={`panel-bezel rounded-md px-3 py-2 text-left text-[10px] font-bold uppercase tracking-[0.12em] transition sm:text-[11px] ${
-                            audioInChannelTab === "media"
-                              ? "bg-zinc-800 text-amber-400 ring-1 ring-amber-600/35"
-                              : "text-zinc-500 ring-1 ring-transparent hover:bg-zinc-800/50 hover:text-zinc-300"
-                          }`}
-                          onClick={() => {
-                            setAudioInChannelTab("media");
-                            saveEchoLinkSettingsToStorage({
-                              audioInChannelTab: "media",
-                            });
-                          }}
-                        >
-                          Canal 3 · mídia
-                        </button>
-                      </div>
-                    </div>
-                  ) : null}
-                  <div className="grid grid-cols-1 gap-0 divide-y divide-zinc-600/35">
-                    {audioInActivePanel === "microphone" ? (
-                      <AudioInMicInputDetailPanel
-                        embedded={false}
-                        audioInDetailScope={audioInDetailScope}
-                        settings={settings}
-                        setSettings={setSettings}
-                        selectedInputId={selectedInputId}
-                        setSelectedInputId={setSelectedInputId}
-                        selectedSecondaryInputId={selectedSecondaryInputId}
-                        selectedTertiaryInputId={selectedTertiaryInputId}
-                        setSelectedSecondaryInputId={setSelectedSecondaryInputId}
-                        setSelectedTertiaryInputId={setSelectedTertiaryInputId}
-                        audioInputs={audioInputs}
-                        busy={busy}
-                        micTesting={micTesting}
-                        outputTesting={outputTesting}
-                        meterSampleRate={meterSampleRate}
-                        selectClass={selectClass}
-                        btnSky={btnSky}
-                        setSettingsField={setSettingsField}
-                        testMicrophone={testMicrophone}
-                        elevenLabsVoiceSelectOptions={
-                          elevenLabsVoiceSelectOptions
-                        }
-                        elevenLabsVoiceSelectUiValue={
-                          elevenLabsVoiceSelectUiValue
-                        }
-                        elevenLabsVoicesLoading={elevenLabsVoicesLoading}
-                        voiceTranslationEnabled={voiceTranslationEnabled}
-                        setVoiceTranslationEnabled={
-                          setVoiceTranslationEnabled
-                        }
-                        voiceTranslationBackendStatus={
-                          voiceTranslationBackendStatus
-                        }
-                      />
-                    ) : audioInActivePanel === "systemAudio" ? (
-                      <AudioInLineInputDetailPanel
-                        embedded={false}
-                        audioInDetailScope={audioInDetailScope}
-                        settings={settings}
-                        setSettings={setSettings}
-                        selectedInputId={selectedInputId}
-                        selectedSecondaryInputId={selectedSecondaryInputId}
-                        selectedTertiaryInputId={selectedTertiaryInputId}
-                        setSelectedSecondaryInputId={setSelectedSecondaryInputId}
-                        setSelectedTertiaryInputId={setSelectedTertiaryInputId}
-                        audioInputs={audioInputs}
-                        busy={busy}
-                        selectClass={selectClass}
-                        previewVuLevel={lineVu}
-                      />
-                    ) : (
-                      <AudioInMediaInputDetailPanel
-                        embedded={false}
-                        audioInDetailScope={audioInDetailScope}
-                        settings={settings}
-                        setSettings={setSettings}
-                        selectedInputId={selectedInputId}
-                        selectedSecondaryInputId={selectedSecondaryInputId}
-                        selectedTertiaryInputId={selectedTertiaryInputId}
-                        setSelectedTertiaryInputId={setSelectedTertiaryInputId}
-                        audioInputs={audioInputs}
-                        busy={busy}
-                        selectClass={selectClass}
-                        previewVuLevel={mediaVu}
-                      />
-                    )}
-                  </div>
-                </div>
-                )
-              ) : sidebarSection === "monitor" ? (
+  const monitoramentoSectionPanel = (
                 <div className="flex min-h-0 flex-col px-3 py-3 sm:px-4 sm:py-4">
                   <div className="mb-4 flex shrink-0 flex-wrap items-start justify-between gap-3 border-b border-zinc-600/35 pb-3">
                     <div className="min-w-0">
@@ -4384,8 +3562,9 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                         Monitoramento
                       </p>
                       <p className="mt-1 text-[10px] leading-snug text-zinc-400">
-                        Etapas · medidores · chat · ajustes finos em Controles
-                        (mesa e configurações da faixa Saída)
+                        Tradução e voz no master sem gravar; use Gravar para
+                        enviar áudio ao serviço e ficheiro de sessão. Etapas ·
+                        medidores · chat · ajustes em Controles (mesa e Saída)
                         {settings.speechLanguagesEnabled &&
                         settings.speechReceiveLanguage !==
                           settings.speechTransformLanguage ? (
@@ -4402,6 +3581,24 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                       </p>
                     </div>
                     <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+                      {!running ? (
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() => void start()}
+                          className="panel-bezel inline-flex h-9 min-w-[7.5rem] shrink-0 items-center justify-center rounded-full bg-linear-to-b from-emerald-600 to-emerald-800 px-4 text-[10px] font-bold uppercase tracking-[0.14em] text-white shadow-[0_2px_0_rgba(6,78,59,0.85)] ring-1 ring-emerald-500/35 transition hover:brightness-110 active:translate-y-px active:shadow-none disabled:opacity-45 sm:h-10 sm:min-w-32 sm:text-[11px]"
+                        >
+                          Gravar
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={stopAll}
+                          className="panel-bezel inline-flex h-9 min-w-[7.5rem] shrink-0 items-center justify-center rounded-full bg-linear-to-b from-zinc-700 to-zinc-800 px-4 text-[10px] font-bold uppercase tracking-[0.14em] text-red-200 shadow-[0_2px_0_rgba(0,0,0,0.45)] ring-1 ring-red-900/45 transition hover:brightness-110 active:translate-y-px sm:h-10 sm:min-w-32 sm:text-[11px]"
+                        >
+                          Parar gravação
+                        </button>
+                      )}
                       {!chatPanelExpanded ? (
                         <button
                           type="button"
@@ -4418,6 +3615,8 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                         onClick={() => {
                           setTranscriptLines([]);
                           transcriptLineIdRef.current = 0;
+                          translationTtsPlayedLineIdsRef.current.clear();
+                          lastSttFinalDedupRef.current = null;
                           setInterimTranscript("");
                           bumpPipelineUtterance();
                           const sid = captureChatSessionIdRef.current;
@@ -4444,6 +3643,34 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                       <p className="mb-3 text-[9px] font-bold uppercase tracking-[0.2em] text-zinc-500">
                         Pipeline
                       </p>
+                      {echoLinkRuntimeSnapshot ? (
+                        <dl className="mb-3 space-y-1 border-b border-zinc-800/80 pb-3 text-[9px] text-zinc-500">
+                          <div className="flex justify-between gap-2">
+                            <dt>Serviço · captura</dt>
+                            <dd
+                              className={
+                                echoLinkRuntimeSnapshot.panelCaptureActive
+                                  ? "text-emerald-400"
+                                  : "text-zinc-500"
+                              }
+                            >
+                              {echoLinkRuntimeSnapshot.panelCaptureActive
+                                ? "ativa"
+                                : "inativa"}
+                            </dd>
+                          </div>
+                          <div className="flex justify-between gap-2">
+                            <dt>WS mic · stt</dt>
+                            <dd className="tabular-nums text-zinc-400">
+                              {echoLinkRuntimeSnapshot.activeWebSockets?.mic ??
+                                0}{" "}
+                              ·{" "}
+                              {echoLinkRuntimeSnapshot.activeWebSockets?.stt ??
+                                0}
+                            </dd>
+                          </div>
+                        </dl>
+                      ) : null}
                       <ol className="flex flex-col">
                         {pipelineTimelineMeta.map((step, idx) => {
                           const fi = pipelineFirstIncompleteIndex;
@@ -4697,7 +3924,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                               Ative idiomas em Canais de entrada para enviar PCM ao
                               serviço Python (STT) e ver o texto aqui.
                             </p>
-                          ) : running && serviceSttFailed ? (
+                          ) : serviceSttFailed ? (
                             <div className="space-y-2 text-zinc-400">
                               <p className="break-words font-mono text-[11px] leading-snug text-amber-200/90">
                                 {serviceSttBootstrapError ??
@@ -4709,9 +3936,7 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                                 )}
                               </p>
                             </div>
-                          ) : running &&
-                            !serviceSttReady &&
-                            !serviceSttFailed ? (
+                          ) : !serviceSttReady && !serviceSttFailed ? (
                             <p className="text-zinc-500">
                               A ligar transcrição ao serviço (PCM 16 kHz)…
                             </p>
@@ -4720,7 +3945,8 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                               {transcriptLines.length === 0 && !interimTranscript ? (
                                 <p className="text-emerald-600/95">
                                   <span className="text-emerald-500">▌</span>{" "}
-                                  Pronto — inicie a captura e fale.
+                                  Pronto — fale; use Gravar para sessão no
+                                  serviço.
                                 </p>
                               ) : null}
                               {transcriptLines.map((line) => {
@@ -4850,6 +4076,1137 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                     </div>
                   </div>
                 </div>
+  );
+
+
+  return (
+    <div className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-zinc-900 font-mono">
+        <header className="shrink-0 border-b border-zinc-800 bg-zinc-900">
+          <div className="flex flex-col gap-3 px-3 py-3 sm:px-4 lg:flex-row lg:items-center lg:justify-between lg:gap-4">
+            <div className="flex min-w-0 items-center gap-2 sm:gap-3">
+              <div
+                className="flex h-8 w-8 shrink-0 items-center justify-center rounded border border-amber-500/45 bg-zinc-800 text-[9px] font-bold text-amber-300 shadow-inner sm:h-9 sm:w-9 sm:text-[10px]"
+                aria-hidden
+              >
+                EL
+              </div>
+              <div className="min-w-0">
+                <p className="truncate font-mono text-[10px] font-semibold uppercase tracking-[0.18em] text-amber-400 sm:text-[11px] sm:tracking-[0.2em]">
+                  EchoLink
+                </p>
+                <p className="truncate font-mono text-[9px] text-zinc-500 sm:text-[10px]">
+                  Painel · E/S local · WebSocket
+                </p>
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center justify-end gap-2 sm:gap-3 lg:ml-auto">
+              <code className="max-w-[min(100%,14rem)] truncate rounded-md bg-zinc-800 px-2 py-1 text-[9px] text-emerald-300 shadow-inner ring-1 ring-zinc-600/40 sm:text-[10px]">
+                {echoLinkServiceOriginForDisplay()}
+              </code>
+            </div>
+          </div>
+        </header>
+
+        <div className="relative isolate flex min-h-0 flex-1 flex-col bg-zinc-900 lg:flex-row lg:items-stretch">
+            <nav
+              className="app-region-no-drag pointer-events-auto relative z-50 flex shrink-0 flex-row gap-1 overflow-x-auto border-b border-zinc-800 bg-zinc-900 p-2 lg:h-full lg:min-h-0 lg:w-52 lg:max-w-52 lg:flex-col lg:justify-start lg:gap-0 lg:overflow-x-hidden lg:overflow-y-auto lg:self-stretch lg:border-b-0 lg:border-r lg:bg-zinc-950/40 lg:p-0 lg:py-2"
+              aria-label="Navegação do painel"
+            >
+              {navEntries.map((item) => (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={() => {
+                    setSidebarSection(item.id);
+                    saveEchoLinkSettingsToStorage({
+                      sidebarSection: item.id,
+                    });
+                  }}
+                  className={`app-region-no-drag ${navItemBase} min-w-30 touch-manipulation lg:min-w-0 lg:w-full ${sidebarSection === item.id ? navItemActive : navItemIdle}`}
+                >
+                  {item.label}
+                </button>
+              ))}
+            </nav>
+
+            <div className="relative z-0 flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto bg-zinc-900">
+              {sidebarSection === "audioIn" ? (
+                audioInLayoutMode === "mixer" ? (
+                  <div className="flex min-h-0 min-w-0 flex-1 flex-col divide-y divide-zinc-600/35">
+                    <div className="shrink-0 border-b border-zinc-600/35 bg-zinc-900/60 px-3 py-2 sm:px-4">
+                      <p className="text-[10px] font-bold uppercase tracking-[0.22em] text-zinc-200">
+                        Canais de entrada
+                      </p>
+                      <p className="mt-0.5 text-[10px] text-zinc-400">
+                        Mesa de som · faders e VU. O traço no topo de cada faixa
+                        serve para arrastar e mudar a ordem (fica gravado nas
+                        definições). Em cada canal, Editar abre dispositivos,
+                        tempos de captura e teste do microfone.
+                      </p>
+                    </div>
+                    <div className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-transparent">
+                      <div
+                        className={`flex min-h-0 min-w-0 flex-1 flex-row ${mixerSideEditor ? "pointer-events-none invisible" : ""}`}
+                        aria-hidden={mixerSideEditor ? true : undefined}
+                      >
+                        <div className="flex min-h-0 shrink-0 flex-col px-3 py-3 sm:px-4 sm:py-4">
+                          <div className="flex min-h-0 min-w-0 flex-1 items-stretch justify-start gap-3 overflow-x-auto pb-1 sm:gap-5">
+                            {mixerStripOrderForUi.map(
+                              (stripSlot, stackIndex) => {
+                                const stripDnD: MixerStripDnDProps = {
+                                  mixerStripId: stripSlot,
+                                  stripStackIndex: stackIndex,
+                                  draggingMixerStripId,
+                                  onMixerStripDragStart:
+                                    handleMixerStripDragStart,
+                                  onMixerStripDragEnd: handleMixerStripDragEnd,
+                                  onMixerStripDragOver:
+                                    handleMixerStripDragOver,
+                                  onMixerStripDrop: handleMixerStripDrop,
+                                };
+                                if (stripSlot === "ch1") {
+                                  return (
+                                    <MixerConsoleInputChannel
+                                      key={stripSlot}
+                                      channelId={1}
+                                      activateOn={mixerActivate1}
+                                      onActivateToggle={() => {
+                                        setMixerActivate1((v) => {
+                                          const next = !v;
+                                          if (!next) {
+                                            setMixerMute1(true);
+                                            saveEchoLinkSettingsToStorage({
+                                              mixerChannel1Active: next,
+                                              mixerChannel1Muted: true,
+                                            });
+                                          } else {
+                                            saveEchoLinkSettingsToStorage({
+                                              mixerChannel1Active: next,
+                                            });
+                                          }
+                                          return next;
+                                        });
+                                      }}
+                                      onEdit={() => {
+                                        setMixerSideEditor("microphone");
+                                        setAudioInDetailScope("microphone");
+                                        setAudioInChannelTab("microphone");
+                                        saveEchoLinkSettingsToStorage({
+                                          audioInDetailScope: "microphone",
+                                          audioInChannelTab: "microphone",
+                                        });
+                                      }}
+                                      onOpenTranslation={() => {
+                                        setMixerSideEditor("microphone");
+                                        setAudioInDetailScope("microphone");
+                                        setAudioInChannelTab("microphone");
+                                        saveEchoLinkSettingsToStorage({
+                                          audioInDetailScope: "microphone",
+                                          audioInChannelTab: "microphone",
+                                        });
+                                        setMicSpeechTabRequestSeq((n) => n + 1);
+                                      }}
+                                      muted={mixerMute1}
+                                      onMuteToggle={() => {
+                                        setMixerMute1((v) => {
+                                          const next = !v;
+                                          saveEchoLinkSettingsToStorage({
+                                            mixerChannel1Muted: next,
+                                          });
+                                          return next;
+                                        });
+                                      }}
+                                      deviceLabel={
+                                        selectedInputId
+                                          ? (() => {
+                                              const d = audioInputs.find(
+                                                (x) =>
+                                                  x.deviceId ===
+                                                  selectedInputId
+                                              );
+                                              return d
+                                                ? formatMediaDeviceOptionLabel(
+                                                    d,
+                                                    "input",
+                                                    settings
+                                                      .inputDeviceAliases[
+                                                      d.deviceId
+                                                    ]
+                                                  )
+                                                : "…";
+                                            })()
+                                          : "Mic · padrão"
+                                      }
+                                      vuLevel={micVu}
+                                      faderValue={
+                                        settings.primaryChannelMixGainPercent
+                                      }
+                                      onFaderChange={onMixerFaderChange1}
+                                      faderDisabled={false}
+                                      busy={busy}
+                                      routeToMaster={
+                                        settings.mixerChannel1RouteMaster
+                                      }
+                                      routeToMonitor={
+                                        settings.mixerChannel1RouteMonitor
+                                      }
+                                      routeMonitorLocked={false}
+                                      onRouteMasterToggle={() => {
+                                        const next =
+                                          !settings.mixerChannel1RouteMaster;
+                                        saveEchoLinkSettingsToStorage({
+                                          mixerChannel1RouteMaster: next,
+                                        });
+                                        setSettings((prev) => ({
+                                          ...prev,
+                                          mixerChannel1RouteMaster: next,
+                                        }));
+                                      }}
+                                      onRouteMonitorToggle={() => {
+                                        const next =
+                                          !settings.mixerChannel1RouteMonitor;
+                                        saveEchoLinkSettingsToStorage({
+                                          mixerChannel1RouteMonitor: next,
+                                        });
+                                        setSettings((prev) => ({
+                                          ...prev,
+                                          mixerChannel1RouteMonitor: next,
+                                        }));
+                                      }}
+                                      {...stripDnD}
+                                    />
+                                  );
+                                }
+                                if (stripSlot === "ch2") {
+                                  return (
+                                    <MixerConsoleInputChannel
+                                      key={stripSlot}
+                                      channelId={2}
+                                      activateOn={mixerActivate2}
+                                      onActivateToggle={() => {
+                                        setMixerActivate2((v) => {
+                                          const next = !v;
+                                          if (!next) {
+                                            setMixerMute2(true);
+                                            saveEchoLinkSettingsToStorage({
+                                              mixerChannel2Active: next,
+                                              mixerChannel2Muted: true,
+                                            });
+                                          } else {
+                                            saveEchoLinkSettingsToStorage({
+                                              mixerChannel2Active: next,
+                                            });
+                                          }
+                                          return next;
+                                        });
+                                      }}
+                                      onEdit={() => {
+                                        setMixerSideEditor("systemAudio");
+                                        setAudioInDetailScope("systemAudio");
+                                        setAudioInChannelTab("systemAudio");
+                                        saveEchoLinkSettingsToStorage({
+                                          audioInDetailScope: "systemAudio",
+                                          audioInChannelTab: "systemAudio",
+                                        });
+                                      }}
+                                      onOpenTranslation={() => {
+                                        setMixerSideEditor("systemAudio");
+                                        setAudioInDetailScope("systemAudio");
+                                        setAudioInChannelTab("systemAudio");
+                                        saveEchoLinkSettingsToStorage({
+                                          audioInDetailScope: "systemAudio",
+                                          audioInChannelTab: "systemAudio",
+                                        });
+                                      }}
+                                      muted={mixerMute2}
+                                      onMuteToggle={() => {
+                                        setMixerMute2((v) => {
+                                          const next = !v;
+                                          saveEchoLinkSettingsToStorage({
+                                            mixerChannel2Muted: next,
+                                          });
+                                          return next;
+                                        });
+                                      }}
+                                      deviceLabel={
+                                        selectedSecondaryInputId &&
+                                        selectedSecondaryInputId !==
+                                          selectedInputId
+                                          ? (() => {
+                                              const d = audioInputs.find(
+                                                (x) =>
+                                                  x.deviceId ===
+                                                  selectedSecondaryInputId
+                                              );
+                                              return d
+                                                ? formatMediaDeviceOptionLabel(
+                                                    d,
+                                                    "input",
+                                                    settings
+                                                      .inputDeviceAliases[
+                                                      d.deviceId
+                                                    ]
+                                                  )
+                                                : "…";
+                                            })()
+                                          : "Teams · off"
+                                      }
+                                      vuLevel={lineVu}
+                                      faderValue={
+                                        settings.secondaryChannelMixGainPercent
+                                      }
+                                      onFaderChange={onMixerFaderChange2}
+                                      faderDisabled={
+                                        !selectedSecondaryInputId ||
+                                        selectedSecondaryInputId ===
+                                          selectedInputId
+                                      }
+                                      busy={busy}
+                                      routeToMaster={
+                                        settings.mixerChannel2RouteMaster
+                                      }
+                                      routeToMonitor={
+                                        settings.mixerChannel2RouteMonitor
+                                      }
+                                      routeMonitorLocked={false}
+                                      onRouteMasterToggle={() => {
+                                        const next =
+                                          !settings.mixerChannel2RouteMaster;
+                                        saveEchoLinkSettingsToStorage({
+                                          mixerChannel2RouteMaster: next,
+                                        });
+                                        setSettings((prev) => ({
+                                          ...prev,
+                                          mixerChannel2RouteMaster: next,
+                                        }));
+                                      }}
+                                      onRouteMonitorToggle={() => {
+                                        const next =
+                                          !settings.mixerChannel2RouteMonitor;
+                                        saveEchoLinkSettingsToStorage({
+                                          mixerChannel2RouteMonitor: next,
+                                        });
+                                        setSettings((prev) => ({
+                                          ...prev,
+                                          mixerChannel2RouteMonitor: next,
+                                        }));
+                                      }}
+                                      {...stripDnD}
+                                    />
+                                  );
+                                }
+                                if (stripSlot === "ch3") {
+                                  return (
+                                    <MixerConsoleInputChannel
+                                      key={stripSlot}
+                                      channelId={3}
+                                      activateOn={mixerActivate3}
+                                      onActivateToggle={() => {
+                                        setMixerActivate3((v) => {
+                                          const next = !v;
+                                          if (!next) {
+                                            setMixerMute3(true);
+                                            saveEchoLinkSettingsToStorage({
+                                              mixerChannel3Active: next,
+                                              mixerChannel3Muted: true,
+                                            });
+                                          } else {
+                                            saveEchoLinkSettingsToStorage({
+                                              mixerChannel3Active: next,
+                                            });
+                                          }
+                                          return next;
+                                        });
+                                      }}
+                                      onEdit={() => {
+                                        setMixerSideEditor("media");
+                                        setAudioInDetailScope("media");
+                                        setAudioInChannelTab("media");
+                                        saveEchoLinkSettingsToStorage({
+                                          audioInDetailScope: "media",
+                                          audioInChannelTab: "media",
+                                        });
+                                      }}
+                                      onOpenTranslation={() => {
+                                        setMixerSideEditor("media");
+                                        setAudioInDetailScope("media");
+                                        setAudioInChannelTab("media");
+                                        saveEchoLinkSettingsToStorage({
+                                          audioInDetailScope: "media",
+                                          audioInChannelTab: "media",
+                                        });
+                                      }}
+                                      muted={mixerMute3}
+                                      onMuteToggle={() => {
+                                        setMixerMute3((v) => {
+                                          const next = !v;
+                                          saveEchoLinkSettingsToStorage({
+                                            mixerChannel3Muted: next,
+                                          });
+                                          return next;
+                                        });
+                                      }}
+                                      deviceLabel={
+                                        selectedTertiaryInputId &&
+                                        selectedTertiaryInputId !==
+                                          selectedInputId &&
+                                        selectedTertiaryInputId !==
+                                          selectedSecondaryInputId
+                                          ? (() => {
+                                              const d = audioInputs.find(
+                                                (x) =>
+                                                  x.deviceId ===
+                                                  selectedTertiaryInputId
+                                              );
+                                              return d
+                                                ? formatMediaDeviceOptionLabel(
+                                                    d,
+                                                    "input",
+                                                    settings
+                                                      .inputDeviceAliases[
+                                                      d.deviceId
+                                                    ]
+                                                  )
+                                                : "…";
+                                            })()
+                                          : "MÍDIA · off"
+                                      }
+                                      vuLevel={mediaVu}
+                                      faderValue={
+                                        settings.tertiaryChannelMixGainPercent
+                                      }
+                                      onFaderChange={onMixerFaderChange3}
+                                      faderDisabled={
+                                        !selectedTertiaryInputId ||
+                                        selectedTertiaryInputId ===
+                                          selectedInputId ||
+                                        selectedTertiaryInputId ===
+                                          selectedSecondaryInputId
+                                      }
+                                      busy={busy}
+                                      routeToMaster={
+                                        settings.mixerChannel3RouteMaster
+                                      }
+                                      routeToMonitor={
+                                        settings.mixerChannel3RouteMonitor
+                                      }
+                                      routeMonitorLocked={false}
+                                      onRouteMasterToggle={() => {
+                                        const next =
+                                          !settings.mixerChannel3RouteMaster;
+                                        saveEchoLinkSettingsToStorage({
+                                          mixerChannel3RouteMaster: next,
+                                        });
+                                        setSettings((prev) => ({
+                                          ...prev,
+                                          mixerChannel3RouteMaster: next,
+                                        }));
+                                      }}
+                                      onRouteMonitorToggle={() => {
+                                        const next =
+                                          !settings.mixerChannel3RouteMonitor;
+                                        saveEchoLinkSettingsToStorage({
+                                          mixerChannel3RouteMonitor: next,
+                                        });
+                                        setSettings((prev) => ({
+                                          ...prev,
+                                          mixerChannel3RouteMonitor: next,
+                                        }));
+                                      }}
+                                      {...stripDnD}
+                                    />
+                                  );
+                                }
+                                if (stripSlot === "output") {
+                                  return (
+                                    <MixerConsoleOutputChannel
+                                      key={stripSlot}
+                                      activateOn={pipelineMasterOutputEnabled}
+                                      onActivateToggle={() => {
+                                        setPipelineMasterOutputEnabled(
+                                          (prev) => {
+                                            const next = !prev;
+                                            setSettings((p) => ({
+                                              ...p,
+                                              pipelineMasterOutputEnabled:
+                                                next,
+                                            }));
+                                            saveEchoLinkSettingsToStorage({
+                                              pipelineMasterOutputEnabled:
+                                                next,
+                                            });
+                                            return next;
+                                          }
+                                        );
+                                      }}
+                                      onEdit={() => {
+                                        setMixerSideEditor("outputMaster");
+                                      }}
+                                      muted={mixerOutputMute}
+                                      onMuteToggle={() => {
+                                        setMixerOutputMute((v) => {
+                                          const next = !v;
+                                          saveEchoLinkSettingsToStorage({
+                                            mixerOutputMuted: next,
+                                          });
+                                          return next;
+                                        });
+                                      }}
+                                      deviceLabel={
+                                        masterOutputEffectiveId
+                                          ? masterOutputEffectiveLabel ||
+                                            `${masterOutputEffectiveId.slice(0, 14)}…`
+                                          : "Saída EchoLink · indisponível"
+                                      }
+                                      vuLevel={pipelineOutVu}
+                                      faderValue={
+                                        settings.outputChannelMixGainPercent
+                                      }
+                                      onFaderChange={onMixerFaderChange4}
+                                      faderDisabled={!masterOutputEffectiveId}
+                                      busy={busy}
+                                      activateDisabled={busy && !running}
+                                      {...stripDnD}
+                                    />
+                                  );
+                                }
+                                if (stripSlot === "monitor") {
+                                  return (
+                                    <MixerConsoleMonitorChannel
+                                      key={stripSlot}
+                                      activateOn={pipelineMonitorEnabled}
+                                      onActivateToggle={() => {
+                                        setPipelineMonitorEnabled((prev) => {
+                                          const next = !prev;
+                                          setSettings((p) => ({
+                                            ...p,
+                                            pipelineMonitorEnabled: next,
+                                          }));
+                                          saveEchoLinkSettingsToStorage({
+                                            pipelineMonitorEnabled: next,
+                                          });
+                                          return next;
+                                        });
+                                      }}
+                                      onEdit={() => {
+                                        setMixerSideEditor("outputMonitor");
+                                      }}
+                                      muted={mixerMonitorMute}
+                                      onMuteToggle={() => {
+                                        setMixerMonitorMute((v) => {
+                                          const next = !v;
+                                          saveEchoLinkSettingsToStorage({
+                                            mixerMonitorMuted: next,
+                                          });
+                                          return next;
+                                        });
+                                      }}
+                                      deviceLabel={
+                                        pipelinePlaybackOutputId
+                                          ? pipelinePlaybackOutputLabel ||
+                                            `${pipelinePlaybackOutputId.slice(0, 14)}…`
+                                          : "Saída · padrão"
+                                      }
+                                      vuLevel={pipelineOutVu}
+                                      faderValue={Math.round(
+                                        pipelineMonitorGain * 100
+                                      )}
+                                      onFaderChange={
+                                        onMixerPipelineMonitorFaderChange
+                                      }
+                                      faderDisabled={false}
+                                      busy={busy}
+                                      activateDisabled={busy && !running}
+                                      {...stripDnD}
+                                    />
+                                  );
+                                }
+                                return null;
+                              }
+                            )}
+                          </div>
+                        </div>
+                        <div
+                          className="min-h-0 min-w-0 flex-1 bg-transparent"
+                          aria-hidden
+                        />
+                      </div>
+                      {mixerSideEditor ? (
+                        <div className="absolute inset-0 z-10 flex min-h-0 min-w-0 flex-col bg-zinc-950/98 ring-1 ring-zinc-700/60">
+                          <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-zinc-700/50 bg-zinc-950/90 px-3 py-2 sm:px-4">
+                            <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-zinc-300 sm:text-[11px]">
+                              {mixerSideEditor === "microphone"
+                                ? "Canal 1 · microfone"
+                                : mixerSideEditor === "systemAudio"
+                                  ? "Canal 2 · linha"
+                                  : mixerSideEditor === "media"
+                                    ? "Canal 3 · mídia"
+                                    : mixerSideEditor === "outputMaster"
+                                      ? "Saída Master · EchoLink"
+                                      : "Monitor · fones / pipeline"}
+                            </p>
+                            <div className="flex flex-wrap items-center justify-end gap-2">
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => void refreshMediaDevices()}
+                                className={btnSecondary}
+                              >
+                                Atualizar
+                              </button>
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => void unlockMediaLabels()}
+                                className={btnSecondary}
+                              >
+                                Nomes
+                              </button>
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => setMixerSideEditor(null)}
+                                className="panel-bezel inline-flex min-h-9 items-center justify-center rounded-md bg-zinc-800 px-3 font-mono text-[10px] font-bold uppercase tracking-wide text-zinc-200 ring-1 ring-zinc-600/50 transition hover:bg-zinc-700 sm:min-h-8 sm:text-[11px]"
+                              >
+                                Fechar
+                              </button>
+                            </div>
+                          </div>
+                          <div className="min-h-0 flex-1 overflow-y-auto">
+                            {mixerSideEditor === "microphone" ? (
+                              <AudioInMicInputDetailPanel
+                                embedded
+                                audioInDetailScope="microphone"
+                                settings={settings}
+                                setSettings={setSettings}
+                                selectedInputId={selectedInputId}
+                                setSelectedInputId={setSelectedInputId}
+                                selectedSecondaryInputId={
+                                  selectedSecondaryInputId
+                                }
+                                selectedTertiaryInputId={selectedTertiaryInputId}
+                                setSelectedSecondaryInputId={
+                                  setSelectedSecondaryInputId
+                                }
+                                setSelectedTertiaryInputId={
+                                  setSelectedTertiaryInputId
+                                }
+                                audioInputs={audioInputs}
+                                busy={busy}
+                                micTesting={micTesting}
+                                outputTesting={outputTesting}
+                                meterSampleRate={meterSampleRate}
+                                selectClass={selectClass}
+                                btnSky={btnSky}
+                                setSettingsField={setSettingsField}
+                                testMicrophone={testMicrophone}
+                                elevenLabsVoiceSelectOptions={
+                                  elevenLabsVoiceSelectOptions
+                                }
+                                elevenLabsVoiceSelectUiValue={
+                                  elevenLabsVoiceSelectUiValue
+                                }
+                                elevenLabsVoicesLoading={
+                                  elevenLabsVoicesLoading
+                                }
+                                voiceTranslationEnabled={
+                                  voiceTranslationEnabled
+                                }
+                                setVoiceTranslationEnabled={
+                                  setVoiceTranslationEnabled
+                                }
+                                voiceTranslationBackendStatus={
+                                  voiceTranslationBackendStatus
+                                }
+                                lastSelfPhraseMonitor={lastSelfPhraseMonitor}
+                                micSpeechTabRequestSeq={micSpeechTabRequestSeq}
+                                routeToMaster={
+                                  settings.mixerChannel1RouteMaster
+                                }
+                                routeToMonitor={
+                                  settings.mixerChannel1RouteMonitor
+                                }
+                                routeMonitorLocked={false}
+                                routeMasterDisabled={
+                                  busy || !mixerActivate1
+                                }
+                                routeMonitorDisabled={
+                                  busy || !mixerActivate1
+                                }
+                                onRouteMasterToggle={() => {
+                                  const next =
+                                    !settings.mixerChannel1RouteMaster;
+                                  saveEchoLinkSettingsToStorage({
+                                    mixerChannel1RouteMaster: next,
+                                  });
+                                  setSettings((prev) => ({
+                                    ...prev,
+                                    mixerChannel1RouteMaster: next,
+                                  }));
+                                }}
+                                onRouteMonitorToggle={() => {
+                                  const next =
+                                    !settings.mixerChannel1RouteMonitor;
+                                  saveEchoLinkSettingsToStorage({
+                                    mixerChannel1RouteMonitor: next,
+                                  });
+                                  setSettings((prev) => ({
+                                    ...prev,
+                                    mixerChannel1RouteMonitor: next,
+                                  }));
+                                }}
+                              />
+                            ) : mixerSideEditor === "systemAudio" ? (
+                              <AudioInLineInputDetailPanel
+                                embedded
+                                audioInDetailScope="systemAudio"
+                                settings={settings}
+                                setSettings={setSettings}
+                                selectedInputId={selectedInputId}
+                                selectedSecondaryInputId={
+                                  selectedSecondaryInputId
+                                }
+                                selectedTertiaryInputId={selectedTertiaryInputId}
+                                setSelectedSecondaryInputId={
+                                  setSelectedSecondaryInputId
+                                }
+                                setSelectedTertiaryInputId={
+                                  setSelectedTertiaryInputId
+                                }
+                                audioInputs={audioInputs}
+                                busy={busy}
+                                selectClass={selectClass}
+                                previewVuLevel={lineVu}
+                                routeToMaster={
+                                  settings.mixerChannel2RouteMaster
+                                }
+                                routeToMonitor={
+                                  settings.mixerChannel2RouteMonitor
+                                }
+                                routeMonitorLocked={false}
+                                routeMasterDisabled={
+                                  busy ||
+                                  !mixerActivate2 ||
+                                  !selectedSecondaryInputId ||
+                                  selectedSecondaryInputId === selectedInputId
+                                }
+                                routeMonitorDisabled={
+                                  busy ||
+                                  !mixerActivate2 ||
+                                  !selectedSecondaryInputId ||
+                                  selectedSecondaryInputId === selectedInputId
+                                }
+                                onRouteMasterToggle={() => {
+                                  const next =
+                                    !settings.mixerChannel2RouteMaster;
+                                  saveEchoLinkSettingsToStorage({
+                                    mixerChannel2RouteMaster: next,
+                                  });
+                                  setSettings((prev) => ({
+                                    ...prev,
+                                    mixerChannel2RouteMaster: next,
+                                  }));
+                                }}
+                                onRouteMonitorToggle={() => {
+                                  const next =
+                                    !settings.mixerChannel2RouteMonitor;
+                                  saveEchoLinkSettingsToStorage({
+                                    mixerChannel2RouteMonitor: next,
+                                  });
+                                  setSettings((prev) => ({
+                                    ...prev,
+                                    mixerChannel2RouteMonitor: next,
+                                  }));
+                                }}
+                              />
+                            ) : mixerSideEditor === "media" ? (
+                              <AudioInMediaInputDetailPanel
+                                embedded
+                                audioInDetailScope="media"
+                                settings={settings}
+                                setSettings={setSettings}
+                                selectedInputId={selectedInputId}
+                                selectedSecondaryInputId={
+                                  selectedSecondaryInputId
+                                }
+                                selectedTertiaryInputId={selectedTertiaryInputId}
+                                setSelectedTertiaryInputId={
+                                  setSelectedTertiaryInputId
+                                }
+                                audioInputs={audioInputs}
+                                busy={busy}
+                                selectClass={selectClass}
+                                previewVuLevel={mediaVu}
+                                routeToMaster={
+                                  settings.mixerChannel3RouteMaster
+                                }
+                                routeToMonitor={
+                                  settings.mixerChannel3RouteMonitor
+                                }
+                                routeMonitorLocked={false}
+                                routeMasterDisabled={
+                                  busy ||
+                                  !mixerActivate3 ||
+                                  !selectedTertiaryInputId ||
+                                  selectedTertiaryInputId === selectedInputId ||
+                                  selectedTertiaryInputId ===
+                                    selectedSecondaryInputId
+                                }
+                                routeMonitorDisabled={
+                                  busy ||
+                                  !mixerActivate3 ||
+                                  !selectedTertiaryInputId ||
+                                  selectedTertiaryInputId === selectedInputId ||
+                                  selectedTertiaryInputId ===
+                                    selectedSecondaryInputId
+                                }
+                                onRouteMasterToggle={() => {
+                                  const next =
+                                    !settings.mixerChannel3RouteMaster;
+                                  saveEchoLinkSettingsToStorage({
+                                    mixerChannel3RouteMaster: next,
+                                  });
+                                  setSettings((prev) => ({
+                                    ...prev,
+                                    mixerChannel3RouteMaster: next,
+                                  }));
+                                }}
+                                onRouteMonitorToggle={() => {
+                                  const next =
+                                    !settings.mixerChannel3RouteMonitor;
+                                  saveEchoLinkSettingsToStorage({
+                                    mixerChannel3RouteMonitor: next,
+                                  });
+                                  setSettings((prev) => ({
+                                    ...prev,
+                                    mixerChannel3RouteMonitor: next,
+                                  }));
+                                }}
+                              />
+                            ) : mixerSideEditor === "outputMaster" ? (
+                              audioOutMasterDetailSections
+                            ) : (
+                              audioOutMonitorDetailSections
+                            )}
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="divide-y divide-zinc-600/35">
+                    <div className="flex flex-wrap items-center gap-2 border-b border-zinc-600/35 bg-zinc-950/60 px-3 py-2 sm:px-4">
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => {
+                          setAudioInLayoutMode("mixer");
+                          setAudioInDetailScope("both");
+                          setMixerSideEditor(null);
+                          saveEchoLinkSettingsToStorage({
+                            audioInLayoutMode: "mixer",
+                            audioInDetailScope: "both",
+                          });
+                        }}
+                        className="panel-bezel inline-flex min-h-9 items-center justify-center rounded-md bg-zinc-800 px-3 font-mono text-[10px] font-bold uppercase tracking-wide text-zinc-200 ring-1 ring-zinc-600/50 transition hover:bg-zinc-700 sm:min-h-8 sm:text-[11px]"
+                      >
+                        Voltar à mesa
+                      </button>
+                    </div>
+                    <div className="border-b border-zinc-600/35 bg-zinc-900/60 px-3 py-2 sm:px-4">
+                      <p className="text-[10px] font-bold uppercase tracking-[0.22em] text-zinc-200">
+                        Canais de entrada
+                      </p>
+                      {audioInDetailScope === "both" ? (
+                        <p className="mt-0.5 text-[10px] text-zinc-400">
+                          Cada separador é um canal de entrada. O medidor VU, os
+                          tempos de bloco, idioma/tradução e voz ElevenLabs
+                          (nuvem) ficam no canal 1 (microfone). Os canais ativos
+                          (até três entradas) são misturados antes do STT e do
+                          envio ao serviço.
+                        </p>
+                      ) : audioInDetailScope === "microphone" ? (
+                        <p className="mt-0.5 text-[10px] text-zinc-400">
+                          Definições só do microfone (canal 1): dispositivo, nível
+                          na mesa, VU, tempos de captura, idioma/tradução, voz
+                          ElevenLabs (nuvem) e teste do mic.
+                        </p>
+                      ) : audioInDetailScope === "systemAudio" ? (
+                        <p className="mt-0.5 text-[10px] text-zinc-400">
+                          Definições da entrada adicional (canal 2): dispositivo,
+                          medidor em tempo real e nível na mesa. Tempos de bloco
+                          seguem o canal 1.
+                        </p>
+                      ) : (
+                        <p className="mt-0.5 text-[10px] text-zinc-400">
+                          Definições da entrada mídia (canal 3): dispositivo,
+                          medidor em tempo real e nível na mesa. Tempos de bloco
+                          seguem o canal 1.
+                        </p>
+                      )}
+                      <p className="mt-2 text-[9px] leading-snug text-zinc-500">
+                        Os nomes vêm do navegador e podem diferir do sistema. O
+                        sufixo após “·” identifica o dispositivo na Web.
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap gap-2 border-b border-zinc-600/35 bg-zinc-900/40 px-3 py-2 sm:px-4">
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => void refreshMediaDevices()}
+                        className={btnSecondary}
+                      >
+                        Atualizar
+                      </button>
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => void unlockMediaLabels()}
+                        className={btnSecondary}
+                      >
+                        Nomes
+                      </button>
+                    </div>
+                  {audioInDetailScope === "both" ? (
+                    <div
+                      className="border-b border-zinc-600/35 bg-zinc-950/30 px-3 py-2 sm:px-4"
+                      role="tablist"
+                      aria-label="Canais de entrada"
+                    >
+                      <div className="flex flex-wrap gap-1">
+                        <button
+                          type="button"
+                          role="tab"
+                          aria-selected={audioInChannelTab === "microphone"}
+                          id="audio-in-tab-mic"
+                          className={`panel-bezel rounded-md px-3 py-2 text-left text-[10px] font-bold uppercase tracking-[0.12em] transition sm:text-[11px] ${
+                            audioInChannelTab === "microphone"
+                              ? "bg-zinc-800 text-amber-400 ring-1 ring-amber-600/35"
+                              : "text-zinc-500 ring-1 ring-transparent hover:bg-zinc-800/50 hover:text-zinc-300"
+                          }`}
+                          onClick={() => {
+                            setAudioInChannelTab("microphone");
+                            saveEchoLinkSettingsToStorage({
+                              audioInChannelTab: "microphone",
+                            });
+                          }}
+                        >
+                          Canal 1 · microfone
+                        </button>
+                        <button
+                          type="button"
+                          role="tab"
+                          aria-selected={audioInChannelTab === "systemAudio"}
+                          id="audio-in-tab-audio"
+                          className={`panel-bezel rounded-md px-3 py-2 text-left text-[10px] font-bold uppercase tracking-[0.12em] transition sm:text-[11px] ${
+                            audioInChannelTab === "systemAudio"
+                              ? "bg-zinc-800 text-amber-400 ring-1 ring-amber-600/35"
+                              : "text-zinc-500 ring-1 ring-transparent hover:bg-zinc-800/50 hover:text-zinc-300"
+                          }`}
+                          onClick={() => {
+                            setAudioInChannelTab("systemAudio");
+                            saveEchoLinkSettingsToStorage({
+                              audioInChannelTab: "systemAudio",
+                            });
+                          }}
+                        >
+                          Canal 2 · áudio
+                        </button>
+                        <button
+                          type="button"
+                          role="tab"
+                          aria-selected={audioInChannelTab === "media"}
+                          id="audio-in-tab-media"
+                          className={`panel-bezel rounded-md px-3 py-2 text-left text-[10px] font-bold uppercase tracking-[0.12em] transition sm:text-[11px] ${
+                            audioInChannelTab === "media"
+                              ? "bg-zinc-800 text-amber-400 ring-1 ring-amber-600/35"
+                              : "text-zinc-500 ring-1 ring-transparent hover:bg-zinc-800/50 hover:text-zinc-300"
+                          }`}
+                          onClick={() => {
+                            setAudioInChannelTab("media");
+                            saveEchoLinkSettingsToStorage({
+                              audioInChannelTab: "media",
+                            });
+                          }}
+                        >
+                          Canal 3 · mídia
+                        </button>
+                      </div>
+                    </div>
+                  ) : null}
+                  <div className="grid grid-cols-1 gap-0 divide-y divide-zinc-600/35">
+                    {audioInActivePanel === "microphone" ? (
+                      <AudioInMicInputDetailPanel
+                        embedded={false}
+                        audioInDetailScope={audioInDetailScope}
+                        settings={settings}
+                        setSettings={setSettings}
+                        selectedInputId={selectedInputId}
+                        setSelectedInputId={setSelectedInputId}
+                        selectedSecondaryInputId={selectedSecondaryInputId}
+                        selectedTertiaryInputId={selectedTertiaryInputId}
+                        setSelectedSecondaryInputId={setSelectedSecondaryInputId}
+                        setSelectedTertiaryInputId={setSelectedTertiaryInputId}
+                        audioInputs={audioInputs}
+                        busy={busy}
+                        micTesting={micTesting}
+                        outputTesting={outputTesting}
+                        meterSampleRate={meterSampleRate}
+                        selectClass={selectClass}
+                        btnSky={btnSky}
+                        setSettingsField={setSettingsField}
+                        testMicrophone={testMicrophone}
+                        elevenLabsVoiceSelectOptions={
+                          elevenLabsVoiceSelectOptions
+                        }
+                        elevenLabsVoiceSelectUiValue={
+                          elevenLabsVoiceSelectUiValue
+                        }
+                        elevenLabsVoicesLoading={elevenLabsVoicesLoading}
+                        voiceTranslationEnabled={voiceTranslationEnabled}
+                        setVoiceTranslationEnabled={
+                          setVoiceTranslationEnabled
+                        }
+                        voiceTranslationBackendStatus={
+                          voiceTranslationBackendStatus
+                        }
+                        lastSelfPhraseMonitor={lastSelfPhraseMonitor}
+                        micSpeechTabRequestSeq={micSpeechTabRequestSeq}
+                        routeToMaster={settings.mixerChannel1RouteMaster}
+                        routeToMonitor={settings.mixerChannel1RouteMonitor}
+                        routeMonitorLocked={false}
+                        routeMasterDisabled={busy || !mixerActivate1}
+                        routeMonitorDisabled={busy || !mixerActivate1}
+                        onRouteMasterToggle={() => {
+                          const next = !settings.mixerChannel1RouteMaster;
+                          saveEchoLinkSettingsToStorage({
+                            mixerChannel1RouteMaster: next,
+                          });
+                          setSettings((prev) => ({
+                            ...prev,
+                            mixerChannel1RouteMaster: next,
+                          }));
+                        }}
+                        onRouteMonitorToggle={() => {
+                          const next = !settings.mixerChannel1RouteMonitor;
+                          saveEchoLinkSettingsToStorage({
+                            mixerChannel1RouteMonitor: next,
+                          });
+                          setSettings((prev) => ({
+                            ...prev,
+                            mixerChannel1RouteMonitor: next,
+                          }));
+                        }}
+                      />
+                    ) : audioInActivePanel === "systemAudio" ? (
+                      <AudioInLineInputDetailPanel
+                        embedded={false}
+                        audioInDetailScope={audioInDetailScope}
+                        settings={settings}
+                        setSettings={setSettings}
+                        selectedInputId={selectedInputId}
+                        selectedSecondaryInputId={selectedSecondaryInputId}
+                        selectedTertiaryInputId={selectedTertiaryInputId}
+                        setSelectedSecondaryInputId={setSelectedSecondaryInputId}
+                        setSelectedTertiaryInputId={setSelectedTertiaryInputId}
+                        audioInputs={audioInputs}
+                        busy={busy}
+                        selectClass={selectClass}
+                        previewVuLevel={lineVu}
+                        routeToMaster={settings.mixerChannel2RouteMaster}
+                        routeToMonitor={settings.mixerChannel2RouteMonitor}
+                        routeMonitorLocked={false}
+                        routeMasterDisabled={
+                          busy ||
+                          !mixerActivate2 ||
+                          !selectedSecondaryInputId ||
+                          selectedSecondaryInputId === selectedInputId
+                        }
+                        routeMonitorDisabled={
+                          busy ||
+                          !mixerActivate2 ||
+                          !selectedSecondaryInputId ||
+                          selectedSecondaryInputId === selectedInputId
+                        }
+                        onRouteMasterToggle={() => {
+                          const next = !settings.mixerChannel2RouteMaster;
+                          saveEchoLinkSettingsToStorage({
+                            mixerChannel2RouteMaster: next,
+                          });
+                          setSettings((prev) => ({
+                            ...prev,
+                            mixerChannel2RouteMaster: next,
+                          }));
+                        }}
+                        onRouteMonitorToggle={() => {
+                          const next = !settings.mixerChannel2RouteMonitor;
+                          saveEchoLinkSettingsToStorage({
+                            mixerChannel2RouteMonitor: next,
+                          });
+                          setSettings((prev) => ({
+                            ...prev,
+                            mixerChannel2RouteMonitor: next,
+                          }));
+                        }}
+                      />
+                    ) : (
+                      <AudioInMediaInputDetailPanel
+                        embedded={false}
+                        audioInDetailScope={audioInDetailScope}
+                        settings={settings}
+                        setSettings={setSettings}
+                        selectedInputId={selectedInputId}
+                        selectedSecondaryInputId={selectedSecondaryInputId}
+                        selectedTertiaryInputId={selectedTertiaryInputId}
+                        setSelectedTertiaryInputId={setSelectedTertiaryInputId}
+                        audioInputs={audioInputs}
+                        busy={busy}
+                        selectClass={selectClass}
+                        previewVuLevel={mediaVu}
+                        routeToMaster={settings.mixerChannel3RouteMaster}
+                        routeToMonitor={settings.mixerChannel3RouteMonitor}
+                        routeMonitorLocked={false}
+                        routeMasterDisabled={
+                          busy ||
+                          !mixerActivate3 ||
+                          !selectedTertiaryInputId ||
+                          selectedTertiaryInputId === selectedInputId ||
+                          selectedTertiaryInputId === selectedSecondaryInputId
+                        }
+                        routeMonitorDisabled={
+                          busy ||
+                          !mixerActivate3 ||
+                          !selectedTertiaryInputId ||
+                          selectedTertiaryInputId === selectedInputId ||
+                          selectedTertiaryInputId === selectedSecondaryInputId
+                        }
+                        onRouteMasterToggle={() => {
+                          const next = !settings.mixerChannel3RouteMaster;
+                          saveEchoLinkSettingsToStorage({
+                            mixerChannel3RouteMaster: next,
+                          });
+                          setSettings((prev) => ({
+                            ...prev,
+                            mixerChannel3RouteMaster: next,
+                          }));
+                        }}
+                        onRouteMonitorToggle={() => {
+                          const next = !settings.mixerChannel3RouteMonitor;
+                          saveEchoLinkSettingsToStorage({
+                            mixerChannel3RouteMonitor: next,
+                          });
+                          setSettings((prev) => ({
+                            ...prev,
+                            mixerChannel3RouteMonitor: next,
+                          }));
+                        }}
+                      />
+                    )}
+                  </div>
+                </div>
+                )
+              ) : sidebarSection === "monitor" ? (
+                monitoramentoSectionPanel
               ) : sidebarSection === "vocabulary" ? (
                 <div className="flex min-h-0 flex-1 flex-col px-3 py-3 sm:px-4 sm:py-4">
                   <div className="mb-4 flex shrink-0 flex-wrap items-end justify-between gap-3 border-b border-zinc-600/35 pb-3">
@@ -5228,8 +5585,8 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                     </p>
                     <p className="text-[10px] uppercase leading-snug tracking-wide text-zinc-300 sm:text-[11px]">
                       {running
-                        ? "Captura ligada — áudio ao serviço e texto via STT (nuvem ou Vosk)."
-                        : "Iniciar envia áudio ao serviço e PCM para transcrição."}
+                        ? "Gravação ligada — áudio ao serviço e sessão em ficheiro."
+                        : "Gravar envia áudio ao serviço; STT e tradução podem funcionar sem gravar."}
                     </p>
                   </div>
                   <p className="mb-4 text-[10px] leading-relaxed text-zinc-400 sm:text-[11px]">
@@ -5314,9 +5671,9 @@ export function MicCapture({ audioPipelineInject }: MicCaptureProps = {}) {
                         <div className="flex flex-wrap justify-between gap-x-2 gap-y-0.5">
                           <span className="text-zinc-500">Saída alvo</span>
                           <span className="max-w-[58%] truncate text-right text-zinc-200">
-                            {selectedOutputId
-                              ? selectedOutputLabel ||
-                                `${selectedOutputId.slice(0, 12)}…`
+                            {selectedMonitorOutputId
+                              ? selectedMonitorOutputLabel ||
+                                `${selectedMonitorOutputId.slice(0, 12)}…`
                               : "Padrão do sistema"}
                           </span>
                         </div>

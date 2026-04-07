@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "sessionId": "20260406T003024Z_14cdaa3e4fde",
+  "startedAt": "2026-04-06T00:30:24Z",
+  "endedAt": "2026-04-06T00:31:16Z",
+  "interimPt": null,
+  "messages": [
+    {
+      "id": 2,
+      "journalKey": "32cef561-d1e3-4a3e-88e7-ea50d48abab4",
+      "chatSpeaker": "self",
+      "pt": "Você sabe se vai deploy.",
+      "en": "You know if you're going to deploy.",
+      "translationOrigin": "cache"
+    },
+    {
+      "id": 4,
+      "journalKey": "81bed61c-5274-4a9c-9914-58d4193443fd",
+      "chatSpeaker": "self",
+      "pt": "eu vou até esperando.",
+      "en": "I'm even going to wait.",
+      "translationOrigin": "cache"
+    }
+  ]
+}

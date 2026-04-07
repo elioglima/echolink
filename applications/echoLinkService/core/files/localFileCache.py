@@ -264,6 +264,7 @@ def write_echo_link_config_slices(state: dict[str, Any]) -> None:
         for k in (
             "selectedOutputDeviceId",
             "outputDeviceAliases",
+            "pipelineMasterOutputEnabled",
             "pipelineMonitorEnabled",
             "pipelineMonitorGainPercent",
             "speechReceiveLanguage",

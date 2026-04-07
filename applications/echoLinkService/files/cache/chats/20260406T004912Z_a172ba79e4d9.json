@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "sessionId": "20260406T004912Z_a172ba79e4d9",
+  "startedAt": "2026-04-06T00:49:12Z",
+  "endedAt": "2026-04-06T00:49:39Z",
+  "interimPt": null,
+  "messages": [
+    {
+      "id": 2,
+      "journalKey": "294e6245-f6f0-4a4a-a418-6f0d327acee3",
+      "chatSpeaker": "self",
+      "pt": "O que eu posso fazer para te ajudar?",
+      "en": "What can I do to help you?",
+      "translationOrigin": "cache"
+    }
+  ]
+}

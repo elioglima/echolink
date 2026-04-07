@@ -51,8 +51,21 @@ export function getEchoLinkMicWebSocketUrl(): string {
   return buildEchoLinkWebSocketUrl("/ws/mic");
 }
 
-export function getEchoLinkSttWebSocketUrl(): string {
-  return buildEchoLinkWebSocketUrl("/ws/stt");
+export function getEchoLinkSttWebSocketUrl(phraseSilenceCutMs?: number): string {
+  const base = buildEchoLinkWebSocketUrl("/ws/stt");
+  if (phraseSilenceCutMs === undefined) {
+    return base;
+  }
+  try {
+    const u = new URL(base);
+    u.searchParams.set(
+      "phraseSilenceCutMs",
+      String(Math.round(phraseSilenceCutMs))
+    );
+    return u.toString();
+  } catch {
+    return base;
+  }
 }
 
 export function openEchoLinkServiceWebSocket(path: string): WebSocket {

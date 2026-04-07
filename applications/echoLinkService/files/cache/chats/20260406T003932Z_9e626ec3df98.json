@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "sessionId": "20260406T003932Z_9e626ec3df98",
+  "startedAt": "2026-04-06T00:39:32Z",
+  "endedAt": "2026-04-06T00:41:46Z",
+  "interimPt": null,
+  "messages": [
+    {
+      "id": 2,
+      "journalKey": "d90c7f09-c424-4a25-b8c1-ceaf773a5811",
+      "chatSpeaker": "self",
+      "pt": "que ir naquela reunião.",
+      "en": "I want to go to that meeting.",
+      "translationOrigin": "cache"
+    },
+    {
+      "id": 4,
+      "journalKey": "2bfc55c8-ed0e-46b8-91e9-3ef73faf7047",
+      "chatSpeaker": "self",
+      "pt": "eu vou ter que ir lá na reunião.",
+      "en": "I'm going to have to go there at the meeting.",
+      "translationOrigin": "cache"
+    },
+    {
+      "id": 6,
+      "journalKey": "d73095ac-6e36-4f07-899c-c1c61d5b653a",
+      "chatSpeaker": "self",
+      "pt": "certeza.",
+      "en": "certainty.",
+      "translationOrigin": "cache"
+    },
+    {
+      "id": 8,
+      "journalKey": "8f31ec53-1cf8-4e06-9f53-d7523d4592d1",
+      "chatSpeaker": "self",
+      "pt": "Não",
+      "en": "Nope",
+      "translationOrigin": "cache"
+    },
+    {
+      "id": 10,
+      "journalKey": "15c61de6-612a-407b-a541-3e22f3809c6b",
+      "chatSpeaker": "self",
+      "pt": "Mas eu quero ir muito lá na",
+      "en": "But I really want to go there",
+      "translationOrigin": "cache"
+    },
+    {
+      "id": 12,
+      "journalKey": "2f2fc32f-27c7-4e5a-a788-861793d8f94b",
+      "chatSpeaker": "self",
+      "pt": "Frontire.",
+      "en": "Frontier.",
+      "translationOrigin": "cache"
+    }
+  ]
+}

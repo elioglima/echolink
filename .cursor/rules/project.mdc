@@ -19,6 +19,11 @@ alwaysApply: true
 - **Python:** `applications/echoLinkService` — API/pipeline (FastAPI, uvicorn).
 - **Frontend:** `applications/echolinkApp` — Next.js + Electron.
 
+## Processamento vs UI
+
+- **Regra:** lógica de domínio e integrações (STT, tradução, TTS, regras de qualidade de texto, orquestração de pipeline) ficam no **serviço Python**. O front **recebe** resultados e parâmetros (JSON/WebSocket), **mostra** estado e **persiste** preferências do utilizador; só envia de volta o que for comando ou patch de configuração.
+- **Exceções aceitáveis no cliente:** Web Audio (mistura, VU, roteamento para altifalantes), reprodução local, cache offline opcional e validação leve de UX — sem duplicar regras de negócio que já existam na API; alinhar com o backend quando houver equivalente.
+
 ## Commits e branches
 
 - Commits em **português**, **Conventional Commits**, mensagens objetivas. Branch curta alinhada ao escopo quando o usuário pedir fluxo git completo.

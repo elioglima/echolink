@@ -14,8 +14,12 @@ ENV/
 htmlcov/
 *.egg
 pip-wheel-metadata/
+
+# Credenciais e ficheiros de ambiente — não versionar (nem .env.local, .env.prd, etc.)
 .env
 .env.*
+!.env.example
+
 node_modules/
 .next/
 out/

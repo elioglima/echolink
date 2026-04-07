@@ -7,9 +7,38 @@ function clampLinear(n: number): number {
   return Math.max(0, Math.min(2, n));
 }
 
+export type ChannelRoutePair = {
+  master: boolean;
+  monitor: boolean;
+};
+
+const ROUTE_DEFAULT: ChannelRoutePair = {
+  master: true,
+  monitor: true,
+};
+
+function routeToMasterLinear(route: ChannelRoutePair): number {
+  if (!route.master && !route.monitor) {
+    return 1;
+  }
+  return route.master ? 1 : 0;
+}
+
+function routeToMonitorLinear(route: ChannelRoutePair): number {
+  if (!route.master && !route.monitor) {
+    return 1;
+  }
+  return route.monitor ? 1 : 0;
+}
+
 export type MixGainControls = {
   setPrimaryLinear: (n: number) => void;
   setSecondaryLinear: (n: number) => void;
+  setPrimaryRouteMaster: (on: boolean) => void;
+  setPrimaryRouteMonitor: (on: boolean) => void;
+  setSecondaryRouteMaster: (on: boolean) => void;
+  setSecondaryRouteMonitor: (on: boolean) => void;
+  setPrimaryExcludeFromProgramBus: (on: boolean) => void;
 };
 
 export type MixedCaptureResult = {
@@ -28,11 +57,24 @@ export async function mixCaptureAudioStreams(
     primaryLinear?: number;
     secondaryLinear?: number;
     monitorExcludePrimary?: boolean;
+    primaryExcludeFromProgramBus?: boolean;
+    primaryRoute?: ChannelRoutePair;
+    secondaryRoute?: ChannelRoutePair;
   }
 ): Promise<MixedCaptureResult> {
   const ctx = new AudioContext();
   await ctx.resume().catch(() => undefined);
-  const dest = ctx.createMediaStreamDestination();
+  let cur1: ChannelRoutePair = {
+    ...(options?.primaryRoute ?? ROUTE_DEFAULT),
+  };
+  let cur2: ChannelRoutePair = {
+    ...(options?.secondaryRoute ?? ROUTE_DEFAULT),
+  };
+
+  const masterDest = ctx.createMediaStreamDestination();
+  const monitorDest = ctx.createMediaStreamDestination();
+  applyMaxChannelWebAudioNodes(masterDest, monitorDest);
+
   const g1 = ctx.createGain();
   const g2 = ctx.createGain();
   const a1 = ctx.createAnalyser();
@@ -45,32 +87,42 @@ export async function mixCaptureAudioStreams(
   const s0 = clampLinear(options?.secondaryLinear ?? 1);
   g1.gain.value = HEADROOM * p0;
   g2.gain.value = HEADROOM * s0;
+
+  const rm1 = ctx.createGain();
+  const rm2 = ctx.createGain();
+  const rmon1 = ctx.createGain();
+  const rmon2 = ctx.createGain();
+  rm2.gain.value = routeToMasterLinear(cur2);
+  rmon2.gain.value = routeToMonitorLinear(cur2);
+  let primaryExcludeFromProgramBus =
+    options?.primaryExcludeFromProgramBus ?? false;
+  const syncPrimaryProgramBusGains = () => {
+    if (primaryExcludeFromProgramBus) {
+      rm1.gain.value = 0;
+      rmon1.gain.value = 0;
+    } else {
+      rm1.gain.value = routeToMasterLinear(cur1);
+      rmon1.gain.value = routeToMonitorLinear(cur1);
+    }
+  };
+  syncPrimaryProgramBusGains();
+
   const src1 = ctx.createMediaStreamSource(primary);
   const src2 = ctx.createMediaStreamSource(secondary);
-  applyMaxChannelWebAudioNodes(dest, g1, g2, a1, a2);
+  applyMaxChannelWebAudioNodes(g1, g2, a1, a2, rm1, rm2, rmon1, rmon2);
   src1.connect(g1);
   src2.connect(g2);
   g1.connect(a1);
-  a1.connect(dest);
   g2.connect(a2);
-  a2.connect(dest);
-  const exclude = Boolean(options?.monitorExcludePrimary);
-  let monitorDest: MediaStreamAudioDestinationNode | null = null;
-  let g1m: GainNode | null = null;
-  let g2m: GainNode | null = null;
-  if (exclude) {
-    monitorDest = ctx.createMediaStreamDestination();
-    g1m = ctx.createGain();
-    g2m = ctx.createGain();
-    g1m.gain.value = 0;
-    g2m.gain.value = HEADROOM * s0;
-    applyMaxChannelWebAudioNodes(monitorDest, g1m, g2m);
-    src1.connect(g1m);
-    g1m.connect(monitorDest);
-    src2.connect(g2m);
-    g2m.connect(monitorDest);
-  }
-  const monitorStream = exclude ? monitorDest!.stream : dest.stream;
+  g1.connect(rm1);
+  rm1.connect(masterDest);
+  g2.connect(rm2);
+  rm2.connect(masterDest);
+  g1.connect(rmon1);
+  rmon1.connect(monitorDest);
+  g2.connect(rmon2);
+  rmon2.connect(monitorDest);
+
   const dispose = () => {
     try {
       src1.disconnect();
@@ -79,16 +131,12 @@ export async function mixCaptureAudioStreams(
       g2.disconnect();
       a1.disconnect();
       a2.disconnect();
-      dest.disconnect();
-      if (g1m) {
-        g1m.disconnect();
-      }
-      if (g2m) {
-        g2m.disconnect();
-      }
-      if (monitorDest) {
-        monitorDest.disconnect();
-      }
+      rm1.disconnect();
+      rm2.disconnect();
+      rmon1.disconnect();
+      rmon2.disconnect();
+      masterDest.disconnect();
+      monitorDest.disconnect();
     } catch {
       /* ignore */
     }
@@ -97,8 +145,8 @@ export async function mixCaptureAudioStreams(
     safeCloseAudioContext(ctx);
   };
   return {
-    mixedStream: dest.stream,
-    monitorStream,
+    mixedStream: masterDest.stream,
+    monitorStream: monitorDest.stream,
     dispose,
     primaryAnalyser: a1,
     secondaryAnalyser: a2,
@@ -107,11 +155,29 @@ export async function mixCaptureAudioStreams(
         g1.gain.value = HEADROOM * clampLinear(n);
       },
       setSecondaryLinear: (n: number) => {
-        const v = HEADROOM * clampLinear(n);
-        g2.gain.value = v;
-        if (g2m) {
-          g2m.gain.value = v;
-        }
+        g2.gain.value = HEADROOM * clampLinear(n);
+      },
+      setPrimaryRouteMaster: (on: boolean) => {
+        cur1 = { ...cur1, master: on };
+        syncPrimaryProgramBusGains();
+      },
+      setPrimaryRouteMonitor: (on: boolean) => {
+        cur1 = { ...cur1, monitor: on };
+        syncPrimaryProgramBusGains();
+      },
+      setSecondaryRouteMaster: (on: boolean) => {
+        cur2 = { ...cur2, master: on };
+        rm2.gain.value = routeToMasterLinear(cur2);
+        rmon2.gain.value = routeToMonitorLinear(cur2);
+      },
+      setSecondaryRouteMonitor: (on: boolean) => {
+        cur2 = { ...cur2, monitor: on };
+        rm2.gain.value = routeToMasterLinear(cur2);
+        rmon2.gain.value = routeToMonitorLinear(cur2);
+      },
+      setPrimaryExcludeFromProgramBus: (on: boolean) => {
+        primaryExcludeFromProgramBus = on;
+        syncPrimaryProgramBusGains();
       },
     },
   };
@@ -122,50 +188,68 @@ export type PassThroughCaptureResult = {
   monitorStream: MediaStream;
   dispose: () => void;
   setGainLinear: (n: number) => void;
+  setRouteMaster: (on: boolean) => void;
+  setRouteMonitor: (on: boolean) => void;
+  setPrimaryExcludeFromProgramBus: (on: boolean) => void;
   primaryAnalyser: AnalyserNode;
 };
 
 export async function passThroughCaptureWithGain(
   stream: MediaStream,
   gainLinear = 1,
-  options?: { monitorExcludePrimary?: boolean }
+  options?: {
+    monitorExcludePrimary?: boolean;
+    route?: ChannelRoutePair;
+    primaryExcludeFromProgramBus?: boolean;
+  }
 ): Promise<PassThroughCaptureResult> {
   const ctx = new AudioContext();
   await ctx.resume().catch(() => undefined);
-  const dest = ctx.createMediaStreamDestination();
+  let cur: ChannelRoutePair = { ...(options?.route ?? ROUTE_DEFAULT) };
+
+  const masterDest = ctx.createMediaStreamDestination();
+  const monitorDest = ctx.createMediaStreamDestination();
+  applyMaxChannelWebAudioNodes(masterDest, monitorDest);
+
   const g = ctx.createGain();
   const a = ctx.createAnalyser();
   a.fftSize = 512;
   a.smoothingTimeConstant = 0.75;
   g.gain.value = HEADROOM * clampLinear(gainLinear);
+
+  const rm = ctx.createGain();
+  const rmon = ctx.createGain();
+  let primaryExcludeFromProgramBus =
+    options?.primaryExcludeFromProgramBus ?? false;
+  const syncProgramBusGains = () => {
+    if (primaryExcludeFromProgramBus) {
+      rm.gain.value = 0;
+      rmon.gain.value = 0;
+    } else {
+      rm.gain.value = routeToMasterLinear(cur);
+      rmon.gain.value = routeToMonitorLinear(cur);
+    }
+  };
+  syncProgramBusGains();
+
   const src = ctx.createMediaStreamSource(stream);
-  applyMaxChannelWebAudioNodes(dest, g, a);
+  applyMaxChannelWebAudioNodes(g, a, rm, rmon);
   src.connect(g);
   g.connect(a);
-  a.connect(dest);
-  const exclude = Boolean(options?.monitorExcludePrimary);
-  let monitorDest: MediaStreamAudioDestinationNode | null = null;
-  let gMon: GainNode | null = null;
-  if (exclude) {
-    monitorDest = ctx.createMediaStreamDestination();
-    gMon = ctx.createGain();
-    gMon.gain.value = 0;
-    src.connect(gMon);
-    gMon.connect(monitorDest);
-  }
-  const monitorStream = exclude ? monitorDest!.stream : dest.stream;
+  g.connect(rm);
+  rm.connect(masterDest);
+  g.connect(rmon);
+  rmon.connect(monitorDest);
+
   const dispose = () => {
     try {
       src.disconnect();
       g.disconnect();
       a.disconnect();
-      dest.disconnect();
-      if (gMon) {
-        gMon.disconnect();
-      }
-      if (monitorDest) {
-        monitorDest.disconnect();
-      }
+      rm.disconnect();
+      rmon.disconnect();
+      masterDest.disconnect();
+      monitorDest.disconnect();
     } catch {
       /* ignore */
     }
@@ -173,12 +257,24 @@ export async function passThroughCaptureWithGain(
     safeCloseAudioContext(ctx);
   };
   return {
-    stream: dest.stream,
-    monitorStream,
+    stream: masterDest.stream,
+    monitorStream: monitorDest.stream,
     dispose,
     primaryAnalyser: a,
     setGainLinear: (n: number) => {
       g.gain.value = HEADROOM * clampLinear(n);
+    },
+    setRouteMaster: (on: boolean) => {
+      cur = { ...cur, master: on };
+      syncProgramBusGains();
+    },
+    setRouteMonitor: (on: boolean) => {
+      cur = { ...cur, monitor: on };
+      syncProgramBusGains();
+    },
+    setPrimaryExcludeFromProgramBus: (on: boolean) => {
+      primaryExcludeFromProgramBus = on;
+      syncProgramBusGains();
     },
   };
 }
@@ -187,6 +283,13 @@ export type MixTripleGainControls = {
   setPrimaryLinear: (n: number) => void;
   setSecondaryLinear: (n: number) => void;
   setTertiaryLinear: (n: number) => void;
+  setPrimaryRouteMaster: (on: boolean) => void;
+  setPrimaryRouteMonitor: (on: boolean) => void;
+  setSecondaryRouteMaster: (on: boolean) => void;
+  setSecondaryRouteMonitor: (on: boolean) => void;
+  setTertiaryRouteMaster: (on: boolean) => void;
+  setTertiaryRouteMonitor: (on: boolean) => void;
+  setPrimaryExcludeFromProgramBus: (on: boolean) => void;
 };
 
 export type MixedCaptureTripleResult = {
@@ -208,11 +311,28 @@ export async function mixCaptureAudioStreamsTriple(
     secondaryLinear?: number;
     tertiaryLinear?: number;
     monitorExcludePrimary?: boolean;
+    primaryExcludeFromProgramBus?: boolean;
+    primaryRoute?: ChannelRoutePair;
+    secondaryRoute?: ChannelRoutePair;
+    tertiaryRoute?: ChannelRoutePair;
   }
 ): Promise<MixedCaptureTripleResult> {
   const ctx = new AudioContext();
   await ctx.resume().catch(() => undefined);
-  const dest = ctx.createMediaStreamDestination();
+  let cur1: ChannelRoutePair = {
+    ...(options?.primaryRoute ?? ROUTE_DEFAULT),
+  };
+  let cur2: ChannelRoutePair = {
+    ...(options?.secondaryRoute ?? ROUTE_DEFAULT),
+  };
+  let cur3: ChannelRoutePair = {
+    ...(options?.tertiaryRoute ?? ROUTE_DEFAULT),
+  };
+
+  const masterDest = ctx.createMediaStreamDestination();
+  const monitorDest = ctx.createMediaStreamDestination();
+  applyMaxChannelWebAudioNodes(masterDest, monitorDest);
+
   const g1 = ctx.createGain();
   const g2 = ctx.createGain();
   const g3 = ctx.createGain();
@@ -231,41 +351,66 @@ export async function mixCaptureAudioStreamsTriple(
   g1.gain.value = HEADROOM * p0;
   g2.gain.value = HEADROOM * s0;
   g3.gain.value = HEADROOM * t0;
+
+  const rm1 = ctx.createGain();
+  const rm2 = ctx.createGain();
+  const rm3 = ctx.createGain();
+  const rmon1 = ctx.createGain();
+  const rmon2 = ctx.createGain();
+  const rmon3 = ctx.createGain();
+  rm2.gain.value = routeToMasterLinear(cur2);
+  rm3.gain.value = routeToMasterLinear(cur3);
+  rmon2.gain.value = routeToMonitorLinear(cur2);
+  rmon3.gain.value = routeToMonitorLinear(cur3);
+  let primaryExcludeFromProgramBus =
+    options?.primaryExcludeFromProgramBus ?? false;
+  const syncPrimaryProgramBusGains = () => {
+    if (primaryExcludeFromProgramBus) {
+      rm1.gain.value = 0;
+      rmon1.gain.value = 0;
+    } else {
+      rm1.gain.value = routeToMasterLinear(cur1);
+      rmon1.gain.value = routeToMonitorLinear(cur1);
+    }
+  };
+  syncPrimaryProgramBusGains();
+
   const src1 = ctx.createMediaStreamSource(primary);
   const src2 = ctx.createMediaStreamSource(secondary);
   const src3 = ctx.createMediaStreamSource(tertiary);
-  applyMaxChannelWebAudioNodes(dest, g1, g2, g3, a1, a2, a3);
+  applyMaxChannelWebAudioNodes(
+    g1,
+    g2,
+    g3,
+    a1,
+    a2,
+    a3,
+    rm1,
+    rm2,
+    rm3,
+    rmon1,
+    rmon2,
+    rmon3
+  );
   src1.connect(g1);
   src2.connect(g2);
   src3.connect(g3);
   g1.connect(a1);
-  a1.connect(dest);
   g2.connect(a2);
-  a2.connect(dest);
   g3.connect(a3);
-  a3.connect(dest);
-  const exclude = Boolean(options?.monitorExcludePrimary);
-  let monitorDest: MediaStreamAudioDestinationNode | null = null;
-  let g1m: GainNode | null = null;
-  let g2m: GainNode | null = null;
-  let g3m: GainNode | null = null;
-  if (exclude) {
-    monitorDest = ctx.createMediaStreamDestination();
-    g1m = ctx.createGain();
-    g2m = ctx.createGain();
-    g3m = ctx.createGain();
-    g1m.gain.value = 0;
-    g2m.gain.value = HEADROOM * s0;
-    g3m.gain.value = HEADROOM * t0;
-    applyMaxChannelWebAudioNodes(monitorDest, g1m, g2m, g3m);
-    src1.connect(g1m);
-    g1m.connect(monitorDest);
-    src2.connect(g2m);
-    g2m.connect(monitorDest);
-    src3.connect(g3m);
-    g3m.connect(monitorDest);
-  }
-  const monitorStream = exclude ? monitorDest!.stream : dest.stream;
+  g1.connect(rm1);
+  rm1.connect(masterDest);
+  g2.connect(rm2);
+  rm2.connect(masterDest);
+  g3.connect(rm3);
+  rm3.connect(masterDest);
+  g1.connect(rmon1);
+  rmon1.connect(monitorDest);
+  g2.connect(rmon2);
+  rmon2.connect(monitorDest);
+  g3.connect(rmon3);
+  rmon3.connect(monitorDest);
+
   const dispose = () => {
     try {
       src1.disconnect();
@@ -277,19 +422,14 @@ export async function mixCaptureAudioStreamsTriple(
       a1.disconnect();
       a2.disconnect();
       a3.disconnect();
-      dest.disconnect();
-      if (g1m) {
-        g1m.disconnect();
-      }
-      if (g2m) {
-        g2m.disconnect();
-      }
-      if (g3m) {
-        g3m.disconnect();
-      }
-      if (monitorDest) {
-        monitorDest.disconnect();
-      }
+      rm1.disconnect();
+      rm2.disconnect();
+      rm3.disconnect();
+      rmon1.disconnect();
+      rmon2.disconnect();
+      rmon3.disconnect();
+      masterDest.disconnect();
+      monitorDest.disconnect();
     } catch {
       /* ignore */
     }
@@ -299,8 +439,8 @@ export async function mixCaptureAudioStreamsTriple(
     safeCloseAudioContext(ctx);
   };
   return {
-    mixedStream: dest.stream,
-    monitorStream,
+    mixedStream: masterDest.stream,
+    monitorStream: monitorDest.stream,
     dispose,
     primaryAnalyser: a1,
     secondaryAnalyser: a2,
@@ -310,18 +450,42 @@ export async function mixCaptureAudioStreamsTriple(
         g1.gain.value = HEADROOM * clampLinear(n);
       },
       setSecondaryLinear: (n: number) => {
-        const v = HEADROOM * clampLinear(n);
-        g2.gain.value = v;
-        if (g2m) {
-          g2m.gain.value = v;
-        }
+        g2.gain.value = HEADROOM * clampLinear(n);
       },
       setTertiaryLinear: (n: number) => {
-        const v = HEADROOM * clampLinear(n);
-        g3.gain.value = v;
-        if (g3m) {
-          g3m.gain.value = v;
-        }
+        g3.gain.value = HEADROOM * clampLinear(n);
+      },
+      setPrimaryRouteMaster: (on: boolean) => {
+        cur1 = { ...cur1, master: on };
+        syncPrimaryProgramBusGains();
+      },
+      setPrimaryRouteMonitor: (on: boolean) => {
+        cur1 = { ...cur1, monitor: on };
+        syncPrimaryProgramBusGains();
+      },
+      setSecondaryRouteMaster: (on: boolean) => {
+        cur2 = { ...cur2, master: on };
+        rm2.gain.value = routeToMasterLinear(cur2);
+        rmon2.gain.value = routeToMonitorLinear(cur2);
+      },
+      setSecondaryRouteMonitor: (on: boolean) => {
+        cur2 = { ...cur2, monitor: on };
+        rm2.gain.value = routeToMasterLinear(cur2);
+        rmon2.gain.value = routeToMonitorLinear(cur2);
+      },
+      setTertiaryRouteMaster: (on: boolean) => {
+        cur3 = { ...cur3, master: on };
+        rm3.gain.value = routeToMasterLinear(cur3);
+        rmon3.gain.value = routeToMonitorLinear(cur3);
+      },
+      setTertiaryRouteMonitor: (on: boolean) => {
+        cur3 = { ...cur3, monitor: on };
+        rm3.gain.value = routeToMasterLinear(cur3);
+        rmon3.gain.value = routeToMonitorLinear(cur3);
+      },
+      setPrimaryExcludeFromProgramBus: (on: boolean) => {
+        primaryExcludeFromProgramBus = on;
+        syncPrimaryProgramBusGains();
       },
     },
   };

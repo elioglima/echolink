@@ -1,126 +1,138 @@
 # EchoLink
 
-Middleware de áudio com **tradução de voz em tempo real** (PT ↔ EN). O produto-alvo é o **EchoLink Box** (interface USB inteligente); o repositório organiza o **core de processamento** e as **applications** (serviço local + UI).
+**EchoLink** é uma plataforma de áudio com **reconhecimento de voz (STT)**, **tradução** e **síntese de voz (TTS)**, orientada ao produto **EchoLink Box** (interface USB no Raspberry Pi). Este repositório contém o **serviço local de processamento** (Python), a **interface** (Next.js + Electron), e o **driver de áudio virtual** para macOS.
 
-## Resumo
+## O que o projeto faz
 
-- **Core independente do hardware:** pipeline (áudio → STT → tradução → TTS → áudio) não deve acoplar ALSA, USB Gadget ou detalhes de placa.
-- **Hardware = adapter:** no Raspberry, áudio/USB entram como implementações; em desenvolvimento usam-se adapters **locais** e **mock** de USB.
-- **Dev-first:** tudo deve rodar no Mac/Windows/Linux **sem Raspberry** — mic/speaker reais, simulação do fluxo USB, logs e gravação de sessão.
+| Área | Descrição |
+|------|-----------|
+| **Captura** | Microfone e outras entradas (linha, mídia) com mesa de mistura, VU, roteamento **Master** / **Monitor** e envio do áudio ao serviço via WebSocket. |
+| **STT** | Transcrição em tempo real: **Amazon Transcribe** (streaming) ou **Vosk** (local), conforme configuração. |
+| **Tradução com voz** | Texto PT → tradução (ex.: EN) via **Amazon Translate** + **ElevenLabs** (TTS), com reprodução na saída escolhida. |
+| **Configuração** | Estado partilhado entre UI e serviço: `GET/PATCH /config`, persistência em cache local de ficheiros no serviço. |
+| **Sessões / histórico** | API de chats e integração com armazenamento local no cliente (IndexedDB) para vocabulário e jornal de frases. |
+| **Áudio virtual (macOS)** | Driver **EchoLink Virtual Audio** (multicanal) para encaminhar o programa para outras aplicações; ver pasta `echoLinkVirtualAudio`. |
 
-## Pontos importantes
+O **core** do pipeline (STT, tradução, TTS, domínio) **não depende** de ALSA, USB Gadget nem drivers de placa: o hardware entra apenas por **adapters** (local/mock em desenvolvimento; ALSA/gadget no Raspberry Pi).
 
-| Tema               | Diretriz                                                                                    |
-| ------------------ | ------------------------------------------------------------------------------------------- |
-| Modos              | **dev** (local + mock USB) vs **hardware** (RPI + ALSA/PipeWire + Gadget)                   |
-| Abstração de áudio | Entrada/saída via interfaces (`read_chunk` / `write_chunk`), não chamadas diretas ao driver |
-| Abstração de USB   | Mock em dev; Gadget real em produção no RPi                                                 |
-| Config             | `MODE`, drivers de áudio/USB e provedores STT/TTS via ambiente (ver `mds/resume.md`)        |
-| Anti-patterns      | Não misturar pipeline com ALSA; não depender de Gadget no core                              |
+## Princípios de arquitetura
+
+- **Dev-first:** o fluxo completo deve correr em Mac/Windows/Linux **sem** Raspberry Pi (microfone e altifalantes reais, mocks onde fizer sentido).
+- **Processamento no serviço Python:** regras de domínio, STT, tradução e TTS na API; o cliente envia áudio/configurações, recebe resultados e gere Web Audio (mistura, VU, dispositivos).
+- **Nomes em inglês** no código (funções, tipos, ficheiros novos em **camelCase** quando o projeto já usa esse padrão).
 
 ## Estrutura do repositório
 
-- `applications/echoLinkService` — serviço Python (API local, pipeline em evolução).
-- `applications/echolinkApp` — interface Next.js + Electron.
-- `applications/echoLinkVirtualAudio` — driver de áudio virtual macOS (fork BlackHole, GPL-3.0); ver `README.pt-BR.md` na pasta.
-- `mds/` — documentação detalhada (visão de arquitetura, roadmap, convenções).
+```
+echoLink/
+├── applications/
+│   ├── echoLinkService/      # API FastAPI (Uvicorn): /config, /ws/mic, /ws/stt, tradução, chats, runtime
+│   ├── echolinkApp/          # UI Next.js (App Router) + Electron; Web Audio; liga ao serviço em :8765
+│   └── echoLinkVirtualAudio/ # Driver macOS (extensão de áudio; GPL-3.0; ver README.pt-BR.md)
+├── mds/                      # Documentação extra (arquitetura, áudio virtual no Mac)
+├── .gitignore                # Inclui .env e .env.* — ver secção «Variáveis de ambiente»
+└── README.MD                 # Este ficheiro
+```
 
-## Instalação e execução no macOS (pyenv + nvm)
+### `applications/echoLinkService` (Python)
 
-### Ferramentas no Mac
+- **Entrada:** `main.py`, `pyproject.toml`, `start.sh` / `configure.sh`.
+- **`core/api/`:** rotas HTTP/WebSocket (`config`, `mic`, `stt`, `voiceTranslation`, `chats`, `runtime`, etc.).
+- **`core/stt/`:** motor de transcrição (AWS, Vosk).
+- **`core/voiceTranslation/`:** tradução + TTS agregados.
+- **`core/config/`:** modelo de configuração EchoLink e escrita em `files/cache/configs/`.
+- **`files/cache/`:** configs, estado de runtime, chats, vocabulário (desenvolvimento local).
 
-1. **Xcode Command Line Tools** (necessário para compilar Python com pyenv):
+### `applications/echolinkApp` (TypeScript / React)
 
-   ```bash
-   xcode-select --install
-   ```
+- **`app/`:** páginas e layout Next.js.
+- **`components/`:** UI principal (ex.: `micCapture.tsx`, consola de mistura, painéis de entrada/saída).
+- **`lib/`:** clientes HTTP/WebSocket, settings, pipeline de áudio, tradução, journal, etc.
 
-2. **Homebrew** (se ainda não tiver): [https://brew.sh](https://brew.sh)
+## Stack técnica
 
-3. **pyenv**:
+| Camada | Tecnologias |
+|--------|-------------|
+| Serviço | Python **3.11+** (recomendado **3.12**), **FastAPI**, **Uvicorn**, cliente AWS (Transcribe, Translate), HTTP/WebSocket |
+| Frontend | **Next.js**, **React**, **TypeScript**, **Electron** (modo desktop) |
+| Áudio (browser) | Web Audio API, `MediaRecorder`, `setSinkId` onde disponível |
+| Áudio (macOS) | Extensão **EchoLink Virtual Audio** (CoreAudio) |
 
-   ```bash
-   brew install pyenv
-   ```
+## Variáveis de ambiente e segredos
 
-   No `~/.zprofile` ou `~/.zshrc` (shell padrão do macOS é o **zsh**):
+**Não commite ficheiros `.env`** nem cópias com credenciais. O `.gitignore` na raiz inclui:
 
-   ```bash
-   eval "$(pyenv init -)"
-   ```
+- `.env`
+- `.env.*` (cobre `.env.local`, `.env.development`, `.env.production`, etc.)
 
-   Abra um terminal novo ou `source` o ficheiro.
+O serviço e scripts podem usar variáveis como (nomes indicativos; valores ficam só na sua máquina):
 
-4. **nvm** (instalação oficial via script):
+| Variável / tema | Uso |
+|-----------------|-----|
+| `AWS_PROFILE` / `ECHO_LINK_AWS_PROFILE` | Perfil AWS para Transcribe e Translate |
+| `ECHO_LINK_STT_ENGINE` | `aws` ou Vosk local |
+| `VOSK_MODEL_PATH` | Pasta do modelo Vosk (alternativa a modelo em `models/`) |
+| `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID` | ElevenLabs (tradução com voz) |
+| `ECHO_LINK_BIND_HOST`, `ECHO_LINK_BIND_PORT` | Bind do Uvicorn (predefinição comum: `127.0.0.1:8765`) |
 
-   ```bash
-   curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.2/install.sh | bash
-   ```
+Para partilhar exemplos no repositório, use um ficheiro **`env.example`** (sem segredos) se for criado no futuro; o padrão `.env.*` pode ser ajustado com `!.env.example` para permitir esse ficheiro.
 
-   Reinicie o terminal ou `source ~/.nvm/nvm.sh`.
+## Instalação e execução (resumo)
 
-### Serviço Python (`echoLinkService`)
+### Requisitos
 
-O interpretador está fixo em `applications/echoLinkService/.python-version` (**3.12**). O `pyproject.toml` exige **Python ≥ 3.11**.
+- **Python** 3.11+ (o projeto fixa **3.12** em `echoLinkService/.python-version`).
+- **Node.js** alinhado a `echolinkApp/.nvmrc` (ex.: **22**).
+
+### Serviço Python
 
 ```bash
 cd applications/echoLinkService
-
-pyenv install -s 3.12
-pyenv local 3.12
-
-python -m venv .venv
-source .venv/bin/activate
-
-pip install -U pip setuptools wheel
-pip install -e .
-
-# API em http://127.0.0.1:8765 (WebSockets: /ws/mic, /ws/stt)
+pyenv install -s 3.12 && pyenv local 3.12   # opcional
+python -m venv .venv && source .venv/bin/activate
+pip install -U pip setuptools wheel && pip install -e .
 python main.py
+# API: http://127.0.0.1:8765  |  WebSockets: /ws/mic, /ws/stt
 ```
 
-Alternativa na pasta do serviço: `./configure.sh` (cria/usa `.venv`, instala dependências, tenta detetar `VOSK_MODEL_PATH` em pastas locais e sobe o Uvicorn com reload).
+Alternativa: `./configure.sh` ou `./start.sh` na mesma pasta (instala dependências e sobe o servidor).
 
-Variável opcional: `ECHO_LINK_RELOAD=0` desativa o reload automático quando usas `python main.py`.
-
-**Configuração (fonte de verdade no servidor):** `GET http://127.0.0.1:8765/config` devolve o JSON de settings; `PATCH` com o mesmo formato aplica alterações parciais. A UI envia `PATCH` ao mudar opções (o `localStorage` fica como cache quando o serviço está offline).
-
-### App Next.js (`echolinkApp`)
-
-A versão do Node está em `applications/echolinkApp/.nvmrc` (**22**).
+### App web / desktop
 
 ```bash
 cd applications/echolinkApp
-
-nvm install
 nvm use
-
 npm install
-npm run dev
+npm run dev          # http://127.0.0.1:3000 — espera o serviço na porta 8765
+npm run dev:desktop  # Electron + Next em desenvolvimento
 ```
 
-A UI fica em **http://127.0.0.1:3000** e espera o serviço Python na porta **8765**; inicie o `echoLinkService` antes ou em paralelo ao `npm run dev`.
+### Verificação rápida
 
-**Desktop (Electron + Next):** `npm run dev:desktop`.
+```bash
+curl -s http://127.0.0.1:8765/health
+curl -s http://127.0.0.1:8765/stt/status
+```
 
-### Dois terminais (recomendado)
+## API e endpoints úteis (serviço)
 
-| Terminal | Pasta                          | Comando                                                              |
-| -------- | ------------------------------ | -------------------------------------------------------------------- |
-| 1        | `applications/echoLinkService` | `source .venv/bin/activate` → `python main.py` (ou `./configure.sh`) |
-| 2        | `applications/echolinkApp`     | `nvm use` → `npm run dev`                                            |
+| Método / caminho | Descrição |
+|------------------|-----------|
+| `GET /health` | Estado do serviço |
+| `GET/PATCH /config` | Configuração EchoLink (JSON) |
+| `WS /ws/mic` | Receção de chunks de áudio (binário) |
+| `WS /ws/stt` | PCM mono 16 kHz s16le para transcrição |
+| `POST /voiceTranslation/...` | Tradução + síntese de voz (ver rotas em `voiceTranslationRoutes`) |
+| `GET /capture/info` | Metadados dos caminhos WebSocket e cache |
 
-### Desenvolvimento no Mac (sem Raspberry Pi)
+Lista completa: código em `applications/echoLinkService/core/api/`.
 
-Quem desenvolve **não precisa de Raspberry Pi** para executar e testar: o Mac usa microfone e saída de áudio normais; o **USB gadget** do produto final só entra no modo **hardware** no Pi (ver `mds/resume.md`).
+## Documentação adicional
 
-**Entrada e saída virtuais no Mac:** use o driver **`applications/echoLinkVirtualAudio`** (EchoLink Virtual Audio) ou o **BlackHole** oficial. Detalhes: `mds/devVirtualAudioMac.md`.
+- `mds/resume.md` — visão de arquitetura, modos dev vs hardware, convenções.
+- `mds/devVirtualAudioMac.md` — áudio virtual no Mac (EchoLink Virtual / BlackHole).
+- `applications/echoLinkVirtualAudio/README.pt-BR.md` — compilação e instalação do driver macOS.
 
-1. **Serviço Python** — terminal na pasta `applications/echoLinkService` (como acima ou `./configure.sh`).
-2. **UI** — terminal na pasta `applications/echolinkApp`, `npm run dev`, abrir **http://127.0.0.1:3000** e autorizar o microfone no browser.
-3. **STT com Vosk (opcional)** — descarregar um modelo em [alphacephei.com/vosk/models](https://alphacephei.com/vosk/models), descompactar em `applications/echoLinkService/vosk-model` (ou definir `VOSK_MODEL_PATH` para a pasta do modelo). Sem modelo, o resto da interface continua utilizável; o passo fala→texto via Vosk fica indisponível.
-4. **Verificação rápida** — `curl -s http://127.0.0.1:8765/health` e `curl -s http://127.0.0.1:8765/stt/status`.
+## Licença
 
-## Documentação
-
-Detalhes de camadas, pastas sugeridas do `core`, roadmap e filosofia **“se roda no dev, roda no hardware”**: `mds/resume.md`.
+O projeto principal não inclui um `LICENSE` na raiz. O subprojeto **`applications/echoLinkVirtualAudio`** inclui licenciamento **GPL-3.0** (ver `applications/echoLinkVirtualAudio/LICENSE`).

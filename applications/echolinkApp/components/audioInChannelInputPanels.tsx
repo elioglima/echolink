@@ -4,6 +4,9 @@ import {
   type CSSProperties,
   type Dispatch,
   type SetStateAction,
+  useEffect,
+  useId,
+  useState,
 } from "react";
 
 import {
@@ -12,6 +15,7 @@ import {
   saveEchoLinkSettingsToStorage,
   saveEchoLinkSpeechSettings,
 } from "../lib/echoLinkSettings";
+import { MixerChannelRoutePairButtons } from "./mixerConsoleShared";
 import { formatMediaDeviceOptionLabel } from "../lib/mediaDeviceOptionLabel";
 import { SPEECH_LANGUAGE_OPTIONS } from "../lib/speechLanguages";
 import { timingRangeProgress } from "../lib/timingRangeProgress";
@@ -52,6 +56,15 @@ export type AudioInMicInputPanelProps = {
   voiceTranslationEnabled: boolean;
   setVoiceTranslationEnabled: Dispatch<SetStateAction<boolean>>;
   voiceTranslationBackendStatus: VoiceTranslationStatus | null;
+  lastSelfPhraseMonitor: { pt: string; en?: string } | null;
+  micSpeechTabRequestSeq?: number;
+  routeToMaster: boolean;
+  routeToMonitor: boolean;
+  routeMonitorLocked: boolean;
+  routeMasterDisabled: boolean;
+  routeMonitorDisabled: boolean;
+  onRouteMasterToggle: () => void;
+  onRouteMonitorToggle: () => void;
 };
 
 export function AudioInMicInputDetailPanel(props: AudioInMicInputPanelProps) {
@@ -81,7 +94,43 @@ export function AudioInMicInputDetailPanel(props: AudioInMicInputPanelProps) {
     voiceTranslationEnabled,
     setVoiceTranslationEnabled,
     voiceTranslationBackendStatus,
+    lastSelfPhraseMonitor,
+    micSpeechTabRequestSeq,
+    routeToMaster,
+    routeToMonitor,
+    routeMonitorLocked,
+    routeMasterDisabled,
+    routeMonitorDisabled,
+    onRouteMasterToggle,
+    onRouteMonitorToggle,
   } = props;
+
+  const tabBaseId = useId();
+  const [micSettingsTab, setMicSettingsTab] = useState<
+    "general" | "capture" | "speech"
+  >("general");
+
+  useEffect(() => {
+    if (
+      micSpeechTabRequestSeq !== undefined &&
+      micSpeechTabRequestSeq > 0
+    ) {
+      setMicSettingsTab("speech");
+    }
+  }, [micSpeechTabRequestSeq]);
+  const tabGeneral = `${tabBaseId}-t-g`;
+  const tabCapture = `${tabBaseId}-t-c`;
+  const tabSpeech = `${tabBaseId}-t-s`;
+  const panelGeneral = `${tabBaseId}-p-g`;
+  const panelCapture = `${tabBaseId}-p-c`;
+  const panelSpeech = `${tabBaseId}-p-s`;
+
+  const tabBtnClass = (active: boolean) =>
+    `min-h-9 flex-1 rounded-md px-2 py-2 text-center text-[10px] font-bold uppercase tracking-wide transition sm:min-h-8 sm:text-[11px] ${
+      active
+        ? "bg-sky-900/55 text-sky-100 ring-1 ring-sky-500/50 shadow-sm"
+        : "text-zinc-500 hover:bg-zinc-800/80 hover:text-zinc-300"
+    }`;
 
   return (
     <section
@@ -98,12 +147,72 @@ export function AudioInMicInputDetailPanel(props: AudioInMicInputPanelProps) {
       }
       className="bg-zinc-900/50 p-3 sm:p-4"
     >
-      <div className="mb-2.5 flex flex-wrap items-center gap-2 rounded-md bg-sky-950/25 px-2 py-1.5 ring-1 ring-sky-700/35">
+      <div className="mb-3 flex flex-wrap items-center gap-2 rounded-md bg-sky-950/25 px-2 py-1.5 ring-1 ring-sky-700/35">
         <span className="text-[9px] font-bold uppercase tracking-[0.18em] text-sky-300 sm:text-[10px] sm:tracking-[0.2em]">
           Canal de entrada 1
         </span>
         <span className="text-[9px] text-zinc-400">Microfone</span>
       </div>
+      <MixerChannelRoutePairButtons
+        channelId={1}
+        routeToMaster={routeToMaster}
+        routeToMonitor={routeToMonitor}
+        routeMonitorLocked={routeMonitorLocked}
+        masterDisabled={routeMasterDisabled}
+        monitorDisabled={routeMonitorDisabled}
+        onRouteMasterToggle={onRouteMasterToggle}
+        onRouteMonitorToggle={onRouteMonitorToggle}
+        wrapperClassName="mb-3"
+      />
+      <div
+        role="tablist"
+        aria-label="Secções das definições do microfone"
+        className="mb-3 flex min-h-0 gap-1 rounded-lg bg-zinc-950/70 p-1 ring-1 ring-zinc-700/55"
+      >
+        <button
+          type="button"
+          role="tab"
+          id={tabGeneral}
+          aria-selected={micSettingsTab === "general"}
+          aria-controls={panelGeneral}
+          tabIndex={micSettingsTab === "general" ? 0 : -1}
+          className={tabBtnClass(micSettingsTab === "general")}
+          onClick={() => setMicSettingsTab("general")}
+        >
+          Geral
+        </button>
+        <button
+          type="button"
+          role="tab"
+          id={tabCapture}
+          aria-selected={micSettingsTab === "capture"}
+          aria-controls={panelCapture}
+          tabIndex={micSettingsTab === "capture" ? 0 : -1}
+          className={tabBtnClass(micSettingsTab === "capture")}
+          onClick={() => setMicSettingsTab("capture")}
+        >
+          Captura
+        </button>
+        <button
+          type="button"
+          role="tab"
+          id={tabSpeech}
+          aria-selected={micSettingsTab === "speech"}
+          aria-controls={panelSpeech}
+          tabIndex={micSettingsTab === "speech" ? 0 : -1}
+          className={tabBtnClass(micSettingsTab === "speech")}
+          onClick={() => setMicSettingsTab("speech")}
+        >
+          Tradução
+        </button>
+      </div>
+      <div
+        id={panelGeneral}
+        role="tabpanel"
+        aria-labelledby={tabGeneral}
+        hidden={micSettingsTab !== "general"}
+        className={micSettingsTab !== "general" ? "hidden" : undefined}
+      >
       <label
         htmlFor="echo-input-device"
         className="mb-1.5 block text-[9px] uppercase tracking-[0.18em] text-zinc-400"
@@ -189,7 +298,24 @@ export function AudioInMicInputDetailPanel(props: AudioInMicInputPanelProps) {
           Ganho do canal na mistura enviada ao serviço (0–150%).
         </p>
       </div>
-      <div className="mt-4 border-t border-zinc-600/35 pt-4">
+      <div className="mt-3 flex flex-wrap gap-2 sm:gap-1.5">
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => void testMicrophone()}
+          className={btnSky}
+        >
+          {micTesting ? "…" : "Testar mic"}
+        </button>
+      </div>
+      </div>
+      <div
+        id={panelCapture}
+        role="tabpanel"
+        aria-labelledby={tabCapture}
+        hidden={micSettingsTab !== "capture"}
+        className={micSettingsTab !== "capture" ? "hidden" : undefined}
+      >
         <p className="mb-2 text-[10px] font-bold uppercase tracking-[0.18em] text-violet-300">
           Captura · medidor e tempo
         </p>
@@ -366,7 +492,18 @@ export function AudioInMicInputDetailPanel(props: AudioInMicInputPanelProps) {
           </dl>
         </div>
       </div>
-      <div className="mt-4 border-t border-zinc-600/35 pt-4">
+      <div
+        id={panelSpeech}
+        role="tabpanel"
+        aria-labelledby={tabSpeech}
+        hidden={micSettingsTab !== "speech"}
+        className={
+          micSettingsTab !== "speech"
+            ? "hidden"
+            : "flex flex-col gap-4"
+        }
+      >
+      <div className="rounded-lg border border-zinc-600/35 bg-zinc-950/30 p-3 sm:p-3.5">
         <div className="mb-2 flex items-start justify-between gap-3">
           <p className="min-w-0 flex-1 text-[10px] font-bold uppercase tracking-[0.18em] text-violet-300">
             Tradutor · idioma e tradução
@@ -536,7 +673,7 @@ export function AudioInMicInputDetailPanel(props: AudioInMicInputPanelProps) {
           )}
         </div>
       </div>
-      <div className="mt-4 border-t border-zinc-600/35 pt-4">
+      <div className="rounded-lg border border-zinc-600/35 bg-zinc-950/30 p-3 sm:p-3.5">
         <div className="mb-2 flex items-start justify-between gap-3">
           <p className="min-w-0 flex-1 text-[10px] font-bold uppercase tracking-[0.18em] text-emerald-300">
             Voz em inglês (nuvem)
@@ -578,15 +715,31 @@ export function AudioInMicInputDetailPanel(props: AudioInMicInputPanelProps) {
           </p>
         )}
       </div>
-      <div className="mt-3 flex flex-wrap gap-2 sm:gap-1.5">
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() => void testMicrophone()}
-          className={btnSky}
-        >
-          {micTesting ? "…" : "Testar mic"}
-        </button>
+      <div className="rounded-lg border border-zinc-600/35 bg-zinc-950/30 p-3 sm:p-3.5">
+        <p className="mb-2 text-[10px] font-bold uppercase tracking-[0.18em] text-zinc-400">
+          Monitor · última frase
+        </p>
+        {lastSelfPhraseMonitor ? (
+          <>
+            <p className="mb-1 text-[9px] font-semibold uppercase tracking-wide text-zinc-500">
+              Falada
+            </p>
+            <p className="mb-3 text-[11px] leading-snug text-zinc-200">
+              {lastSelfPhraseMonitor.pt}
+            </p>
+            <p className="mb-1 text-[9px] font-semibold uppercase tracking-wide text-zinc-500">
+              Tradução
+            </p>
+            <p className="text-[11px] leading-snug text-emerald-200/95">
+              {lastSelfPhraseMonitor.en ?? "—"}
+            </p>
+          </>
+        ) : (
+          <p className="text-[9px] text-zinc-500">
+            Ainda sem frase final nesta sessão.
+          </p>
+        )}
+      </div>
       </div>
     </section>
   );
@@ -606,6 +759,13 @@ export type AudioInLineInputPanelProps = {
   busy: boolean;
   selectClass: string;
   previewVuLevel: number;
+  routeToMaster: boolean;
+  routeToMonitor: boolean;
+  routeMonitorLocked: boolean;
+  routeMasterDisabled: boolean;
+  routeMonitorDisabled: boolean;
+  onRouteMasterToggle: () => void;
+  onRouteMonitorToggle: () => void;
 };
 
 export function AudioInLineInputDetailPanel(props: AudioInLineInputPanelProps) {
@@ -623,6 +783,13 @@ export function AudioInLineInputDetailPanel(props: AudioInLineInputPanelProps) {
     busy,
     selectClass,
     previewVuLevel,
+    routeToMaster,
+    routeToMonitor,
+    routeMonitorLocked,
+    routeMasterDisabled,
+    routeMonitorDisabled,
+    onRouteMasterToggle,
+    onRouteMonitorToggle,
   } = props;
 
   const lineChannelOff =
@@ -664,6 +831,17 @@ export function AudioInLineInputDetailPanel(props: AudioInLineInputPanelProps) {
           Microsoft Teams, apps, loopback
         </span>
       </div>
+      <MixerChannelRoutePairButtons
+        channelId={2}
+        routeToMaster={routeToMaster}
+        routeToMonitor={routeToMonitor}
+        routeMonitorLocked={routeMonitorLocked}
+        masterDisabled={routeMasterDisabled}
+        monitorDisabled={routeMonitorDisabled}
+        onRouteMasterToggle={onRouteMasterToggle}
+        onRouteMonitorToggle={onRouteMonitorToggle}
+        wrapperClassName="mb-3"
+      />
       <p className="mb-2 text-[9px] leading-snug text-zinc-500">
         Canal opcional. Misturado ao microfone na captura (STT e fluxo ao
         serviço). Use para capturar o Teams (dispositivo de áudio do Teams ou
@@ -806,6 +984,13 @@ export type AudioInMediaInputPanelProps = {
   busy: boolean;
   selectClass: string;
   previewVuLevel: number;
+  routeToMaster: boolean;
+  routeToMonitor: boolean;
+  routeMonitorLocked: boolean;
+  routeMasterDisabled: boolean;
+  routeMonitorDisabled: boolean;
+  onRouteMasterToggle: () => void;
+  onRouteMonitorToggle: () => void;
 };
 
 export function AudioInMediaInputDetailPanel(props: AudioInMediaInputPanelProps) {
@@ -822,6 +1007,13 @@ export function AudioInMediaInputDetailPanel(props: AudioInMediaInputPanelProps)
     busy,
     selectClass,
     previewVuLevel,
+    routeToMaster,
+    routeToMonitor,
+    routeMonitorLocked,
+    routeMasterDisabled,
+    routeMonitorDisabled,
+    onRouteMasterToggle,
+    onRouteMonitorToggle,
   } = props;
 
   const mediaChannelOff =
@@ -862,6 +1054,17 @@ export function AudioInMediaInputDetailPanel(props: AudioInMediaInputPanelProps)
         </span>
         <span className="text-[9px] text-zinc-400">Mídia</span>
       </div>
+      <MixerChannelRoutePairButtons
+        channelId={3}
+        routeToMaster={routeToMaster}
+        routeToMonitor={routeToMonitor}
+        routeMonitorLocked={routeMonitorLocked}
+        masterDisabled={routeMasterDisabled}
+        monitorDisabled={routeMonitorDisabled}
+        onRouteMasterToggle={onRouteMasterToggle}
+        onRouteMonitorToggle={onRouteMonitorToggle}
+        wrapperClassName="mb-3"
+      />
       <p className="mb-2 text-[9px] leading-snug text-zinc-500">
         Terceira entrada opcional (ex.: outro virtual, leitor ou app). Misturada
         aos canais 1 e 2 na captura. Não pode repetir o mesmo dispositivo dos

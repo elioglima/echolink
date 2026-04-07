@@ -90,6 +90,7 @@ class EchoLinkConfigModel(BaseModel):
         default="bIHbv24MWmeRgasZH58o", max_length=96
     )
     voiceTranslationEnabled: bool = True
+    pipelineMasterOutputEnabled: bool = True
     pipelineMonitorEnabled: bool = False
     pipelineMonitorGainPercent: int = Field(default=12, ge=1, le=100)
     sidebarSection: str = "audioIn"
@@ -103,6 +104,12 @@ class EchoLinkConfigModel(BaseModel):
     mixerChannel2Muted: bool = False
     mixerChannel3Muted: bool = False
     mixerOutputMuted: bool = False
+    mixerChannel1RouteMaster: bool = True
+    mixerChannel1RouteMonitor: bool = True
+    mixerChannel2RouteMaster: bool = True
+    mixerChannel2RouteMonitor: bool = True
+    mixerChannel3RouteMaster: bool = True
+    mixerChannel3RouteMonitor: bool = True
     mixerStripOrder: list[str] = Field(
         default_factory=lambda: list(_MIXER_STRIP_ORDER_DEFAULT)
     )
@@ -201,6 +208,7 @@ class EchoLinkConfigPatch(BaseModel):
     selectedOutputDeviceId: str | None = Field(default=None, max_length=512)
     selectedElevenLabsVoiceId: str | None = Field(default=None, max_length=96)
     voiceTranslationEnabled: bool | None = None
+    pipelineMasterOutputEnabled: bool | None = None
     pipelineMonitorEnabled: bool | None = None
     pipelineMonitorGainPercent: int | None = Field(default=None, ge=1, le=100)
     sidebarSection: str | None = None
@@ -214,6 +222,12 @@ class EchoLinkConfigPatch(BaseModel):
     mixerChannel2Muted: bool | None = None
     mixerChannel3Muted: bool | None = None
     mixerOutputMuted: bool | None = None
+    mixerChannel1RouteMaster: bool | None = None
+    mixerChannel1RouteMonitor: bool | None = None
+    mixerChannel2RouteMaster: bool | None = None
+    mixerChannel2RouteMonitor: bool | None = None
+    mixerChannel3RouteMaster: bool | None = None
+    mixerChannel3RouteMonitor: bool | None = None
     mixerStripOrder: list[str] | None = None
 
     @field_validator("mixerStripOrder", mode="before")

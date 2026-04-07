@@ -33,13 +33,19 @@ export type EchoLinkAudioInDetailScope =
 
 export type EchoLinkAudioInChannelTab = "microphone" | "systemAudio" | "media";
 
-export type EchoLinkMixerStripId = "ch1" | "ch2" | "ch3" | "output";
+export type EchoLinkMixerStripId =
+  | "ch1"
+  | "ch2"
+  | "ch3"
+  | "output"
+  | "monitor";
 
 export const ECHO_LINK_MIXER_STRIP_ORDER_DEFAULT: EchoLinkMixerStripId[] = [
   "ch1",
   "ch2",
   "ch3",
   "output",
+  "monitor",
 ];
 
 export function sanitizeMixerStripOrder(
@@ -52,7 +58,13 @@ export function sanitizeMixerStripOrder(
   const seen = new Set<EchoLinkMixerStripId>();
   const out: EchoLinkMixerStripId[] = [];
   for (const x of raw) {
-    if (x !== "ch1" && x !== "ch2" && x !== "ch3" && x !== "output") {
+    if (
+      x !== "ch1" &&
+      x !== "ch2" &&
+      x !== "ch3" &&
+      x !== "output" &&
+      x !== "monitor"
+    ) {
       return fallback;
     }
     if (seen.has(x)) {
@@ -61,8 +73,18 @@ export function sanitizeMixerStripOrder(
     seen.add(x);
     out.push(x);
   }
-  if (out.length === 4 && seen.size === 4) {
+  if (out.length === 5 && seen.size === 5) {
     return out;
+  }
+  if (
+    out.length === 4 &&
+    seen.has("ch1") &&
+    seen.has("ch2") &&
+    seen.has("ch3") &&
+    seen.has("output") &&
+    !seen.has("monitor")
+  ) {
+    return [...out, "monitor"];
   }
   if (
     out.length === 3 &&
@@ -72,7 +94,7 @@ export function sanitizeMixerStripOrder(
     !seen.has("ch3")
   ) {
     const idxOut = out.indexOf("output");
-    return [...out.slice(0, idxOut), "ch3", ...out.slice(idxOut)];
+    return [...out.slice(0, idxOut), "ch3", "output", "monitor"];
   }
   return fallback;
 }
@@ -91,8 +113,11 @@ export type EchoLinkSettings = {
   selectedSecondaryInputDeviceId: string;
   selectedTertiaryInputDeviceId: string;
   selectedOutputDeviceId: string;
+  selectedMasterOutputDeviceId: string;
+  selectedPipelineMonitorOutputDeviceId: string;
   selectedElevenLabsVoiceId: string;
   voiceTranslationEnabled: boolean;
+  pipelineMasterOutputEnabled: boolean;
   pipelineMonitorEnabled: boolean;
   pipelineMonitorGainPercent: number;
   primaryChannelMixGainPercent: number;
@@ -110,6 +135,13 @@ export type EchoLinkSettings = {
   mixerChannel2Muted: boolean;
   mixerChannel3Muted: boolean;
   mixerOutputMuted: boolean;
+  mixerMonitorMuted: boolean;
+  mixerChannel1RouteMaster: boolean;
+  mixerChannel1RouteMonitor: boolean;
+  mixerChannel2RouteMaster: boolean;
+  mixerChannel2RouteMonitor: boolean;
+  mixerChannel3RouteMaster: boolean;
+  mixerChannel3RouteMonitor: boolean;
   mixerStripOrder: EchoLinkMixerStripId[];
 };
 
@@ -132,8 +164,11 @@ export const ECHO_LINK_SETTINGS_PLACEHOLDER: EchoLinkSettings = {
   selectedSecondaryInputDeviceId: "",
   selectedTertiaryInputDeviceId: "",
   selectedOutputDeviceId: "",
+  selectedMasterOutputDeviceId: "",
+  selectedPipelineMonitorOutputDeviceId: "",
   selectedElevenLabsVoiceId: "",
   voiceTranslationEnabled: false,
+  pipelineMasterOutputEnabled: true,
   pipelineMonitorEnabled: false,
   pipelineMonitorGainPercent: 25,
   primaryChannelMixGainPercent: 100,
@@ -151,6 +186,13 @@ export const ECHO_LINK_SETTINGS_PLACEHOLDER: EchoLinkSettings = {
   mixerChannel2Muted: false,
   mixerChannel3Muted: false,
   mixerOutputMuted: false,
+  mixerMonitorMuted: false,
+  mixerChannel1RouteMaster: true,
+  mixerChannel1RouteMonitor: true,
+  mixerChannel2RouteMaster: true,
+  mixerChannel2RouteMonitor: true,
+  mixerChannel3RouteMaster: true,
+  mixerChannel3RouteMonitor: true,
   mixerStripOrder: [...ECHO_LINK_MIXER_STRIP_ORDER_DEFAULT],
 };
 
@@ -299,7 +341,14 @@ function mergeEchoLinkSettingsPayload(
         key === "mixerChannel1Muted" ||
         key === "mixerChannel2Muted" ||
         key === "mixerChannel3Muted" ||
-        key === "mixerOutputMuted"
+        key === "mixerOutputMuted" ||
+        key === "mixerMonitorMuted" ||
+        key === "mixerChannel1RouteMaster" ||
+        key === "mixerChannel1RouteMonitor" ||
+        key === "mixerChannel2RouteMaster" ||
+        key === "mixerChannel2RouteMonitor" ||
+        key === "mixerChannel3RouteMaster" ||
+        key === "mixerChannel3RouteMonitor"
       ) {
         if (typeof v === "boolean") {
           out[key] = v;
@@ -314,7 +363,9 @@ function mergeEchoLinkSettingsPayload(
         key === "selectedInputDeviceId" ||
         key === "selectedSecondaryInputDeviceId" ||
         key === "selectedTertiaryInputDeviceId" ||
-        key === "selectedOutputDeviceId"
+        key === "selectedOutputDeviceId" ||
+        key === "selectedMasterOutputDeviceId" ||
+        key === "selectedPipelineMonitorOutputDeviceId"
       ) {
         out[key] = sanitizeDeviceId(v);
         return;
@@ -323,7 +374,11 @@ function mergeEchoLinkSettingsPayload(
         out[key] = sanitizeElevenLabsVoiceId(v);
         return;
       }
-      if (key === "voiceTranslationEnabled" || key === "pipelineMonitorEnabled") {
+      if (
+        key === "voiceTranslationEnabled" ||
+        key === "pipelineMasterOutputEnabled" ||
+        key === "pipelineMonitorEnabled"
+      ) {
         out[key] =
           typeof v === "boolean"
             ? v
@@ -352,6 +407,12 @@ function mergeEchoLinkSettingsPayload(
       }
     }
   );
+  if (
+    !out.selectedPipelineMonitorOutputDeviceId.trim() &&
+    out.selectedOutputDeviceId.trim()
+  ) {
+    out.selectedPipelineMonitorOutputDeviceId = out.selectedOutputDeviceId;
+  }
   return out;
 }
 
@@ -503,7 +564,14 @@ export function saveEchoLinkSettingsToStorage(
       key === "mixerChannel1Muted" ||
       key === "mixerChannel2Muted" ||
       key === "mixerChannel3Muted" ||
-      key === "mixerOutputMuted"
+      key === "mixerOutputMuted" ||
+      key === "mixerMonitorMuted" ||
+      key === "mixerChannel1RouteMaster" ||
+      key === "mixerChannel1RouteMonitor" ||
+      key === "mixerChannel2RouteMaster" ||
+      key === "mixerChannel2RouteMonitor" ||
+      key === "mixerChannel3RouteMaster" ||
+      key === "mixerChannel3RouteMonitor"
     ) {
       if (typeof v === "boolean") {
         next[key] = v;
@@ -518,7 +586,9 @@ export function saveEchoLinkSettingsToStorage(
       key === "selectedInputDeviceId" ||
       key === "selectedSecondaryInputDeviceId" ||
       key === "selectedTertiaryInputDeviceId" ||
-      key === "selectedOutputDeviceId"
+      key === "selectedOutputDeviceId" ||
+      key === "selectedMasterOutputDeviceId" ||
+      key === "selectedPipelineMonitorOutputDeviceId"
     ) {
       if (typeof v === "string") {
         next[key] = sanitizeDeviceId(v);
@@ -531,7 +601,11 @@ export function saveEchoLinkSettingsToStorage(
       }
       return;
     }
-    if (key === "voiceTranslationEnabled" || key === "pipelineMonitorEnabled") {
+    if (
+      key === "voiceTranslationEnabled" ||
+      key === "pipelineMasterOutputEnabled" ||
+      key === "pipelineMonitorEnabled"
+    ) {
       if (typeof v === "boolean") {
         next[key] = v;
       }

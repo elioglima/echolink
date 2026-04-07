@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "sessionId": "20260406T005347Z_8491821d3e81",
+  "startedAt": "2026-04-06T00:53:47Z",
+  "endedAt": "2026-04-06T00:54:18Z",
+  "interimPt": null,
+  "messages": [
+    {
+      "id": 2,
+      "journalKey": "23c72141-eb7c-4c63-9dbe-49473707e625",
+      "chatSpeaker": "self",
+      "pt": "O que eu posso fazer para te ajudar?",
+      "en": "What can I do to help you?",
+      "translationOrigin": "cache",
+      "replayCount": 1
+    },
+    {
+      "id": 4,
+      "journalKey": "518ae8ae-aa1e-4008-a1ba-e15b5b450c42",
+      "chatSpeaker": "self",
+      "pt": "não.",
+      "en": "No.",
+      "translationOrigin": "cache"
+    }
+  ]
+}
