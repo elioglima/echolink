@@ -73,6 +73,39 @@ Pastas úteis: `core/api/` (rotas), `core/stt/`, `core/voiceTranslation/`, `file
 | Áudio (browser) | Web Audio API, MediaRecorder, `setSinkId` quando suportado |
 | Áudio (macOS) | EchoLink Virtual Audio (HAL), Core Audio |
 
+## Tecnologias, AWS e serviços de terceiros
+
+### Tecnologias por camada
+
+| Área | Tecnologias |
+|------|-------------|
+| **Backend (`echoLinkService`)** | Python ≥ 3.11, **FastAPI**, **Uvicorn**, **boto3** / botocore, **amazon-transcribe** (streaming), **vosk**, **httpx** |
+| **Frontend (`echolinkApp`)** | **Next.js**, **React**, **TypeScript**, **Tailwind CSS**, **Electron** (opcional), ESLint; **concurrently** / **wait-on** (dev desktop) |
+| **Áudio no browser** | Web Audio API, **MediaRecorder**, WebSocket para o serviço local |
+| **Driver macOS (`echoLinkVirtualAudio`)** | **Xcode**, Core Audio HAL, C/C++/Objective-C (fork **BlackHole**) |
+
+### AWS (via `echoLinkService`)
+
+Credenciais: perfil AWS (`AWS_PROFILE` / `ECHO_LINK_AWS_PROFILE`); região típica em `AWS_REGION` (ex.: `us-east-1`).
+
+| Serviço AWS | Uso no EchoLink |
+|-------------|-----------------|
+| **Amazon Transcribe** | STT em **streaming** quando `ECHO_LINK_STT_ENGINE=aws` — WebSocket `/ws/stt` com PCM mono 16 kHz. |
+| **Amazon Translate** | Tradução de texto **PT → EN** na pipeline de voz traduzida (`boto3` cliente `translate`). |
+
+**Alternativa sem AWS para STT:** **Vosk** (modelo local em disco) — não é serviço na nuvem.
+
+### Terceiros (não AWS)
+
+| Serviço | Uso |
+|---------|-----|
+| **ElevenLabs** (`api.elevenlabs.io`) | **TTS**: síntese de voz a partir do texto já traduzido (ex.: inglês). Requer `ELEVENLABS_API_KEY` e identificador de voz. |
+| **Vosk** (Alphacephei) | Apenas o **ficheiro do modelo** descarregado para o disco — execução **local**, sem API paga em runtime. |
+
+### Nota sobre a UI
+
+A **echolinkApp** não chama diretamente AWS nem ElevenLabs: comunica só com **`http://127.0.0.1:8765`**. Quem integra nuvem é o **echoLinkService**.
+
 ## Variáveis de ambiente e segredos
 
 **Não commite ficheiros `.env`** nem cópias com credenciais. O `.gitignore` na raiz inclui:
