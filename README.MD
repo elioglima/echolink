@@ -34,29 +34,44 @@ echoLink/
 └── README.MD                 # Este ficheiro
 ```
 
-### `applications/echoLinkService` (Python)
+## Aplicações no repositório
 
-- **Entrada:** `main.py`, `pyproject.toml`, `start.sh` / `configure.sh`.
-- **`core/api/`:** rotas HTTP/WebSocket (`config`, `mic`, `stt`, `voiceTranslation`, `chats`, `runtime`, etc.).
-- **`core/stt/`:** motor de transcrição (AWS, Vosk).
-- **`core/voiceTranslation/`:** tradução + TTS agregados.
-- **`core/config/`:** modelo de configuração EchoLink e escrita em `files/cache/configs/`.
-- **`files/cache/`:** configs, estado de runtime, chats, vocabulário (desenvolvimento local).
+Cada pasta em `applications/` é um artefacto distinto: descrição, tecnologias e **serviços externos** (cloud ou APIs de terceiros).
 
-### `applications/echolinkApp` (TypeScript / React)
+### `echoLinkService` — API e pipeline local (Python)
 
-- **`app/`:** páginas e layout Next.js.
-- **`components/`:** UI principal (ex.: `micCapture.tsx`, consola de mistura, painéis de entrada/saída).
-- **`lib/`:** clientes HTTP/WebSocket, settings, pipeline de áudio, tradução, journal, etc.
+| | |
+|--|--|
+| **Descrição** | Serviço **FastAPI** em **Uvicorn** que expõe REST, WebSockets e a lógica de STT, tradução PT→EN, TTS, estado de runtime, chats e cache em ficheiros. Recebe áudio da UI (`/ws/mic`, `/ws/stt`), aplica regras de qualidade de texto e orquestra integrações AWS/ElevenLabs quando configuradas. Inclui modo **Vosk** totalmente local, sem cloud. |
+| **Tecnologias** | Python **≥ 3.11** (recomendado **3.12**), **FastAPI**, **Uvicorn** `[standard]`, **boto3**, **amazon-transcribe**, **vosk**, **httpx**; estrutura em `core/` (`api`, `stt`, `voiceTranslation`, `config`, `files`). Entrada: `main.py`, `pyproject.toml`, scripts `start.sh` / `configure.sh`. |
+| **Serviços externos** | **Amazon Web Services** (credenciais via perfil AWS): **Transcribe** (streaming STT), **Translate** (tradução de texto). **ElevenLabs** (API REST: síntese de voz / TTS a partir do texto traduzido). *Opcional:* apenas Vosk local — sem STT/tradução/TTS na nuvem se não configurar AWS/ElevenLabs. |
 
-## Stack técnica
+Pastas úteis: `core/api/` (rotas), `core/stt/`, `core/voiceTranslation/`, `files/cache/` (configs, runtime, chats).
+
+### `echolinkApp` — interface web e desktop (Next.js + Electron)
+
+| | |
+|--|--|
+| **Descrição** | Aplicação **Next.js** (App Router) com **React** para a mesa EchoLink: captura de áudio no browser, mistura multi-canal (Web Audio), VU, roteamento Master/Monitor, chat de transcrição, definições sincronizadas com o serviço (`/config`). Modo **Electron** para ambiente tipo desktop (`npm run dev:desktop`). Comunica com o **echoLinkService** em `http://127.0.0.1:8765` (HTTP + WebSocket); não embute STT/tradução no bundle — delega ao Python. |
+| **Tecnologias** | **Next.js** 16, **React** 19, **TypeScript**, **Tailwind CSS** 4, **ESLint**; **Electron** 35 (dev); **concurrently** / **wait-on** para dev desktop. Pastas: `app/`, `components/`, `lib/` (clientes, settings, áudio, journal). |
+| **Serviços externos** | **Nenhuma chamada direta** da UI a AWS ou ElevenLabs no fluxo normal: os pedidos vão ao **serviço local**. Serviços na nuvem são utilizados **indiretamente**, só quando o **echoLinkService** está configurado e encaminha STT/tradução/TTS. |
+
+### `echoLinkVirtualAudio` — driver de áudio virtual (macOS)
+
+| | |
+|--|--|
+| **Descrição** | Extensão **HAL** Core Audio que cria dispositivos virtuais **loopback** (ex.: **EchoLink Virtual Audio 8ch**) para encaminhar o som da mesa/aplicações para outras apps no Mac (Teams, navegador, gravação). Fork do **BlackHole**; necessário para cenários de integração local sem hardware dedicado. |
+| **Tecnologias** | **Xcode**, projeto **Core Audio** (plug-in HAL); base **C/C++/Objective-C** herdada do upstream BlackHole; scripts `build.sh`, `install.sh`, instalador opcional em `Installer/`. Licença **GPL-3.0** (ver `LICENSE` na pasta). |
+| **Serviços externos** | **Nenhum** — compilação e execução são 100 % locais; apenas **Apple Developer** (assinatura/notarização) se distribuir binários assinados. |
+
+## Stack técnica (visão rápida)
 
 | Camada | Tecnologias |
 |--------|-------------|
-| Serviço | Python **3.11+** (recomendado **3.12**), **FastAPI**, **Uvicorn**, cliente AWS (Transcribe, Translate), HTTP/WebSocket |
-| Frontend | **Next.js**, **React**, **TypeScript**, **Electron** (modo desktop) |
-| Áudio (browser) | Web Audio API, `MediaRecorder`, `setSinkId` onde disponível |
-| Áudio (macOS) | Extensão **EchoLink Virtual Audio** (CoreAudio) |
+| Serviço | Python, FastAPI, Uvicorn, boto3, amazon-transcribe, vosk, httpx |
+| Frontend | Next.js, React, TypeScript, Tailwind, Electron |
+| Áudio (browser) | Web Audio API, MediaRecorder, `setSinkId` quando suportado |
+| Áudio (macOS) | EchoLink Virtual Audio (HAL), Core Audio |
 
 ## Variáveis de ambiente e segredos
 
